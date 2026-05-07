@@ -26,11 +26,11 @@ function JLUST.prepare(::CUSPARSEBackend, ::Type{SDDMMOp},
     descC = CuSparseMatrixDescriptor(_to_cuspmat(u_C), idx)
     algo  = CUSPARSE_SDDMM_ALG_DEFAULT
 
-    # Dimensions: A is (rows_A × cols_A), B is (rows_B × cols_B)
+    # Physical stored dimensions — transposition is handled by transa/transb args
     rows_A, cols_A = Int64.(extents(u_A))
     rows_B, cols_B = Int64.(extents(u_B))
-    descA = CuDenseMatrixDescriptor(T, rows_A, cols_A; transposed = transa != 'N')
-    descB = CuDenseMatrixDescriptor(T, rows_B, cols_B; transposed = transb != 'N')
+    descA = CuDenseMatrixDescriptor(T, rows_A, cols_A)
+    descB = CuDenseMatrixDescriptor(T, rows_B, cols_B)
 
     alpha_ref = Ref{T}(one(T));  beta_ref = Ref{T}(zero(T))
     buf_sz = Ref{Csize_t}(0)

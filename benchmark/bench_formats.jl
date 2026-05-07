@@ -251,6 +251,134 @@ function run_spmm_suite(n, nnz_target, k, empty_frac=0.0; T=Float64)
     end
 end
 
+# ─── SDDMM Suite ─────────────────────────────────────────────────────────────
+#
+# C (sparse m×m mask) ← alpha * (A (m×k) * B (k×m)) ∘ C + beta * C
+# Compares: Direct CUSPARSE (preprocess + compute every call),
+#           Handle CUSPARSE (preprocess cached at prepare() time),
+#           EmitterBackend (JIT kernel).
+
+function bench_sddmm_direct(u_A, u_B, u_C; samples=50)
+    for _ in 1:3; sparse_sddmm!(CUSPARSEBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
+    @belapsed(begin
+        sparse_sddmm!(CUSPARSEBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
+end
+
+function bench_sddmm_handle(h, u_A, u_B, u_C; samples=50)
+    for _ in 1:3; sparse_sddmm!(h, u_A, u_B, u_C); CUDA.synchronize(); end
+    @belapsed(begin
+        sparse_sddmm!($h, $u_A, $u_B, $u_C); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
+end
+
+function bench_sddmm_emit(u_A, u_B, u_C; samples=50)
+    for _ in 1:3; sparse_sddmm!(EmitterBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
+    @belapsed(begin
+        sparse_sddmm!(EmitterBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
+end
+
+function run_sddmm_suite(n, nnz_target, k; T=Float64)
+    A_cpu = random_sparse(n, nnz_target; T=T)
+    nz    = nnz(A_cpu)
+
+    # Dense A (n×k) and B (k×n); sparse C (n×n CSR mask)
+    A_d = CUDA.randn(T, n, k)
+    B_d = CUDA.randn(T, k, n)
+
+    make_u_dense(arr) = begin
+        fmt = Formats.DensedRight(2)
+        USTensor{T,Int32,2,typeof(arr),CuVector{Int32},OneBased}(
+            size(arr), fmt,
+            Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+            arr, nothing)
+    end
+
+    u_A = make_u_dense(A_d)
+    u_B = make_u_dense(B_d)
+    u_C = csr_gpu(A_cpu)   # sparse mask/result with same pattern as test matrix
+
+    nflops = 2 * nz * k   # one k-dot per nonzero of C
+
+    println("\n── SDDMM  n=$n  nnz≈$nz  k=$k  T=$T ──")
+    @printf("  %-18s  %-10s  %10s  %10s  %10s\n",
+            "Variant", "Backend", "Time(μs)", "vs Direct", "GFLOP/s")
+    println("  ", "-"^60)
+
+    gf(t_us) = nflops / (t_us * 1e3)
+
+    t_direct = bench_sddmm_direct(u_A, u_B, u_C)
+    @printf("  %-18s  %-10s  %10.1f  %10s  %10.2f\n",
+            "Direct", "CUSPARSE", t_direct, "base", gf(t_direct))
+
+    h_sddmm = prepare(CUSPARSEBackend(), SDDMMOp, u_A, u_B, u_C)
+    t_handle = bench_sddmm_handle(h_sddmm, u_A, u_B, u_C)
+    @printf("  %-18s  %-10s  %10.1f  %10s  %10.2f\n",
+            "Handle", "CUSPARSE", t_handle, @sprintf("%.2f×", t_direct/t_handle), gf(t_handle))
+
+    t_emit = bench_sddmm_emit(u_A, u_B, u_C)
+    @printf("  %-18s  %-10s  %10.1f  %10s  %10.2f\n",
+            "Emitter", "Emitter", t_emit, @sprintf("%.2f×", t_direct/t_emit), gf(t_emit))
+end
+
+# ─── SpGEMM Suite ─────────────────────────────────────────────────────────────
+#
+# C (CSR) ← alpha * A (CSR) * B (CSR)
+# Compares: Direct CUSPARSE (symbolic + numeric each call),
+#           Handle CUSPARSE (SpGEMMreuse: symbolic cached, numeric only per call),
+#           EmitterBackend (scatter-sort-reduce per call).
+
+function bench_gemm_direct(u_A, u_B, u_C_templ; samples=30)
+    for _ in 1:3; sparse_gemm!(CUSPARSEBackend(), u_A, u_B, u_C_templ); CUDA.synchronize(); end
+    @belapsed(begin
+        sparse_gemm!(CUSPARSEBackend(), $u_A, $u_B, $u_C_templ); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
+end
+
+function bench_gemm_handle(h; samples=30)
+    for _ in 1:3; sparse_gemm!(h); CUDA.synchronize(); end
+    @belapsed(begin; sparse_gemm!($h); CUDA.synchronize(); end,
+              samples=samples, evals=1) * 1e6
+end
+
+function bench_gemm_emit(u_A, u_B; samples=30)
+    for _ in 1:3; sparse_gemm!(EmitterBackend(), u_A, u_B); CUDA.synchronize(); end
+    @belapsed(begin
+        sparse_gemm!(EmitterBackend(), $u_A, $u_B); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
+end
+
+function run_spgemm_suite(n, nnz_target; T=Float64)
+    A_cpu = random_sparse(n, nnz_target; T=T)
+    B_cpu = random_sparse(n, nnz_target; T=T)
+    nnz_C = nnz(A_cpu * B_cpu)
+    nz_A  = nnz(A_cpu)
+
+    u_A = csr_gpu(A_cpu)
+    u_B = csr_gpu(B_cpu)
+    # C template: correct sparsity structure for direct CUSPARSE (values overwritten)
+    u_C_templ = csr_gpu(A_cpu * B_cpu)
+
+    println("\n── SpGEMM  n=$n  nnz_A≈$nz_A  nnz_C≈$nnz_C  T=$T ──")
+    @printf("  %-20s  %-10s  %10s  %10s\n",
+            "Variant", "Backend", "Time(μs)", "vs Direct")
+    println("  ", "-"^44)
+
+    t_direct = bench_gemm_direct(u_A, u_B, u_C_templ)
+    @printf("  %-20s  %-10s  %10.1f  %10s\n",
+            "Direct", "CUSPARSE", t_direct, "base")
+
+    h_gemm = prepare(CUSPARSEBackend(), SpGEMMOp, u_A, u_B)
+    t_handle = bench_gemm_handle(h_gemm)
+    @printf("  %-20s  %-10s  %10.1f  %10s\n",
+            "Handle(reuse)", "CUSPARSE", t_handle, @sprintf("%.2f×", t_direct/t_handle))
+
+    t_emit = bench_gemm_emit(u_A, u_B)
+    @printf("  %-20s  %-10s  %10.1f  %10s\n",
+            "Emitter", "Emitter", t_emit, @sprintf("%.2f×", t_direct/t_emit))
+end
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 println("="^80)
@@ -277,6 +405,26 @@ spmm_configs = [
 for (n, nnz_t, k, ef) in spmm_configs
     try; run_spmm_suite(n, nnz_t, k, ef; T=Float64)
     catch e; @printf("\nSpMM n=%d k=%d FAILED: %s\n", n, k, sprint(showerror, e)); end
+end
+
+sddmm_configs = [
+    (8192,   80_000,  32),
+    (32768,  200_000, 64),
+    (131072, 800_000, 16),
+]
+for (n, nnz_t, k) in sddmm_configs
+    try; run_sddmm_suite(n, nnz_t, k; T=Float64)
+    catch e; @printf("\nSDDMM n=%d k=%d FAILED: %s\n", n, k, sprint(showerror, e)); end
+end
+
+spgemm_configs = [
+    (4_096,  16_000),
+    (16_384, 100_000),
+    (65_536, 400_000),
+]
+for (n, nnz_t) in spgemm_configs
+    try; run_spgemm_suite(n, nnz_t; T=Float64)
+    catch e; @printf("\nSpGEMM n=%d FAILED: %s\n", n, sprint(showerror, e)); end
 end
 
 println("\n", "="^80)

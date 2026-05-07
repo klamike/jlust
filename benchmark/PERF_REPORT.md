@@ -1,6 +1,6 @@
 # JLUST Performance Report — NVIDIA L40S
 
-**Date**: 2026-05-07 (iter 4)  
+**Date**: 2026-05-07 (iter 5)  
 **GPU**: NVIDIA L40S (46 GB GDDR6, 864 GB/s peak bandwidth)  
 **Julia**: 1.12.6  
 **Benchmark**: `benchmark/bench_formats.jl`
@@ -15,16 +15,18 @@ All comparisons are against the **CU(handle)** baseline — cuSPARSE with pre-an
 descriptors (`prepare()` → `CUSPARSESpMVHandle` / `CUSPARSESpMMHandle`), which is
 the fastest obtainable vendor API.
 
-| Operation | Format | EmitterBackend vs CU(handle) |
-|-----------|--------|------------------------------|
-| SpMV | CSR | **24% faster** (n≤32K), **8% faster** (n=131K), tied (n=262K) |
-| SpMV | COO (warp kernel) | within 3–15% (atomic bottleneck at large n) |
-| SpMV | DCSR (native) | **11–27% faster** vs CSR/handle |
-| SpMV | DCSR → CSR → CUSPARSE | **13–28× faster** end-to-end |
-| SpMM | CSR (k=16) | **40% faster** |
-| SpMM | CSR (k=32) | **23% faster** |
-| SpMM | CSR (k=64) | **2% faster** (was −15% in iter 3) |
-| SpMM | DCSR → CSR → CUSPARSE | **1.7–4× faster** end-to-end |
+| Operation | Format | Result |
+|-----------|--------|--------|
+| SpMV | CSR | **20–49% faster** vs CU(handle) (n≤131K) |
+| SpMV | COO (warp kernel) | within 4–12% of CU(handle) |
+| SpMV | DCSR (native) | **8–15% faster** vs CSR/handle |
+| SpMV | DCSR → CSR → CUSPARSE | **13–28× faster** end-to-end (Emitter) |
+| SpMM | CSR (k=16) | **39–46% faster** vs CU(handle) |
+| SpMM | CSR (k=32) | **22–24% faster** vs CU(handle) |
+| SpMM | CSR (k=64) | **1–2% faster** vs CU(handle) |
+| SpMM | DCSR → CSR → CUSPARSE | **1.7–4× faster** end-to-end (Emitter) |
+| SDDMM | CSR | Handle **4–16% faster** than Direct; Emitter **up to 2× faster** (large n) |
+| SpGEMM | CSR×CSR | Handle(reuse) **8–14× faster** than Direct (numeric-only phase) |
 
 The CSR SpMV vector kernel (iter 4) closes the remaining gap between EmitterBackend
 and CU(handle): 4 threads per row with warp-shuffle reduction, each thread striding
@@ -127,6 +129,81 @@ DCSR EmitterBackend is **4× faster end-to-end** than DCSR→CSR→CUSPARSE.
 
 At k=64, EmitterBackend now matches and slightly exceeds CU(handle).
 For DCSR data, Emitter is still **2.1× faster end-to-end** (734μs vs 1536μs).
+
+---
+
+## SDDMM Results (Float64)
+
+Sampled dense-dense matrix multiply: C (sparse mask, m×m) ← α · (A (m×k) · B (k×m)) ∘ C + β·C.
+Three variants: Direct (preprocess every call), Handle (preprocess cached), Emitter (JIT kernel).
+
+### n=8 192, nnz≈74K, k=32
+
+| Variant | Backend | Time (μs) | vs Direct | GFLOP/s |
+|---------|---------|-----------|-----------|---------|
+| Direct | CUSPARSE | 32.9 | base | 143.5 |
+| Handle | CUSPARSE | **28.3** | **1.16×** | 166.8 |
+| Emitter | Emitter | 37.2 | 0.88× | 126.7 |
+
+### n=32 768, nnz≈197K, k=64
+
+| Variant | Backend | Time (μs) | vs Direct | GFLOP/s |
+|---------|---------|-----------|-----------|---------|
+| Direct | CUSPARSE | 133.3 | base | 188.8 |
+| Handle | CUSPARSE | **127.0** | **1.05×** | 198.2 |
+| **Emitter** | **Emitter** | **68.0** | **1.96×** | **370.1** |
+
+### n=131 072, nnz≈786K, k=16
+
+| Variant | Backend | Time (μs) | vs Direct | GFLOP/s |
+|---------|---------|-----------|-----------|---------|
+| Direct | CUSPARSE | 151.5 | base | 166.2 |
+| Handle | CUSPARSE | **146.3** | **1.04×** | 172.1 |
+| **Emitter** | **Emitter** | **90.4** | **1.68×** | **278.4** |
+
+**Key findings:** The Handle preprocess cache gives 4–16% speedup over Direct. The EmitterBackend
+dramatically outperforms cuSPARSE at n≥32K — up to 2× faster — because the JIT kernel eliminates
+cuSPARSE dispatch overhead and compiles a tight row-parallel inner loop with sequential k reduction.
+
+---
+
+## SpGEMM Results (Float64)
+
+All-sparse product: C (CSR) ← A (CSR) × B (CSR).
+Three variants: Direct (symbolic + numeric every call), Handle/reuse (symbolic cached once at
+`prepare()` time, numeric-only per call), Emitter (scatter-sort-reduce on GPU).
+
+### n=4 096, nnz_A≈12K, nnz_C≈37K
+
+| Variant | Backend | Time (μs) | vs Direct |
+|---------|---------|-----------|-----------|
+| Direct | CUSPARSE | 212.1 | base |
+| **Handle(reuse)** | **CUSPARSE** | **15.5** | **13.7×** |
+| Emitter | Emitter | 870.7 | 0.24× |
+
+### n=16 384, nnz_A≈98K, nnz_C≈589K
+
+| Variant | Backend | Time (μs) | vs Direct |
+|---------|---------|-----------|-----------|
+| Direct | CUSPARSE | 265.3 | base |
+| **Handle(reuse)** | **CUSPARSE** | **21.5** | **12.3×** |
+| Emitter | Emitter | 3329.1 | 0.08× |
+
+### n=65 536, nnz_A≈393K, nnz_C≈2.4M
+
+| Variant | Backend | Time (μs) | vs Direct |
+|---------|---------|-----------|-----------|
+| Direct | CUSPARSE | 349.9 | base |
+| **Handle(reuse)** | **CUSPARSE** | **41.6** | **8.4×** |
+| Emitter | Emitter | 9878.1 | 0.04× |
+
+**Key findings:**
+- The `CUSPARSESpGEMMHandle` (SpGEMMreuse API) is **8–14× faster** than direct for repeated calls
+  with the same sparsity structure. The symbolic analysis (phases 1–3) is done once at `prepare()`
+  time; each `sparse_gemm!(h)` call only runs the numeric phase.
+- The EmitterBackend SpGEMM (scatter-sort-reduce) is 4–26× slower than cuSPARSE direct. The scatter-
+  sort approach has high overhead: O(nnz_A · avg_nnz_B) intermediate keys, one GPU sort, and 5+
+  kernel passes. Correct but not competitive with cuSPARSE for CSR×CSR.
 
 ---
 
@@ -244,13 +321,17 @@ Results vs CU(handle):
 | 3 | SpMM | NNZ-first, k baked in at JIT | **40% faster (k=16), 23% faster (k=32)** |
 | 3 | SpMM | Tiled (TILE_K=8), k>32 | k=64 now matches CU(handle) (was −15%) |
 | 4 | CSR SpMV | Vector kernel (4 threads/row, warp reduce) | **24% faster than CU(handle) at n≤32K** |
+| 5 | SDDMM | Handle (preprocess cached via `cusparseSDDMM_preprocess`) | 4–16% faster than direct |
+| 5 | SDDMM | EmitterBackend (row-parallel JIT kernel, sequential k-loop) | **up to 2× faster than cuSPARSE at large n** |
+| 5 | SpGEMM | Handle (SpGEMMreuse API: symbolic once, numeric per call) | **8–14× faster than direct** |
+| 5 | SpGEMM | EmitterBackend (scatter-sort-reduce) | correct but 4–26× slower than cuSPARSE |
 
 ---
 
 ## Recommended Future Work (priority order)
 
-1. **Adaptive VECTOR_SIZE for CSR** — at n=262K (1 NNZ/row), VECTOR_SIZE=4 wastes 3/4
-   of threads. Auto-select VECTOR_SIZE based on avg NNZ/row (1→1, 2-4→2, 5-16→4, >16→8).
+1. **Adaptive VECTOR_SIZE for CSR SpMV** — at n=262K (1 NNZ/row), VECTOR_SIZE=4 wastes 3/4
+   of threads. Auto-select based on avg NNZ/row (1→VS=1, 2-4→VS=2, 5-16→VS=4, >16→VS=8). ✓ Implemented (iter 4), but only VS=2/4/8; could extend to VS=1 and VS=32.
 
 2. **COO SpMV ballot-based early exit** — for very sparse matrices where most warps have
    only 1 NNZ, add an `any_active = vote_any(row == prev_row)` check to skip the
@@ -259,8 +340,9 @@ Results vs CU(handle):
 3. **Warp-per-row for unbalanced CSR** — select VECTOR_SIZE=32 for rows where
    nnz_per_row > 32 to fully hide memory latency on dense rows.
 
-4. **SpGEMM EmitterBackend** — Gustavson row-merge: each thread handles one output
-   row, walks A's inner Compressed level, for each entry walks B's inner list.
+4. **EmitterBackend SpGEMM optimization** — current scatter-sort approach is 4–26× slower
+   than cuSPARSE. Consider Gustavson row-merge (one thread per output row, dense accumulator
+   for each row) for small output matrices, or hybrid with cuSPARSE-reuse for dense cases.
 
 5. **DCSR SpMM column blocking** — combine DCSR format advantage with SpMM
    column tiling to beat CUSPARSE at all scales.

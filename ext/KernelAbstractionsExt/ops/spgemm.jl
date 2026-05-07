@@ -127,13 +127,8 @@ function JLUST.sparse_gemm!(::EmitterBackend,
         ndrange = m)
     KernelAbstractions.synchronize(ka)
 
-    # ── Step 2: prefix-sum → scatter positions ─────────────────────────────────
-    prod_offset = similar(A_rowPtr, Int64, m + 1)
-    fill!(prod_offset, Int64(0))
-    accumulate!(+, view(prod_offset, 2:m + 1), prod_count)
-    prod_offset .+= Int64(1)
-
-    total_products = Int(prod_offset[m + 1]) - 1
+    # ── Step 2: total product count (GPU reduction, no scalar indexing) ──────────
+    total_products = Int(sum(prod_count))
 
     if total_products == 0
         C_rowPtr = fill!(similar(A_rowPtr, Ti, m + 1), Ti(off))
@@ -142,6 +137,12 @@ function JLUST.sparse_gemm!(::EmitterBackend,
         orig = index_origin(u_A)
         return csr_tensor(C_rowPtr, C_colInd, C_nzVal, (m, n); origin=orig)
     end
+
+    # Prefix-sum prod_count → 1-based scatter positions for each row.
+    prod_offset = similar(A_rowPtr, Int64, m + 1)
+    fill!(prod_offset, Int64(0))
+    accumulate!(+, view(prod_offset, 2:m + 1), prod_count)
+    prod_offset .+= Int64(1)
 
     # ── Step 3: scatter (key, val) pairs ───────────────────────────────────────
     keys = similar(A_rowPtr, Int64, total_products)
@@ -169,10 +170,10 @@ function JLUST.sparse_gemm!(::EmitterBackend,
                                           ndrange = total_products)
     KernelAbstractions.synchronize(ka)
 
-    # cumsum(heads) → 1-based output position for each product
+    # Count unique (key) segments → nnzC; then cumsum heads → output positions.
+    nnzC = Int(sum(heads))
     head_pos = similar(A_rowPtr, Int64, total_products)
     accumulate!(+, head_pos, heads)
-    nnzC = Int(head_pos[end])
 
     # ── Step 6: scatter-reduce into C values ───────────────────────────────────
     C_keys   = similar(A_rowPtr, Int64, nnzC)

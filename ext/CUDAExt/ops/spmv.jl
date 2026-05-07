@@ -165,6 +165,21 @@ end
     val += CUDA.shfl_down_sync(mask, val, Int32(4))
     val
 end
+@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{16}) where T
+    val += CUDA.shfl_down_sync(mask, val, Int32(1))
+    val += CUDA.shfl_down_sync(mask, val, Int32(2))
+    val += CUDA.shfl_down_sync(mask, val, Int32(4))
+    val += CUDA.shfl_down_sync(mask, val, Int32(8))
+    val
+end
+@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{32}) where T
+    val += CUDA.shfl_down_sync(mask, val, Int32(1))
+    val += CUDA.shfl_down_sync(mask, val, Int32(2))
+    val += CUDA.shfl_down_sync(mask, val, Int32(4))
+    val += CUDA.shfl_down_sync(mask, val, Int32(8))
+    val += CUDA.shfl_down_sync(mask, val, Int32(16))
+    val
+end
 
 function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer, ::Val{VS}) where VS
     T        = eltype(nzval)
@@ -198,17 +213,28 @@ function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer, ::
     return nothing
 end
 
-# Select VS based on average NNZ/row:
-#   < 4  → VS=2  (very sparse: 2 threads/row keeps occupancy up without over-splitting)
-#   < 8  → VS=4  (moderate: balanced inner loop and shuffle overhead)
-#   ≥ 8  → VS=8  (denser rows: more threads hide memory latency)
+# Select VS based on average NNZ/row (computed over all rows, including empty).
+# Thresholds are deliberately lower than the true per-non-empty-row average so
+# that high-sparsity matrices (many zero-length rows) still pick a high enough
+# VS to parallelise their non-empty rows:
+#   < 2  → VS=2   (ultra-sparse; 2 threads/row keeps occupancy)
+#   < 6  → VS=4   (sparse with some empty rows)
+#   < 16 → VS=8   (moderate density or heavy empty-row regime)
+#   < 32 → VS=16  (dense rows; parallelize within-row loads aggressively)
+#   ≥ 32 → VS=32  (warp-per-row; row NNZ >> warp width)
+#
+# For VS=32 the warp mask formula (UInt32(1)<<32)-1 wraps to 0xffffffff by
+# UInt32 overflow semantics on GPU, giving the correct full-warp mask.
 function JLUST._csr_spmv_specialized!(
         pos::CuVector, crd::CuVector,
         nzval::CuVector{T}, x::CuVector{T}, y::CuVector{T},
         origin_off::Int32, n_outer::Int32) where T
     n_outer == Int32(0) && return true
     avg_nnz = length(nzval) / Int(n_outer)
-    vs      = avg_nnz < 4.0 ? 2 : avg_nnz < 8.0 ? 4 : 8
+    vs = avg_nnz < 2.0  ? 2  :
+         avg_nnz < 6.0  ? 4  :
+         avg_nnz < 16.0 ? 8  :
+         avg_nnz < 32.0 ? 16 : 32
     threads = 256
     blocks  = cld(Int(n_outer) * vs, threads)
     if vs == 2
@@ -217,9 +243,15 @@ function JLUST._csr_spmv_specialized!(
     elseif vs == 4
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
             pos, crd, nzval, x, y, origin_off, n_outer, Val(4))
-    else
+    elseif vs == 8
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
             pos, crd, nzval, x, y, origin_off, n_outer, Val(8))
+    elseif vs == 16
+        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(16))
+    else
+        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(32))
     end
     return true
 end
