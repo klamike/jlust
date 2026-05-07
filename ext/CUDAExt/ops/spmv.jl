@@ -140,23 +140,43 @@ end
 
 # ─── CUDA vector-per-row CSR SpMV (hook override) ────────────────────────────
 #
-# _CSR_VECTOR_SIZE threads collaborate on each row: each handles NNZ at
-# stride _CSR_VECTOR_SIZE from its lane offset. A log2(_CSR_VECTOR_SIZE)-step
-# warp-shuffle tree reduces within each group; lane 0 writes y[row].
-# Compared to one-thread-per-row: better parallelism for rows with many NNZ
-# and removes the cuSPARSE descriptor-rebuild overhead from the direct path.
+# Val{VS} threads collaborate on each row: each handles NNZ at stride VS.
+# A log2(VS)-step warp-shuffle tree reduces within the VS-thread group;
+# lane 0 writes y[row]. VS is selected adaptively by average NNZ/row so that
+# the number of inner-loop iterations per thread stays near the sweet spot
+# (enough to hide latency, not so many that parallelism is wasted).
+#
+# Group mask: VS consecutive bits starting at the group's base lane.
+# All threads in the group participate unconditionally so that shfl_sync
+# sees a consistent mask; threads beyond n_outer contribute 0.
 
-const _CSR_VECTOR_SIZE = Int32(4)   # threads per row; must divide 32
+@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{2}) where T
+    val += CUDA.shfl_down_sync(mask, val, Int32(1))
+    val
+end
+@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{4}) where T
+    val += CUDA.shfl_down_sync(mask, val, Int32(1))
+    val += CUDA.shfl_down_sync(mask, val, Int32(2))
+    val
+end
+@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{8}) where T
+    val += CUDA.shfl_down_sync(mask, val, Int32(1))
+    val += CUDA.shfl_down_sync(mask, val, Int32(2))
+    val += CUDA.shfl_down_sync(mask, val, Int32(4))
+    val
+end
 
-function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer)
+function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer, ::Val{VS}) where VS
     T        = eltype(nzval)
+    vs       = Int32(VS)
     tid      = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    row_id   = (tid - Int32(1)) ÷ _CSR_VECTOR_SIZE + Int32(1)   # 1-based row
-    vec_lane = (tid - Int32(1)) % _CSR_VECTOR_SIZE               # 0-based within group
+    row_id   = (tid - Int32(1)) ÷ vs + Int32(1)
+    vec_lane = (tid - Int32(1)) % vs
 
     lane_in_warp  = (threadIdx().x - Int32(1)) % Int32(32)
-    group_in_warp = lane_in_warp ÷ _CSR_VECTOR_SIZE
-    group_mask    = UInt32(0x0f) << (UInt32(group_in_warp) * UInt32(4))
+    group_in_warp = lane_in_warp ÷ vs
+    group_bits    = (UInt32(1) << UInt32(VS)) - UInt32(1)   # VS consecutive 1-bits
+    group_mask    = group_bits << (UInt32(group_in_warp) * UInt32(VS))
 
     my_acc = zero(T)
     if row_id <= n_outer
@@ -166,13 +186,11 @@ function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer)
         while k <= hi
             col     = Int(crd[k]) - Int(origin_off) + 1
             my_acc += nzval[k] * x[col]
-            k      += Int(_CSR_VECTOR_SIZE)
+            k      += Int(vs)
         end
     end
 
-    # All threads in the group participate in the reduce for shfl correctness.
-    my_acc += CUDA.shfl_down_sync(group_mask, my_acc, Int32(1))
-    my_acc += CUDA.shfl_down_sync(group_mask, my_acc, Int32(2))
+    my_acc = _csr_group_reduce(my_acc, group_mask, Val(VS))
 
     if vec_lane == Int32(0) && row_id <= n_outer
         y[row_id] = my_acc
@@ -180,14 +198,28 @@ function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer)
     return nothing
 end
 
+# Select VS based on average NNZ/row:
+#   < 4  → VS=2  (very sparse: 2 threads/row keeps occupancy up without over-splitting)
+#   < 8  → VS=4  (moderate: balanced inner loop and shuffle overhead)
+#   ≥ 8  → VS=8  (denser rows: more threads hide memory latency)
 function JLUST._csr_spmv_specialized!(
         pos::CuVector, crd::CuVector,
         nzval::CuVector{T}, x::CuVector{T}, y::CuVector{T},
         origin_off::Int32, n_outer::Int32) where T
     n_outer == Int32(0) && return true
+    avg_nnz = length(nzval) / Int(n_outer)
+    vs      = avg_nnz < 4.0 ? 2 : avg_nnz < 8.0 ? 4 : 8
     threads = 256
-    blocks  = cld(Int(n_outer) * Int(_CSR_VECTOR_SIZE), threads)
-    CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-        pos, crd, nzval, x, y, origin_off, n_outer)
+    blocks  = cld(Int(n_outer) * vs, threads)
+    if vs == 2
+        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(2))
+    elseif vs == 4
+        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(4))
+    else
+        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(8))
+    end
     return true
 end
