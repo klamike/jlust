@@ -61,6 +61,10 @@ export
     TensorDecomposer, TensorComposer, run!,
     materialize,
 
+    # Handle types (exported from backend extensions)
+    # CUSPARSESpMVHandle, CUSPARSESpMMHandle, CUSPARSESpSVHandle, CUSPARSESpSMHandle,
+    # CUSPARSESDDMMHandle, CUSPARSESpGEMMHandle  (exported from CUDAExt)
+
     # Hooks for backend-specialized SpMV; overridden by CUDAExt for GPU kernels
     _coo_spmv_specialized!,
     _csr_spmv_specialized!,

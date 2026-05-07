@@ -3,13 +3,14 @@ module KernelAbstractionsExt
 using JLUST, KernelAbstractions, SparseArrays
 import JLUST:
     USTensor, TensorFormat, AbstractUSTBackend,
-    SpMVOp, SpMMOp, SpSVOp, SpSMOp, SDDMMOp, SparseToDenseOp,
+    SpMVOp, SpMMOp, SpGEMMOp, SpSVOp, SpSMOp, SDDMMOp, SparseToDenseOp,
     supports_backend, format, extents, index_origin, OneBased,
     positions, coordinates, nonzeros, has_positions, has_coordinates,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
-    is_unique, is_ordered,
-    apply_values!, sparse_mv!, sparse_mm!,
-    sparse_sv!, sparse_sm!, sparse_sddmm!, sparse_to_dense, dense_to_sparse
+    is_unique, is_ordered, format_family, Formats,
+    apply_values!, sparse_mv!, sparse_mm!, sparse_gemm!,
+    sparse_sv!, sparse_sm!, sparse_sddmm!, sparse_to_dense, dense_to_sparse,
+    csr_tensor
 
 # ─── EmitterBackend ───────────────────────────────────────────────────────────
 
@@ -28,6 +29,10 @@ end
 
 function JLUST.supports_backend(::EmitterBackend, op::SpMMOp)
     _is_emittable(op.A) && _is_dense_fmt(op.B) && _is_dense_fmt(op.C)
+end
+
+function JLUST.supports_backend(::EmitterBackend, op::SpGEMMOp)
+    op.A == Formats.CSR && op.B == Formats.CSR && op.C == Formats.CSR
 end
 
 # ─── apply_values! ────────────────────────────────────────────────────────────
@@ -56,10 +61,11 @@ function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
     JLUST.sparse_mm!(backend, u_A, u_B, u_C; kw...)
 end
 
-# ─── SpMV / SpMM ──────────────────────────────────────────────────────────────
+# ─── SpMV / SpMM / SpGEMM / SpSV / SpSM / SDDMM ─────────────────────────────
 
 include("ops/spmv.jl")
 include("ops/spmm.jl")
+include("ops/spgemm.jl")
 include("ops/spsv.jl")
 include("ops/spsm.jl")
 include("ops/sddmm.jl")
