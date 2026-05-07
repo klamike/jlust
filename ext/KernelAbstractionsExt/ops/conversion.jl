@@ -1,0 +1,163 @@
+# ─── EmitterBackend: format conversions ──────────────────────────────────────
+#
+# sparse_to_dense: scatter stored NNZ into a pre-zeroed dense matrix.
+#   Parallelism: one thread per outer fiber of the sparse tensor (same as SpMV).
+#
+# dense_to_sparse: requires parallel prefix sums to count / place NNZ —
+#   not implemented; throws a clear error.
+
+function JLUST.supports_backend(::EmitterBackend, op::SparseToDenseOp)
+    _is_emittable(op.src)
+end
+
+# ─── sparse_to_dense body emitter ─────────────────────────────────────────────
+#
+# Traversal mirrors the SpMV emitter. At the leaf, instead of accumulating into
+# y, we scatter _nzval[_nnz_pos] into _dense[_row_idx, _col_idx].
+
+function _emit_s2d_body(fmt::TensorFormat)
+    pc = Ref(0); cc = Ref(0)
+    _emit_s2d_level(fmt.levels, 1, nothing, pc, cc)
+end
+
+function _emit_s2d_level(levels, lvl, p_var, pc, cc)
+    if lvl > length(levels)
+        return :(_dense[_row_idx, _col_idx] = _nzval[_nnz_pos])
+    end
+    _, lv = levels[lvl]
+    _emit_s2d_lv(lv, levels, lvl, p_var, pc, cc)
+end
+
+function _emit_s2d_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc)
+    inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
+    quote
+        _tid = @index(Global, Linear)
+        if _tid <= _n_outer
+            _row_idx = _tid
+            $inner
+        end
+    end
+end
+
+function _emit_s2d_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc)
+    sz   = Symbol(:_sz, lvl)
+    lv2  = Symbol(:_i, lvl)
+    inner = _emit_s2d_level(levels, lvl + 1, lv2, pc, cc)
+    quote
+        for $lv2 in 1:$sz
+            $inner
+        end
+    end
+end
+
+function _emit_s2d_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc)
+    pc[] += 1; ci = cc[] += 1
+    cs = Symbol(:_crd, ci)
+    if is_unique(lv)
+        inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
+        quote
+            _tid = @index(Global, Linear)
+            if _tid <= _n_outer
+                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
+                $inner
+            end
+        end
+    else
+        inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
+        quote
+            _tid = @index(Global, Linear)
+            if _tid <= _n_outer
+                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
+                _nnz_pos = _tid
+                $inner
+            end
+        end
+    end
+end
+
+function _emit_s2d_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc)
+    pi = pc[] += 1; ci = cc[] += 1
+    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
+    lvar = Symbol(:_i, lvl)
+    inner = _emit_s2d_level(levels, lvl + 1, lvar, pc, cc)
+    quote
+        _lo = Int($ps[$p_var])     - Int(_origin_off)
+        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
+        for $lvar in (_lo + 1):_hi
+            _col_idx = Int($cs[$lvar]) - Int(_origin_off) + 1
+            _nnz_pos = $lvar
+            $inner
+        end
+    end
+end
+
+function _emit_s2d_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc)
+    ci = cc[] += 1
+    cs = Symbol(:_crd, ci)
+    inner = _emit_s2d_level(levels, lvl + 1, p_var, pc, cc)
+    quote
+        _col_idx = Int($cs[$p_var]) - Int(_origin_off) + 1
+        _nnz_pos = $p_var
+        $inner
+    end
+end
+
+function _emit_s2d_lv(::Union{RangeLevel,DeltaLevel}, levels, lvl, _, pc, cc)
+    error("EmitterBackend sparse_to_dense: RangeLevel/DeltaLevel not supported.")
+end
+
+# ─── Kernel cache and launch ──────────────────────────────────────────────────
+
+function _get_s2d_kernel(fmt::TensorFormat)
+    key = (fmt, Any, :s2d)
+    haskey(_emitter_cache, key) && return _emitter_cache[key]
+
+    body      = _emit_s2d_body(fmt)
+    buf_names = _sparse_arg_names(fmt)
+    arg_names = vcat(buf_names, [:_dense, :_origin_off, :_n_outer])
+    fname     = gensym(:ust_s2d)
+
+    kern = @eval begin
+        @kernel inbounds=true function $fname($(arg_names...))
+            $body
+        end
+        $fname
+    end
+
+    _emitter_cache[key] = kern
+    return kern
+end
+
+# ─── sparse_to_dense ──────────────────────────────────────────────────────────
+
+function JLUST.sparse_to_dense(::EmitterBackend, u::USTensor{T,I,N,VA,VI,O}) where {T,I,N,VA,VI,O}
+    fmt     = format(u)
+    ka      = KernelAbstractions.get_backend(nonzeros(u))
+    off     = Int32(O === OneBased ? 1 : 0)
+    n_outer = Int32(_spmv_ndrange(u))
+
+    dense_val = KernelAbstractions.zeros(ka, T, extents(u)...)
+    VA2 = typeof(dense_val)
+    kern = _get_s2d_kernel(fmt)
+
+    sparse_bufs = _sparse_args(u)
+    all_args    = (sparse_bufs..., dense_val, off, n_outer)
+
+    kernel_obj = Base.invokelatest(kern, ka, 64)
+    Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+
+    fmt_dense = Formats.DensedRight(N)
+    USTensor{T,I,N,VA2,VI,O}(extents(u), fmt_dense,
+                               Dict{Int,VI}(), Dict{Int,VI}(), dense_val, nothing)
+end
+
+function JLUST.sparse_to_dense(u::USTensor; backend=EmitterBackend(), kw...)
+    JLUST.sparse_to_dense(backend, u; kw...)
+end
+
+# ─── dense_to_sparse ──────────────────────────────────────────────────────────
+
+function JLUST.dense_to_sparse(::EmitterBackend, u::USTensor, fmt::TensorFormat; kw...)
+    error("EmitterBackend does not support dense_to_sparse — requires parallel prefix " *
+          "sums. Use CUSPARSEBackend() or convert_format() via a COO intermediate.")
+end
