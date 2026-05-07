@@ -16,11 +16,13 @@ import JLUST:
 
 import CUDA.CUSPARSE:
     CuSparseMatrixDescriptor, CuDenseVectorDescriptor, CuDenseMatrixDescriptor,
+    CuSpGEMMDescriptor,
     handle,
     cusparseSpMV_bufferSize, cusparseSpMV_preprocess, cusparseSpMV,
     cusparseSpMM_bufferSize, cusparseSpMM_preprocess, cusparseSpMM,
     cusparseDnVecSetValues, cusparseDnMatSetValues,
     cusparseSpMatSetValues, cusparseSpMatSetAttribute,
+    cusparseSpMatGetSize, cusparseCsrSetPointers,
     CUSPARSE_SPMV_ALG_DEFAULT, CUSPARSE_SPMM_ALG_DEFAULT,
     cusparseSpMVAlg_t, cusparseSpMMAlg_t,
     CuSparseSpSVDescriptor, CuSparseSpSMDescriptor,
@@ -31,7 +33,12 @@ import CUDA.CUSPARSE:
     cusparseFillMode_t, cusparseDiagType_t,
     CUSPARSE_FILL_MODE_LOWER, CUSPARSE_FILL_MODE_UPPER,
     CUSPARSE_DIAG_TYPE_NON_UNIT, CUSPARSE_DIAG_TYPE_UNIT,
-    CUSPARSE_SPMAT_FILL_MODE, CUSPARSE_SPMAT_DIAG_TYPE
+    CUSPARSE_SPMAT_FILL_MODE, CUSPARSE_SPMAT_DIAG_TYPE,
+    cusparseSpGEMMAlg_t, CUSPARSE_SPGEMM_DEFAULT,
+    cusparseSpGEMMreuse_workEstimation, cusparseSpGEMMreuse_nnz,
+    cusparseSpGEMMreuse_copy, cusparseSpGEMMreuse_compute,
+    cusparseSDDMMAlg_t, CUSPARSE_SDDMM_ALG_DEFAULT,
+    cusparseSDDMM_bufferSize, cusparseSDDMM_preprocess, cusparseSDDMM
 
 # ─── Memory space trait ───────────────────────────────────────────────────────
 
