@@ -428,5 +428,3 @@ function _lexsort_cols(A::Matrix)
     sortperm(keys)
 end
 
-# materialize stub — concrete method added by CUDAExt
-function materialize end

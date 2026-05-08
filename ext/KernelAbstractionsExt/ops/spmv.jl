@@ -120,7 +120,7 @@ end
 
 function _emit_spmv_lv(lv::AbstractLevelFormat, _levels, _lvl, ::Nothing,
                         _pc, _cc, _T, _na, _input_fn_sym, _output_fn_sym)
-    error("emit_spmv_lv: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+    error("EmitterBackend SpMV: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
 end
 
 # DenseLevel / BatchLevel (outermost) → thread = dense row index
@@ -237,7 +237,7 @@ end
 
 function _emit_spmv_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na,
                         input_fn_sym, output_fn_sym)
-    error("EmitterBackend SpMV: RangeLevel (DIA-style) kernels not yet emitted. " *
+    error("EmitterBackend SpMV: RangeLevel (DIA-style) kernels not supported. " *
           "Use convert_format to CSR or DCSR first.")
 end
 

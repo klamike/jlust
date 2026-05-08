@@ -180,12 +180,11 @@ struct RotOp <: AbstractUSTOp
     y::TensorFormat   # dense
 end
 
-# ─── Operation function stubs ─────────────────────────────────────────────────
+# ─── Operation function declarations ─────────────────────────────────────────
 #
 # Declared here so the full operation API is visible in one place.
 # Backend extensions (KernelAbstractionsExt, CUDAExt) add concrete methods.
 
-# Generic function stubs — methods are added by backend extensions
 function materialize end
 
 """

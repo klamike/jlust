@@ -133,7 +133,7 @@ function _emit_spmm_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
 end
 
 function _emit_spmm_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na)
-    error("EmitterBackend SpMM: RangeLevel (DIA-style) kernels not yet emitted. " *
+    error("EmitterBackend SpMM: RangeLevel (DIA-style) kernels not supported. " *
           "Use convert_format to CSR or DCSR first.")
 end
 

@@ -2,9 +2,6 @@
 #
 # sparse_to_dense: scatter stored NNZ into a pre-zeroed dense matrix.
 #   Parallelism: one thread per outer fiber of the sparse tensor (same as SpMV).
-#
-# dense_to_sparse: requires parallel prefix sums to count / place NNZ —
-#   not implemented; throws a clear error.
 
 function JLUST.supports_backend(::EmitterBackend, op::SparseToDenseOp)
     _is_emittable(op.src)

@@ -321,9 +321,9 @@ function JLUST.prepare(::EmitterBackend, ::Type{SpGEMMOp},
                         transa::Char='N', transb::Char='N',
                         alpha=one(T), beta=zero(T)) where {T, Ti}
     (transa == 'N' && transb == 'N') ||
-        error("EmitterSpGEMMHandle: transposed operands not yet supported")
+        error("EmitterSpGEMMHandle: transposed operands not supported")
     beta == zero(T) ||
-        error("EmitterSpGEMMHandle: beta ≠ 0 not yet supported")
+        error("EmitterSpGEMMHandle: beta ≠ 0 not supported")
     (format(u_A) == Formats.CSR && format(u_B) == Formats.CSR) ||
         error("EmitterSpGEMMHandle: only CSR×CSR supported")
 
@@ -443,7 +443,7 @@ function JLUST.sparse_gemm!(h::EmitterSpGEMMHandle{K, T, Ti},
                               u_A::USTensor, u_B::USTensor;
                               alpha=one(T), beta=zero(T)) where {K, T, Ti}
     beta == zero(T) ||
-        error("EmitterSpGEMMHandle sparse_gemm!: beta ≠ 0 not yet supported")
+        error("EmitterSpGEMMHandle sparse_gemm!: beta ≠ 0 not supported")
 
     h.total_products == 0 &&
         return csr_tensor(h.C_rowPtr, h.C_colInd, h.C_nzVal, (h.m, h.n); origin=h.orig)
@@ -491,9 +491,9 @@ function JLUST.sparse_gemm!(::EmitterBackend,
                               transa::Char='N', transb::Char='N',
                               alpha=one(T), beta=zero(T)) where {T, Ti}
     (transa == 'N' && transb == 'N') ||
-        error("EmitterBackend sparse_gemm!: transposed operands not yet supported")
+        error("EmitterBackend sparse_gemm!: transposed operands not supported")
     beta == zero(T) ||
-        error("EmitterBackend sparse_gemm!: beta ≠ 0 not yet supported")
+        error("EmitterBackend sparse_gemm!: beta ≠ 0 not supported")
     (format(u_A) == Formats.CSR && format(u_B) == Formats.CSR) ||
         error("EmitterBackend sparse_gemm!: only CSR×CSR supported")
 
