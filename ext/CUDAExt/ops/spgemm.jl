@@ -29,7 +29,7 @@ end
 
 export CUSPARSESpGEMMHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SpGEMMOp},
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpGEMM}},
                         u_A::USTensor{T,Ti}, u_B::USTensor;
                         transa::Char='N', transb::Char='N') where {T<:_CUSPARSE_ELTYPES, Ti}
     idx  = _cusparse_index(u_A)
@@ -132,7 +132,3 @@ function JLUST.sparse_gemm!(::CUSPARSEBackend,
     ust(out)
 end
 
-function JLUST.sparse_gemm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                              backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_gemm!(backend, u_A, u_B, u_C; kw...)
-end

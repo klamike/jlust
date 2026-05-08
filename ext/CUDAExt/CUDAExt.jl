@@ -6,10 +6,9 @@ using SparseArrays
 import SparseArrays: nonzeros, rowvals
 import Adapt
 import JLUST:
-    USTensor, TensorFormat, AbstractUSTBackend,
+    USTensor, TensorFormat, AbstractUSTBackend, Op,
     format, extents, index_origin, OneBased, ZeroBased, format_family,
     positions, coordinates,
-    SpMVOp, SpMMOp, SpGEMMOp, SpSVOp, SpSMOp,
     sparse_mv!, sparse_mm!, sparse_gemm!, sparse_sv!, sparse_sm!, sparse_sddmm!,
     sparse_to_dense, dense_to_sparse,
     prepare, update_values!,
@@ -164,106 +163,124 @@ end
 _adaptor(::CPUDevice)  = Array
 _adaptor(::CUDADevice) = CuArray
 
+# ─── Default backend policy for CUDA-backed tensors ─────────────────────────
+#
+# Per-op selection: SpMV stays on EmitterBackend (warp-shuffle CSR kernel beats
+# cuSPARSE on the L40S benchmark for the matrix sizes we target).  All other ops
+# default to CUSPARSEBackend on CuArray-backed tensors — vendor-tuned kernels
+# outperform the emitter for SpMM / SpGEMM / SpSV / SpSM / SDDMM.
+
+const _CuUST = USTensor{T,I,N,VA} where {T,I,N,VA<:CuArray}
+
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SpMM}})           = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:BatchedSpMM}})    = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SpGEMM}})         = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SpSV}})           = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SpSM}})           = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SDDMM}})          = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:SparseToDense}})  = CUSPARSEBackend()
+JLUST.default_backend(::_CuUST, ::Type{<:Op{:DenseToSparse}})  = CUSPARSEBackend()
+
 # ─── Backend capability ───────────────────────────────────────────────────────
+#
+# All capability checks are pure type-level dispatch.  Operand format types are
+# in the Op's type parameters; their family / level structure / etc. is in the
+# TensorFormat type system.  No value comparisons, no Dict lookups, no runtime
+# field reads — capability resolves through Julia's method table.
 
 # CUSPARSEBackend is defined in JLUST core (src/backends.jl); imported above.
 
-# Generic-API formats (cusparseSpMV / cusparseSpMM / cusparseSpSV / cusparseSpSM).
-const _CUSPARSE_GENERIC_FORMATS = Set([Formats.CSR, Formats.CSC, Formats.COO])
-# Triangular-solve formats (generic SpSV / SpSM).
-const _CUSPARSE_TRISV_FORMATS   = Set([Formats.CSR, Formats.CSC])
+# Generic-API families (cusparseSpMV / cusparseSpMM / cusparseSpSV / cusparseSpSM).
+const _CUSPARSE_GENERIC_FAMILIES = (:CSR, :CSC, :COO)
+const _CUSPARSE_TRISV_FAMILIES   = (:CSR, :CSC)
 
-const _dense1 = Formats.DensedRight(1)
-const _dense2 = Formats.DensedRight(2)
+# Type-level predicates dispatched on the format's Family parameter.
+@inline _is_csr(::Type{<:TensorFormat{LT, :CSR}}) where {LT} = true
+@inline _is_csr(::Type)                                       = false
+@inline _is_dense(::Type{<:TensorFormat{LT, :Dense}}) where {LT} = true
+@inline _is_dense(::Type{<:TensorFormat{LT, :DenseVector}}) where {LT} = true
+@inline _is_dense(::Type)                                              = false
+@inline _is_bsr(::Type{<:TensorFormat{LT, :BSR}}) where {LT} = true
+@inline _is_bsr(::Type)                                       = false
+@inline _is_sell(::Type{<:TensorFormat{LT, :SELL}}) where {LT} = true
+@inline _is_sell(::Type)                                       = false
+@inline _is_bell(::Type{<:TensorFormat{LT, :BlockedELL}}) where {LT} = true
+@inline _is_bell(::Type)                                              = false
+@inline _is_generic(F)  = format_family(F) in _CUSPARSE_GENERIC_FAMILIES
+@inline _is_trisv_fmt(F) = format_family(F) in _CUSPARSE_TRISV_FAMILIES
 
-# Format family predicates — use the typed :family field, not name strings.
-_is_bsr(fmt::TensorFormat)  = format_family(fmt) == :BSR
-_is_sell(fmt::TensorFormat) = format_family(fmt) == :SELL
-_is_bell(fmt::TensorFormat) = format_family(fmt) == :BlockedELL
+# `nlevels(::Type)` — number of levels in a TensorFormat type.
+@inline nlevels(::Type{<:TensorFormat{LT}}) where {LT} = length(LT.parameters)
 
-# SpVV: x sparse (CSR/COO-style vector), y dense.
-# cuSPARSE: cusparseSpVV.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpVVOp)
-    op.x in _CUSPARSE_GENERIC_FORMATS && op.y == _dense1
+# `_is_dense_n(F, N)` — F is a dense format with N levels.
+@inline _is_dense_n(F, N::Int) = _is_dense(F) && nlevels(F) == N
+
+# SpVV: x sparse, y dense (1D).
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpVV, Tuple{X, Y}}) where {X, Y}
+    _is_generic(X) && _is_dense_n(Y, 1)
 end
 
-# SpMV: A sparse, x and y dense vectors.
-# Generic API: CSR, CSC, COO.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpMVOp)
-    op.A in _CUSPARSE_GENERIC_FORMATS && op.x == _dense1 && op.y == _dense1
+# SpMV: A sparse, x and y 1D dense.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpMV, Tuple{A, X, Y}}) where {A, X, Y}
+    _is_generic(A) && _is_dense_n(X, 1) && _is_dense_n(Y, 1)
 end
 
-# SpMM: A sparse, B and C dense matrices.
-# Generic API: CSR, CSC, COO.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpMMOp)
-    op.A in _CUSPARSE_GENERIC_FORMATS && op.B == _dense2 && op.C == _dense2
+# SpMM: A sparse, B and C 2D dense.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_generic(A) && _is_dense_n(B, 2) && _is_dense_n(C, 2)
 end
 
-# BatchedSpMM: CuSparseArrayCSR (N-D); B and C dense.
-# cuSPARSE: cusparseSpMM on batched CuSparseArrayCSR.
-function JLUST.supports_backend(::CUSPARSEBackend, op::BatchedSpMMOp)
-    op.A == Formats.CSR && op.B == _dense2 && op.C == _dense2
+# BatchedSpMM: only CSR with 2D dense B/C; cuSPARSE batched SpMM via CuSparseArrayCSR.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:BatchedSpMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_csr(A) && _is_dense_n(B, 2) && _is_dense_n(C, 2)
 end
 
-# SpGEMM: cusparseSpGEMM requires CSR×CSR→CSR.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpGEMMOp)
-    op.A == Formats.CSR && op.B == Formats.CSR && op.C == Formats.CSR
+# SpGEMM: CSR×CSR→CSR.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpGEMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_csr(A) && _is_csr(B) && _is_csr(C)
 end
 
-# SpSV: sparse triangular solve, single RHS.
-# Generic API: CSR, CSC.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpSVOp)
-    op.A in _CUSPARSE_TRISV_FORMATS && op.b == _dense1 && op.x == _dense1
+# SpSV: sparse triangular solve (single RHS); CSR or CSC, 1D dense b/x.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpSV, Tuple{A, B, X}}) where {A, B, X}
+    _is_trisv_fmt(A) && _is_dense_n(B, 1) && _is_dense_n(X, 1)
 end
 
-# SpSM: sparse triangular solve, multiple RHS.
-# Generic API: CSR, CSC; B and C dense.  BSR not supported by generic SpSM.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SpSMOp)
-    op.A in _CUSPARSE_TRISV_FORMATS && op.B == _dense2 && op.C == _dense2
+# SpSM: sparse triangular solve (multi-RHS); CSR or CSC, 2D dense B/C.
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SpSM, Tuple{A, B, C}}) where {A, B, C}
+    _is_trisv_fmt(A) && _is_dense_n(B, 2) && _is_dense_n(C, 2)
 end
 
-# SDDMM: C (sparse mask/result) must be CSR or COO.
-function JLUST.supports_backend(::CUSPARSEBackend, op::SDDMMOp)
-    op.A == _dense2 && op.B == _dense2 &&
-    (op.C == Formats.CSR || op.C == Formats.COO)
+# SDDMM: A,B 2D dense; C sparse (CSR or COO).
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SDDMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_dense_n(A, 2) && _is_dense_n(B, 2) &&
+    (format_family(C) === :CSR || format_family(C) === :COO)
 end
 
-# SparseToDense: CSR, CSC, COO (generic API).
-function JLUST.supports_backend(::CUSPARSEBackend, op::SparseToDenseOp)
-    op.src in _CUSPARSE_GENERIC_FORMATS
-end
-
-# DenseToSparse: CSR, CSC, COO only (generic cusparseDenseToSparse).
-function JLUST.supports_backend(::CUSPARSEBackend, op::DenseToSparseOp)
-    op.dst in _CUSPARSE_GENERIC_FORMATS
-end
+# SparseToDense / DenseToSparse: CSR, CSC, COO (generic API).
+JLUST.supports_backend(::CUSPARSEBackend, ::Op{:SparseToDense, Tuple{S}}) where {S} = _is_generic(S)
+JLUST.supports_backend(::CUSPARSEBackend, ::Op{:DenseToSparse, Tuple{D}}) where {D} = _is_generic(D)
 
 # Sparse vector ops: COO-style (index + value arrays).
-function JLUST.supports_backend(::CUSPARSEBackend, op::GatherOp)
-    op.fmt == Formats.COO
+JLUST.supports_backend(::CUSPARSEBackend, ::Op{:Gather,  Tuple{F}}) where {F} = format_family(F) === :COO
+JLUST.supports_backend(::CUSPARSEBackend, ::Op{:Scatter, Tuple{F}}) where {F} = format_family(F) === :COO
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:Axpby, Tuple{X, Y}}) where {X, Y}
+    format_family(X) === :COO && _is_dense_n(Y, 1)
 end
-
-function JLUST.supports_backend(::CUSPARSEBackend, op::ScatterOp)
-    op.fmt == Formats.COO
-end
-
-function JLUST.supports_backend(::CUSPARSEBackend, op::AxpbyOp)
-    op.x == Formats.COO && op.y == _dense1
-end
-
-function JLUST.supports_backend(::CUSPARSEBackend, op::RotOp)
-    op.x == Formats.COO && op.y == _dense1
+function JLUST.supports_backend(::CUSPARSEBackend, ::Op{:Rot, Tuple{X, Y}}) where {X, Y}
+    format_family(X) === :COO && _is_dense_n(Y, 1)
 end
 
 # Direct format conversions (vendor-accelerated).
 # CSR↔CSC, CSR↔COO: generic API.  BSR↔CSR: csr2bsr / bsr2csr legacy API.
 function JLUST.supports_convert(::CUSPARSEBackend, src::TensorFormat, dst::TensorFormat)
-    (src == Formats.CSR  && dst == Formats.CSC) ||
-    (src == Formats.CSC  && dst == Formats.CSR) ||
-    (src == Formats.CSR  && dst == Formats.COO) ||
-    (src == Formats.COO  && dst == Formats.CSR) ||
-    (src == Formats.CSR  && _is_bsr(dst))       ||   # csr2bsr
-    (_is_bsr(src)        && dst == Formats.CSR)       # bsr2csr
+    fs = format_family(src)
+    fd = format_family(dst)
+    (fs === :CSR && fd === :CSC) ||
+    (fs === :CSC && fd === :CSR) ||
+    (fs === :CSR && fd === :COO) ||
+    (fs === :COO && fd === :CSR) ||
+    (fs === :CSR && fd === :BSR) ||   # csr2bsr
+    (fs === :BSR && fd === :CSR)      # bsr2csr
 end
 
 function JLUST.validate_storage(u::USTensor, backend::CUSPARSEBackend; op = :unknown)

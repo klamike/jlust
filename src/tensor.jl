@@ -32,24 +32,26 @@ struct USTensor{T, I, N,
                 O  <: AbstractIndexOrigin,
                 NL,
                 FMT <: TensorFormat,
+                OW,
                } <: AbstractUSTensor{T,N}
     extents     :: NTuple{N,Int}
     format      :: FMT
     pos_buffers :: NTuple{NL, Union{Nothing, VI}}
     crd_buffers :: NTuple{NL, Union{Nothing, VI}}
     val         :: VA
-    owner       :: Any   # GC anchor for zero-copy views
+    owner       :: OW   # GC anchor for zero-copy views; Nothing when no source
 end
 
-# ─── Convenience constructor: infer NL from format, accept Dict or Tuple ─────
+# ─── Convenience constructor: infer NL, FMT, OW from arguments ──────────────
 #
-# Existing call sites pass Dict{Int,VI}; the helper converts to NTuple at
-# construction.  New call sites can pass NTuple directly to skip the conversion.
+# Canonical pos/crd storage is NTuple{NL, Union{Nothing, VI}}.  Constructors
+# accept any heterogeneous tuple (e.g. `(nothing, posbuf)`) and the helper
+# normalises it to the homogeneous union form via `convert`.  No other input
+# shape is supported — public construction goes through csr_tensor / csc_tensor
+# / coo_tensor / dcsr_tensor / make_tensor / ust(...).
 
-@inline _to_buf_tuple(t::NTuple, _NL::Int, ::Type) = t
-function _to_buf_tuple(d::Dict, NL::Int, ::Type{VI}) where {VI}
-    ntuple(i -> get(d, i, nothing), NL)::NTuple{NL, Union{Nothing, VI}}
-end
+@inline _to_buf_tuple(t::Tuple, NL::Int, ::Type{VI}) where {VI} =
+    convert(NTuple{NL, Union{Nothing, VI}}, t)::NTuple{NL, Union{Nothing, VI}}
 
 # Build a length-NL pos/crd tuple with `buf` at level `at` and `nothing` elsewhere.
 @inline _bufs_at(::Val{NL}, ::Type{VI}, at::Int, buf::VI) where {NL, VI} =
@@ -60,17 +62,23 @@ end
     ntuple(_ -> nothing, Val(NL))::NTuple{NL, Union{Nothing, VI}}
 
 function USTensor{T,I,N,VA,VI,O}(extents::NTuple{N,Int}, format::FMT,
-                                  pos_bufs, crd_bufs, val::VA, owner) where {T,I,N,VA,VI,O,FMT<:TensorFormat}
+                                  pos_bufs, crd_bufs, val::VA, owner::OW) where {T,I,N,VA,VI,O,FMT<:TensorFormat,OW}
     NL  = length(format.levels)
     pos = _to_buf_tuple(pos_bufs, NL, VI)
     crd = _to_buf_tuple(crd_bufs, NL, VI)
-    USTensor{T,I,N,VA,VI,O,NL,FMT}(extents, format, pos, crd, val, owner)
+    USTensor{T,I,N,VA,VI,O,NL,FMT,OW}(extents, format, pos, crd, val, owner)
 end
 
-# 7-param convenience: NL specified, FMT inferred from format value.
+# 7-param convenience: NL specified, FMT and OW inferred.
 function USTensor{T,I,N,VA,VI,O,NL}(extents::NTuple{N,Int}, format::FMT,
-                                     pos_bufs, crd_bufs, val::VA, owner) where {T,I,N,VA,VI,O,NL,FMT<:TensorFormat}
-    USTensor{T,I,N,VA,VI,O,NL,FMT}(extents, format, pos_bufs, crd_bufs, val, owner)
+                                     pos_bufs, crd_bufs, val::VA, owner::OW) where {T,I,N,VA,VI,O,NL,FMT<:TensorFormat,OW}
+    USTensor{T,I,N,VA,VI,O,NL,FMT,OW}(extents, format, pos_bufs, crd_bufs, val, owner)
+end
+
+# 8-param convenience: NL and FMT specified, OW inferred.
+function USTensor{T,I,N,VA,VI,O,NL,FMT}(extents::NTuple{N,Int}, format::FMT,
+                                         pos_bufs, crd_bufs, val::VA, owner::OW) where {T,I,N,VA,VI,O,NL,FMT<:TensorFormat,OW}
+    USTensor{T,I,N,VA,VI,O,NL,FMT,OW}(extents, format, pos_bufs, crd_bufs, val, owner)
 end
 
 # ─── Memory space trait ───────────────────────────────────────────────────────
@@ -121,7 +129,7 @@ Base.length(u::USTensor)        = prod(u.extents)
 
 function Base.copy(u::USTensor{T,I,N,VA,VI,O,NL,FMT}) where {T,I,N,VA,VI,O,NL,FMT}
     _copy_or_nothing(b) = b === nothing ? nothing : copy(b)
-    USTensor{T,I,N,VA,VI,O,NL,FMT}(
+    USTensor{T,I,N,VA,VI,O,NL,FMT,Nothing}(
         u.extents,
         u.format,
         map(_copy_or_nothing, u.pos_buffers),

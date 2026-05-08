@@ -299,7 +299,7 @@ end
 # Subsequent sparse_gemm!(h, u_A, u_B) calls recompute values from a_idx/b_idx
 # without any sort, scatter, or malloc.
 
-mutable struct EmitterSpGEMMHandle{K, T, Ti}
+mutable struct EmitterSpGEMMHandle{K, T, Ti, ORIG<:AbstractIndexOrigin}
     C_rowPtr::AbstractVector{Ti}
     C_colInd::AbstractVector{Ti}
     C_nzVal::AbstractVector{T}
@@ -309,14 +309,15 @@ mutable struct EmitterSpGEMMHandle{K, T, Ti}
     is_head::AbstractVector{Bool}   # segment head flags; empty if fast path
     nnzC::Int
     total_products::Int
-    m::Int; n::Int; off::Int32; orig::Any
+    m::Int; n::Int; off::Int32
+    orig::ORIG
 end
 
 export EmitterSpGEMMHandle
 
 # ── prepare (symbolic analysis + first numeric result) ───────────────────────
 
-function JLUST.prepare(::EmitterBackend, ::Type{SpGEMMOp},
+function JLUST.prepare(::EmitterBackend, ::Type{<:Op{:SpGEMM}},
                         u_A::USTensor{T,Ti}, u_B::USTensor;
                         transa::Char='N', transb::Char='N',
                         alpha=one(T), beta=zero(T)) where {T, Ti}
@@ -350,9 +351,10 @@ function JLUST.prepare(::EmitterBackend, ::Type{SpGEMMOp},
         b_idx    = similar(A_rowPtr, Int32, 0)
         c_pos    = similar(A_rowPtr, Int32, 0)
         is_head  = similar(A_rowPtr, Bool,  0)
-        return EmitterSpGEMMHandle{UInt32, T, Ti}(
+        orig = index_origin(u_A)
+        return EmitterSpGEMMHandle{UInt32, T, Ti, typeof(orig)}(
             C_rowPtr, C_colInd, C_nzVal, a_idx, b_idx, c_pos, is_head,
-            0, 0, m, n, off, index_origin(u_A))
+            0, 0, m, n, off, orig)
     end
 
     prod_offset = similar(A_rowPtr, Int64, m + 1)
@@ -426,9 +428,10 @@ function JLUST.prepare(::EmitterBackend, ::Type{SpGEMMOp},
         is_head_stored = copy(heads)
     end
 
-    return EmitterSpGEMMHandle{K, T, Ti}(
+    orig = index_origin(u_A)
+    return EmitterSpGEMMHandle{K, T, Ti, typeof(orig)}(
         C_rowPtr, C_colInd, C_nzVal, a_idx, b_idx, c_pos_stored, is_head_stored,
-        nnzC, total_products, m, n, off, index_origin(u_A))
+        nnzC, total_products, m, n, off, orig)
 end
 
 # ── Handle path — product-parallel numeric; no sort, no malloc ────────────────

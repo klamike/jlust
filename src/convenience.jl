@@ -1,28 +1,67 @@
 import LinearAlgebra
 
-# ─── Accept AbstractMatrix in sparse_mm! ─────────────────────────────────────
+# ─── No-backend convenience wrappers ─────────────────────────────────────────
 #
-# Wraps raw matrices as dense USTensors (DensedRight(2) format) so callers
-# can pass plain Matrix / CuMatrix without constructing USTensors manually.
+# Each op's no-backend wrapper consults `default_backend(u, OpTag)` to pick
+# the right backend.  Extensions override `default_backend` per (storage, op)
+# combination — e.g. CUDAExt selects CUSPARSEBackend for SpMM on CuArray-backed
+# tensors but stays on EmitterBackend for SpMV.  This is the single point of
+# truth for backend-selection policy; extensions never override these wrappers.
+
+function sparse_mv!(A::USTensor, x::USTensor, y::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(A, SpMVOp))
+    sparse_mv!(be, A, x, y; kw...)
+end
+
+function sparse_mm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(A, SpMMOp))
+    sparse_mm!(be, A, B, C; kw...)
+end
+
+function sparse_gemm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(A, SpGEMMOp))
+    sparse_gemm!(be, A, B, C; kw...)
+end
+
+function sparse_sv!(A::USTensor, b::USTensor, x::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(A, SpSVOp))
+    sparse_sv!(be, A, b, x; kw...)
+end
+
+function sparse_sm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(A, SpSMOp))
+    sparse_sm!(be, A, B, C; kw...)
+end
+
+function sparse_sddmm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(C, SDDMMOp))   # C is the sparse arg
+    sparse_sddmm!(be, A, B, C; kw...)
+end
+
+function sparse_to_dense(u::USTensor; backend=nothing, kw...)
+    be = something(backend, default_backend(u, SparseToDenseOp))
+    sparse_to_dense(be, u; kw...)
+end
+
+# ─── Accept AbstractMatrix / AbstractVector ─────────────────────────────────
+#
+# Wraps raw arrays as dense USTensors (DensedRight(N) format) so callers can
+# pass plain Matrix / CuMatrix / Vector / CuVector without manual wrapping.
 
 function sparse_mm!(be::AbstractUSTBackend, A::USTensor,
                     B::AbstractMatrix, C::AbstractMatrix; kw...)
     sparse_mm!(be, A, ust(B), ust(C); kw...)
 end
-
 function sparse_mm!(A::USTensor, B::AbstractMatrix, C::AbstractMatrix; kw...)
     sparse_mm!(A, ust(B), ust(C); kw...)
 end
 
-# ─── Accept AbstractVector in sparse_mv! ─────────────────────────────────────
-#
-# The no-backend overload lives in KernelAbstractionsExt (default backend is
-# resolved there).  The explicit-backend and handle overloads below belong
-# here so they don't depend on any extension being loaded.
-
 function sparse_mv!(be::AbstractUSTBackend, A::USTensor,
                     x::AbstractVector, y::AbstractVector; kw...)
     sparse_mv!(be, A, ust(x), ust(y); kw...)
+end
+function sparse_mv!(A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
+    sparse_mv!(A, ust(x), ust(y); kw...)
 end
 
 function sparse_mv!(h, A::USTensor, x::AbstractVector, y::AbstractVector; kw...)

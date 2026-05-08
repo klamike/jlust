@@ -43,13 +43,17 @@ const Scalar = TensorFormat((), (); name=:Scalar)
 
 # ─── Parameterized format builders ────────────────────────────────────────────
 
+# Block sizes are statically known for the blocked-modulo (i%B, j%B) inner dims,
+# so they enter the DenseLevel type — emitter unrolls those loops at compile time
+# and BSR(2,2) vs BSR(4,4) become structurally distinct types in the cache.
+
 function BSRRight(blocksize::Tuple{Int,Int})
     b1, b2 = blocksize
     i, j = dims(:i, :j)
     TensorFormat(
         [i, j],
         [i÷b1 => DenseLevel(), j÷b2 => CompressedLevel(),
-         i%b1 => DenseLevel(), j%b2 => DenseLevel()];
+         i%b1 => DenseLevel(b1), j%b2 => DenseLevel(b2)];
         name   = Symbol("BSRRight$(b1)x$(b2)"),
         family = :BSR,
     )
@@ -61,7 +65,7 @@ function BSRLeft(blocksize::Tuple{Int,Int})
     TensorFormat(
         [i, j],
         [i÷b1 => DenseLevel(), j÷b2 => CompressedLevel(),
-         j%b2 => DenseLevel(), i%b1 => DenseLevel()];
+         j%b2 => DenseLevel(b2), i%b1 => DenseLevel(b1)];
         name   = Symbol("BSRLeft$(b1)x$(b2)"),
         family = :BSR,
     )
@@ -73,7 +77,7 @@ function BSCRight(blocksize::Tuple{Int,Int})
     TensorFormat(
         [i, j],
         [j÷b2 => DenseLevel(), i÷b1 => CompressedLevel(),
-         i%b1 => DenseLevel(), j%b2 => DenseLevel()];
+         i%b1 => DenseLevel(b1), j%b2 => DenseLevel(b2)];
         name   = Symbol("BSCRight$(b1)x$(b2)"),
         family = :BSC,
     )
@@ -85,7 +89,7 @@ function BSCLeft(blocksize::Tuple{Int,Int})
     TensorFormat(
         [i, j],
         [j÷b2 => DenseLevel(), i÷b1 => CompressedLevel(),
-         j%b2 => DenseLevel(), i%b1 => DenseLevel()];
+         j%b2 => DenseLevel(b2), i%b1 => DenseLevel(b1)];
         name   = Symbol("BSCLeft$(b1)x$(b2)"),
         family = :BSC,
     )
@@ -107,7 +111,7 @@ function BSR3(blocksize::Tuple{Int,Int,Int})
     TensorFormat(
         [i, j, k],
         [i÷b1 => DenseLevel(), j÷b2 => CompressedLevel(), k÷b3 => CompressedLevel(),
-         i%b1 => DenseLevel(), j%b2 => DenseLevel(),       k%b3 => DenseLevel()];
+         i%b1 => DenseLevel(b1), j%b2 => DenseLevel(b2),  k%b3 => DenseLevel(b3)];
         name   = Symbol("BSR3$(b1)x$(b2)x$(b3)"),
         family = :BSR,
     )
@@ -117,7 +121,7 @@ function BlockVector(blocksize::Int)
     i, = dims(:i)
     TensorFormat(
         [i],
-        [i÷blocksize => CompressedLevel(), i%blocksize => DenseLevel()];
+        [i÷blocksize => CompressedLevel(), i%blocksize => DenseLevel(blocksize)];
         name   = Symbol("BlockVector$(blocksize)"),
         family = :BlockVector,
     )
@@ -133,7 +137,7 @@ function SELL(slice_size::Int)
     i, j = dims(:i, :j)
     TensorFormat(
         [i, j],
-        [i÷slice_size => CompressedLevel(), j => DenseLevel(), i%slice_size => DenseLevel()];
+        [i÷slice_size => CompressedLevel(), j => DenseLevel(), i%slice_size => DenseLevel(slice_size)];
         name   = Symbol("SELL$(slice_size)"),
         family = :SELL,
     )
@@ -150,7 +154,7 @@ function BlockedELL(block_size::Int)
     TensorFormat(
         [i, j],
         [i÷block_size => DenseLevel(), j÷block_size => DenseLevel(),
-         i%block_size => DenseLevel(), j%block_size => DenseLevel()];
+         i%block_size => DenseLevel(block_size), j%block_size => DenseLevel(block_size)];
         name   = Symbol("BlockedELL$(block_size)"),
         family = :BlockedELL,
     )
@@ -236,7 +240,7 @@ function BSRRightd(blocksize::Tuple{Int,Int}, batch_dim::Int=0, dense_dim::Int=0
     bi, bj = ds[batch_dim+1], ds[batch_dim+2]
     batch_pairs = [ds[d+1] => BatchLevel() for d in 0:batch_dim-1]
     block_pairs = [bi÷b1 => DenseLevel(), bj÷b2 => CompressedLevel(),
-                   bi%b1 => DenseLevel(), bj%b2 => DenseLevel()]
+                   bi%b1 => DenseLevel(b1), bj%b2 => DenseLevel(b2)]
     dense_pairs = [ds[d+1] => DenseLevel() for d in batch_dim+2:dim-1]
     name_str = "BSRRight$(b1)x$(b2)" *
                (batch_dim > 0 ? "-b$(batch_dim)" : "") *
@@ -251,7 +255,7 @@ function BSCRightd(blocksize::Tuple{Int,Int}, batch_dim::Int=0, dense_dim::Int=0
     bi, bj = ds[batch_dim+1], ds[batch_dim+2]
     batch_pairs = [ds[d+1] => BatchLevel() for d in 0:batch_dim-1]
     block_pairs = [bj÷b2 => DenseLevel(), bi÷b1 => CompressedLevel(),
-                   bi%b1 => DenseLevel(), bj%b2 => DenseLevel()]
+                   bi%b1 => DenseLevel(b1), bj%b2 => DenseLevel(b2)]
     dense_pairs = [ds[d+1] => DenseLevel() for d in batch_dim+2:dim-1]
     name_str = "BSCRight$(b1)x$(b2)" *
                (batch_dim > 0 ? "-b$(batch_dim)" : "") *

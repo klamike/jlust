@@ -17,7 +17,7 @@ end
 
 export CUSPARSESpMMHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SpMMOp}, u_A::USTensor{T,Ti};
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMM}}, u_A::USTensor{T,Ti};
                         transa::Char='N', transb::Char='N',
                         n_cols::Int) where {T<:_CUSPARSE_ELTYPES, Ti}
     idx   = _cusparse_index(u_A)
@@ -73,12 +73,6 @@ function JLUST.sparse_mm!(h::CUSPARSESpMMHandle{T},
         Ref{T}(beta),  h.dnmat_C,
         T, h.algo, h.workspace)
     return u_C
-end
-
-# Convenience wrapper — overrides KernelAbstractionsExt's default when CUDA is loaded.
-function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                           backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_mm!(backend, u_A, u_B, u_C; kw...)
 end
 
 # cuSPARSE rejects SubArray outputs; route to EmitterBackend (our KA kernel) instead.

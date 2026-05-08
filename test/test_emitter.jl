@@ -14,7 +14,7 @@ function dense_vec(v::Vector{T}) where T
     n   = length(v)
     USTensor{T,Int32,1,Vector{T},Vector{Int32},OneBased}(
         (n,), Formats.DensedRight(1),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing,), (nothing,),
         v, nothing,
     )
 end
@@ -23,7 +23,7 @@ end
 function dense_mat(m::Matrix{T}) where T
     USTensor{T,Int32,2,Matrix{T},Vector{Int32},OneBased}(
         size(m), Formats.DensedRight(2),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         m, nothing,
     )
 end
@@ -71,8 +71,8 @@ end
 
     u = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -90,8 +90,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_vec([1.0, 2.0, 3.0])
@@ -111,8 +111,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},ZeroBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_vec([1.0, 2.0, 3.0])
@@ -145,8 +145,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.DCSR,
-        Dict{Int,Vector{Int32}}(2 => inner_pos),
-        Dict{Int,Vector{Int32}}(1 => outer_crd, 2 => inner_crd),
+        (nothing, inner_pos),
+        (outer_crd, inner_crd),
         nzval, nothing,
     )
     u_x = dense_vec([1.0, 2.0, 3.0])
@@ -168,8 +168,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.COO,
-        Dict{Int,Vector{Int32}}(),
-        Dict{Int,Vector{Int32}}(1 => row_crd, 2 => col_crd),
+        (nothing, nothing),
+        (row_crd, col_crd),
         nzval, nothing,
     )
     u_x = dense_vec([1.0, 2.0, 3.0])
@@ -208,18 +208,18 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_B = USTensor{Float64,Int32,2,Matrix{Float64},Vector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         B_mat, nothing,
     )
     u_C = USTensor{Float64,Int32,2,Matrix{Float64},Vector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         C_mat, nothing,
     )
 
@@ -239,18 +239,18 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.DCSR,
-        Dict{Int,Vector{Int32}}(2 => inner_pos),
-        Dict{Int,Vector{Int32}}(1 => outer_crd, 2 => inner_crd),
+        (nothing, inner_pos),
+        (outer_crd, inner_crd),
         nzval, nothing,
     )
     u_B = USTensor{Float64,Int32,2,Matrix{Float64},Vector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         B_mat, nothing,
     )
     u_C = USTensor{Float64,Int32,2,Matrix{Float64},Vector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,Vector{Int32}}(), Dict{Int,Vector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         C_mat, nothing,
     )
 
@@ -276,8 +276,8 @@ end
     u_B = dense_mat(B_mat)
     u_C = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -297,8 +297,8 @@ end
     u_B = dense_mat(B_mat)
     u_C = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.COO,
-        Dict{Int,Vector{Int32}}(),
-        Dict{Int,Vector{Int32}}(1 => row_crd, 2 => col_crd),
+        (nothing, nothing),
+        (row_crd, col_crd),
         nzval, nothing,
     )
 
@@ -316,8 +316,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => rowptr),
-        Dict{Int,Vector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -333,8 +333,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.COO,
-        Dict{Int,Vector{Int32}}(),
-        Dict{Int,Vector{Int32}}(1 => row_crd, 2 => col_crd),
+        (nothing, nothing),
+        (row_crd, col_crd),
         nzval, nothing,
     )
 
@@ -342,34 +342,34 @@ end
     @test nonzeros(u_D) ≈ [1.0 0.0 2.0; 0.0 3.0 0.0; 4.0 0.0 5.0]
 end
 
-# ─── Kernel cache hits ────────────────────────────────────────────────────────
+# ─── Kernel reuse ─────────────────────────────────────────────────────────────
 
-@testset "Kernel cache reuse" begin
-    # Verify that a second call with the same format is a cache hit (no new compilation).
-    # Prior testsets may have already populated the cache, so we only check that
-    # the count stays stable across two identical calls.
-    ext   = Base.get_extension(JLUST, :KernelAbstractionsExt)
-    cache = ext._emitter_cache
-
+@testset "Kernel reuse" begin
+    # The old _emitter_cache global is gone — Julia's method specialization
+    # caches the @generated kernel per (FMT, T) automatically.  This test
+    # verifies that repeated calls with structurally-identical tensors give
+    # consistent results (proxy for "kernel is reused, not re-emitted").
     rowptr = Int32[1, 3, 4, 6]
     colval = Int32[1, 3, 2, 1, 3]
     nzval  = Float64[1.0, 2.0, 3.0, 4.0, 5.0]
     make_A() = USTensor{Float64,Int32,2,Vector{Float64},Vector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,Vector{Int32}}(2 => copy(rowptr)),
-        Dict{Int,Vector{Int32}}(2 => copy(colval)),
+        (nothing, copy(rowptr)),
+        (nothing, copy(colval)),
         copy(nzval), nothing,
     )
 
-    # First call: CSR is already in cache from prior tests; this is a cache hit.
-    u_A1 = make_A(); u_x = dense_vec([1.0, 2.0, 3.0]); u_y = dense_vec(zeros(3))
-    sparse_mv!(u_A1, u_x, u_y; backend=EmitterBackend())
-    n_after_first = length(cache)
-    @test nonzeros(u_y) ≈ [7.0, 6.0, 19.0]
+    u_x = dense_vec([1.0, 2.0, 3.0])
 
-    # Second call: must also be a cache hit (count unchanged).
+    u_A1 = make_A(); u_y1 = dense_vec(zeros(3))
+    sparse_mv!(u_A1, u_x, u_y1; backend=EmitterBackend())
+    @test nonzeros(u_y1) ≈ [7.0, 6.0, 19.0]
+
     u_A2 = make_A(); u_y2 = dense_vec(zeros(3))
     sparse_mv!(u_A2, u_x, u_y2; backend=EmitterBackend())
-    @test length(cache) == n_after_first   # no new entry
     @test nonzeros(u_y2) ≈ [7.0, 6.0, 19.0]
+
+    # Both u_A1 and u_A2 have identical Julia types (same FMT type param) →
+    # the @generated _ust_spmv_kern method specialization is shared.
+    @test typeof(u_A1) === typeof(u_A2)
 end

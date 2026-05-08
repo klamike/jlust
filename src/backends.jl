@@ -103,7 +103,7 @@ default_backend(::USTensor, ::Type{<:AbstractUSTOp}) = EmitterBackend()
 #       @kernel argument names contributed by this level.
 #       Increment pc[] for each pos array used, cc[] for each crd array.
 #
-#   level_args(lv, u, lvl, dummy_pos)     → Vector{AbstractArray} (default: [])
+#   level_args(lv, u, lvl)                → Vector{AbstractArray} (default: [])
 #       Runtime arrays in the same order as level_arg_names.
 #
 #   emit_spmv_lv(lv, p_var, input_fn_sym) → Expr
@@ -113,7 +113,7 @@ default_backend(::USTensor, ::Type{<:AbstractUSTOp}) = EmitterBackend()
 
 level_has_nzval(::AbstractLevelFormat) = true
 level_arg_names(::AbstractLevelFormat, pc::Ref, cc::Ref) = Symbol[]
-level_args(::AbstractLevelFormat, u::AbstractUSTensor, lvl::Int, dummy_pos) = AbstractArray[]
+level_args(::AbstractLevelFormat, u::AbstractUSTensor, lvl::Int) = AbstractArray[]
 
 """
     level_step(lv, i::Int, nz) → (col::Int, val)

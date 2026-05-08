@@ -9,8 +9,8 @@
 #
 # Shares _sparse_arg_names / _sparse_args / _spmv_ndrange from spmv.jl.
 
-function JLUST.supports_backend(::EmitterBackend, op::SDDMMOp)
-    _is_dense_fmt(op.A) && _is_dense_fmt(op.B) && _is_emittable(op.C)
+function JLUST.supports_backend(::EmitterBackend, ::Op{:SDDMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_dense_fmt(A) && _is_dense_fmt(B) && _is_emittable(C)
 end
 
 # ─── Body emitter ─────────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ end
 # k-loop dot product against dense A and B and writes back to nzval.
 # No row-level init/write is needed — the leaf handles its own scratch.
 
-function _emit_sddmm_body(fmt::TensorFormat, ::Type{T}) where T
+function _emit_sddmm_body(levels::Tuple, ::Type{T}) where T
     leaf = quote
         _dot = $(zero(T))
         for _k in 1:_n_inner
@@ -30,31 +30,30 @@ function _emit_sddmm_body(fmt::TensorFormat, ::Type{T}) where T
     end
     # No row contention: each NNZ has a unique nzval position, so atomic == non-atomic.
     row_body = inner -> inner
-    emit_kernel_body(fmt;
+    emit_kernel_body(levels;
                      row_body_unique = row_body, row_body_atomic = row_body,
                      leaf_unique = leaf, leaf_atomic = leaf)
 end
 
-# ─── Kernel cache and launch ──────────────────────────────────────────────────
+_emit_sddmm_body(fmt::TensorFormat, T) = _emit_sddmm_body(fmt.levels, T)
 
-function _get_sddmm_kernel(fmt::TensorFormat, ::Type{T}) where T
-    key = (fmt.name, T, :sddmm)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
+# ─── @generated SDDMM kernel ─────────────────────────────────────────────────
 
-    body      = _emit_sddmm_body(fmt, T)
-    buf_names = _sparse_arg_names(fmt)
-    arg_names = vcat(buf_names, [:_A, :_B, :_alpha, :_beta, :_origin_off, :_n_outer, :_n_inner])
-    fname     = gensym(:ust_sddmm)
-
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
+@generated function _ust_sddmm_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
+    LT          = FMT.parameters[1]
+    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
+    sparse_nms  = _sparse_arg_names_for_levels(levels)
+    standard_nm = (:_A, :_B, :_alpha, :_beta, :_origin_off, :_n_outer, :_n_inner)
+    all_nms     = (sparse_nms..., standard_nm...)
+    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
+    body        = _emit_sddmm_body(levels, T)
+    quote
+        @inbounds begin
+            $(bindings...)
             $body
         end
-        $fname
+        return nothing
     end
-
-    _emitter_cache[key] = kern
-    return kern
 end
 
 # ─── sparse_sddmm! ────────────────────────────────────────────────────────────
@@ -68,19 +67,12 @@ function JLUST.sparse_sddmm!(::EmitterBackend,
     n_outer = Int32(_spmv_ndrange(u_C))
     n_inner = Int32(size(nonzeros(u_A), 2))   # cols of A = shared inner dimension
 
-    kern = _get_sddmm_kernel(fmt, T)
-
     sparse_bufs = _sparse_args(u_C)
-    all_args    = (sparse_bufs..., nonzeros(u_A), nonzeros(u_B),
-                   T(alpha), T(beta), off, n_outer, n_inner)
-
-    kernel_obj = Base.invokelatest(kern, ka, 64)
-    Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+    args = (typeof(fmt), T,
+            sparse_bufs..., nonzeros(u_A), nonzeros(u_B),
+            T(alpha), T(beta), off, n_outer, n_inner)
+    _launch_kern(ka, _ust_sddmm_kern, args, Int(n_outer))
 
     return u_C
 end
 
-function JLUST.sparse_sddmm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                               backend=EmitterBackend(), kw...)
-    JLUST.sparse_sddmm!(backend, u_A, u_B, u_C; kw...)
-end

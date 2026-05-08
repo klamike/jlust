@@ -1,9 +1,9 @@
 struct InvalidTensorFormat  <: Exception; msg::String end
 struct InvalidLevelAccess   <: Exception; msg::String end
-struct UnsupportedFormat    <: Exception; format::Any; backend::Any end
-struct UnsupportedIndexType <: Exception; T::Type; backend::Any end
-struct UnsupportedValueType <: Exception; T::Type; backend::Any end
-struct IndexOriginMismatch  <: Exception; have::Any; need::Any end
+struct UnsupportedFormat{F, B}    <: Exception; format::F; backend::B end
+struct UnsupportedIndexType{B}    <: Exception; T::Type; backend::B end
+struct UnsupportedValueType{B}    <: Exception; T::Type; backend::B end
+struct IndexOriginMismatch{H, N}  <: Exception; have::H; need::N end
 struct DeviceMismatch       <: Exception; msg::String end
 struct IncompatibleExtents  <: Exception; msg::String end
 struct NonCanonicalStorage  <: Exception; msg::String end

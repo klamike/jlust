@@ -21,7 +21,7 @@ end
 
 export CUSPARSESpSVHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SpSVOp},
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpSV}},
                         u_A::USTensor{T,Ti};
                         transa::Char='N', uplo::Char='L', diag::Char='N',
                         alpha=one(T)) where {T<:_CUSPARSE_ELTYPES, Ti}
@@ -90,7 +90,3 @@ function JLUST.sparse_sv!(h::CUSPARSESpSVHandle{T},
     return u_x
 end
 
-function JLUST.sparse_sv!(u_A::USTensor, u_b::USTensor, u_x::USTensor;
-                           backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_sv!(backend, u_A, u_b, u_x; kw...)
-end

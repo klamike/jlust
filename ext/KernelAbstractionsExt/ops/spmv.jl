@@ -1,60 +1,77 @@
 # ─── Emitter: arg name/value collection ───────────────────────────────────────
 #
-# These three functions are the extension points for custom AbstractLevelFormat
-# subtypes.  Add methods in user code (or JLUST extensions) to plug a new level
-# type into the emitter without touching _sparse_arg_names / _sparse_args.
+# These hooks are the extension points for custom AbstractLevelFormat subtypes.
+# Add methods in user code (or JLUST extensions) to plug a new level type into
+# the emitter without touching _sparse_arg_names / _sparse_args.
 #
-#   _level_arg_names(lv, pc, cc) → Vector{Symbol}
-#       Returns the @kernel arg names contributed by level `lv`.
-#       pc/cc are Ref counters for pos/crd naming (increment as needed).
+#   _level_arg_names(lv, pc, cc; outermost::Bool) → Vector{Symbol}
+#       Returns the @kernel arg names contributed by level `lv` at the given
+#       depth.  `outermost=true` means this is the outermost level — non-unique
+#       Compressed at the outer level has no pos buffer (no parent fiber), so
+#       the pos slot is omitted.  pc/cc track pos/crd naming counters.
 #
 #   _level_has_nzval(lv) → Bool
 #       Return false if the level encodes values implicitly (e.g. IncidenceLevel
 #       where values are always ±1).  If ANY level returns false, :_nzval is
 #       omitted from the @kernel signature.
 #
-#   _level_args(lv, u, lvl_idx, dummy_pos) → Vector{AbstractArray}
-#       Returns the actual array arguments for level `lv` in USTensor `u`.
-#       Must be consistent with the names returned by _level_arg_names.
+#   _level_args(lv, u, lvl_idx; outermost::Bool) → Vector{AbstractArray}
+#       Runtime arrays in the same order as _level_arg_names.
 
-# AbstractLevelFormat fallbacks delegate to the public JLUST extension hooks so
-# that user-defined level types only need to extend JLUST.level_* functions.
-_level_arg_names(lv::AbstractLevelFormat,             pc::Ref, cc::Ref) = JLUST.level_arg_names(lv, pc, cc)
-_level_arg_names(::Union{CompressedLevel,DeltaLevel}, pc::Ref, cc::Ref) =
-    [Symbol(:_pos, pc[] += 1), Symbol(:_crd, cc[] += 1)]
-_level_arg_names(::SingletonLevel,                    pc::Ref, cc::Ref) =
+# AbstractLevelFormat fallbacks delegate to the public JLUST extension hooks.
+# Custom levels are only ever inner (paired with a Dense/Compressed outer), so
+# the outermost flag is forwarded to the public hook only for completeness.
+_level_arg_names(lv::AbstractLevelFormat, pc::Ref, cc::Ref; outermost::Bool=false) =
+    JLUST.level_arg_names(lv, pc, cc)
+
+# Compressed/Delta: pos+crd, except at the outermost level — no parent fiber to
+# index into, so only crd is bound (the format omits the pos buffer entirely).
+function _level_arg_names(::CompressedLevel, pc::Ref, cc::Ref; outermost::Bool=false)
+    outermost && return [Symbol(:_crd, cc[] += 1)]
+    return [Symbol(:_pos, pc[] += 1), Symbol(:_crd, cc[] += 1)]
+end
+function _level_arg_names(::DeltaLevel, pc::Ref, cc::Ref; outermost::Bool=false)
+    outermost && return [Symbol(:_crd, cc[] += 1)]
+    return [Symbol(:_pos, pc[] += 1), Symbol(:_crd, cc[] += 1)]
+end
+_level_arg_names(::SingletonLevel, pc::Ref, cc::Ref; outermost::Bool=false) =
     [Symbol(:_crd, cc[] += 1)]
 
 _level_has_nzval(lv::AbstractLevelFormat) = JLUST.level_has_nzval(lv)
 _level_has_nzval(::Union{DenseLevel,BatchLevel,CompressedLevel,SingletonLevel,DeltaLevel,RangeLevel}) = true
 
-_level_args(lv::AbstractLevelFormat, u::USTensor, lvl::Int, dummy_pos) = JLUST.level_args(lv, u, lvl, dummy_pos)
-function _level_args(lv::Union{CompressedLevel,DeltaLevel}, u::USTensor, lvl::Int, dummy_pos)
-    pos = has_positions(u, lvl) ? positions(u, lvl) : dummy_pos
-    AbstractArray[pos, coordinates(u, lvl)]
+_level_args(lv::AbstractLevelFormat, u::USTensor, lvl::Int; outermost::Bool=false) =
+    JLUST.level_args(lv, u, lvl)
+
+function _level_args(::CompressedLevel, u::USTensor, lvl::Int; outermost::Bool=false)
+    outermost && return AbstractArray[coordinates(u, lvl)]
+    return AbstractArray[positions(u, lvl), coordinates(u, lvl)]
 end
-_level_args(::SingletonLevel, u::USTensor, lvl::Int, dummy_pos) =
+function _level_args(::DeltaLevel, u::USTensor, lvl::Int; outermost::Bool=false)
+    outermost && return AbstractArray[coordinates(u, lvl)]
+    return AbstractArray[positions(u, lvl), coordinates(u, lvl)]
+end
+_level_args(::SingletonLevel, u::USTensor, lvl::Int; outermost::Bool=false) =
     AbstractArray[coordinates(u, lvl)]
 
 # Symbolic arg names matching the order the emitter expects for the sparse A.
-function _sparse_arg_names(fmt::TensorFormat)
+function _sparse_arg_names_for_levels(levels::Tuple)
     names = Symbol[]
     pc = Ref(0); cc = Ref(0)
-    for lv in fmt.levels
-        append!(names, _level_arg_names(lv, pc, cc))
+    for (i, lv) in enumerate(levels)
+        append!(names, _level_arg_names(lv, pc, cc; outermost = (i == 1)))
     end
-    all(_level_has_nzval(lv) for lv in fmt.levels) && push!(names, :_nzval)
+    all(_level_has_nzval(lv) for lv in levels) && push!(names, :_nzval)
     names
 end
 
+_sparse_arg_names(fmt::TensorFormat) = _sparse_arg_names_for_levels(fmt.levels)
+
 # Actual arrays in the same order as _sparse_arg_names.
-# Outermost CompressedLevel (DCSR, COO) has no pos buffer; pass a typed empty
-# array as a placeholder — the emitter never generates an access to _pos1.
-function _sparse_args(u::USTensor{T,I,N,VA,VI,O}) where {T,I,N,VA,VI,O}
-    dummy_pos = VI(undef, 0)
+function _sparse_args(u::USTensor)
     args = AbstractArray[]
     for (lvl, lv) in enumerate(u.format.levels)
-        append!(args, _level_args(lv, u, lvl, dummy_pos))
+        append!(args, _level_args(lv, u, lvl; outermost = (lvl == 1)))
     end
     all(_level_has_nzval(lv) for lv in u.format.levels) && push!(args, nonzeros(u))
     args
@@ -89,7 +106,7 @@ end
 # Julia specializes kernels on the concrete types of _input_fn/_output_fn, so
 # passing `identity` compiles to zero overhead.
 
-function _emit_spmv_body(fmt::TensorFormat, ::Type{T};
+function _emit_spmv_body(levels::Tuple, ::Type{T};
                           input_fn_sym::Symbol=:_input_fn,
                           output_fn_sym::Symbol=:_output_fn) where T
     leaf_unique = :(_acc += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx]))
@@ -102,9 +119,11 @@ function _emit_spmv_body(fmt::TensorFormat, ::Type{T};
     end
     # Non-unique outer (COO-like): pre-scaled-by-beta y is accumulated into via the atomic leaf.
     row_body_atomic = inner -> inner
-    emit_kernel_body(fmt;
+    emit_kernel_body(levels;
                      row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
 end
+
+_emit_spmv_body(fmt::TensorFormat, T; kw...) = _emit_spmv_body(fmt.levels, T; kw...)
 
 # ─── COO chunked kernel (reduced atomic contention) ──────────────────────────
 #
@@ -143,31 +162,43 @@ const _COO_CHUNK = 8   # NNZ per thread; Int for type stability
     end
 end
 
-# ─── Kernel cache and launch ─────────────────────────────────────────────────
+# ─── Kernel functions and launch ─────────────────────────────────────────────
+#
+# Each op's kernel is a regular `@generated` Julia function that emits its body
+# from the format type's level structure, using `KernelIntrinsics` (KI)
+# primitives directly (`KI.get_global_id().x`, `Atomix.@atomic`).  At the call
+# site, `_launch_kern` dispatches via `KI.kernel_function` — Julia specializes
+# per (FMT, T, ...) tuple type, the generated body compiles in the call site's
+# world age, and there is no global Dict cache and no `Base.invokelatest`.
 
-# Cache: (TensorFormat, element_type, :spmv/:spmm/:spmm_nf) [or with extra n_col] → @kernel fn.
-const _emitter_cache = Dict{Any, Any}()
+# Launch helper: call `KI.kernel_function` and dispatch the kernel.  Bypasses
+# the `KI.@kernel` macro so we can splat varargs cleanly.
+@inline function _launch_kern(ka, kfunc, args::Tuple, ndrange::Int, ws::Int=64)
+    ng        = cld(ndrange, ws)
+    kf        = KI.argconvert(ka, kfunc)
+    kargs     = map(x -> KI.argconvert(ka, x), args)
+    ktt       = Tuple{map(Core.Typeof, kargs)...}
+    kobj      = KI.kernel_function(ka, kf, ktt)
+    kobj(kargs...; numworkgroups=ng, workgroupsize=ws)
+end
 
-function _get_spmv_kernel(fmt::TensorFormat, ::Type{T}) where T
-    # Julia JIT-specializes on the concrete (input_fn, output_fn) types at call
-    # time — no need for separate @kernel functions per transform pair.
-    key = (fmt.name, T, :spmv)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-
-    body      = _emit_spmv_body(fmt, T)
-    buf_names = _sparse_arg_names(fmt)
-    arg_names = vcat(buf_names, [:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta])
-    fname     = gensym(:ust_spmv)
-
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
+# SpMV kernel — body emitted from FMT's level types.  `args` is the variadic
+# tail: sparse buffers, x, y, origin_off, n_outer, input_fn, output_fn, alpha, beta.
+@generated function _ust_spmv_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
+    LT          = FMT.parameters[1]
+    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
+    sparse_nms  = _sparse_arg_names_for_levels(levels)
+    standard_nm = (:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta)
+    all_nms     = (sparse_nms..., standard_nm...)
+    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
+    body        = _emit_spmv_body(levels, T)
+    quote
+        @inbounds begin
+            $(bindings...)
             $body
         end
-        $fname
+        return nothing
     end
-
-    _emitter_cache[key] = kern
-    return kern
 end
 
 # ─── sparse_mv! ───────────────────────────────────────────────────────────────
@@ -203,7 +234,7 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
             n_nnz   = Int32(length(row_crd))
             if !JLUST._coo_spmv_specialized!(row_crd, col_crd, nzv, nx, ny, off, n_nnz)
                 n_chunks = Int32(cld(Int(n_nnz), _COO_CHUNK))
-                Base.invokelatest(_coo_spmv_chunked!, ka, 64)(
+                _coo_spmv_chunked!(ka, 64)(
                     row_crd, col_crd, nzv, nx, ny, off, n_nnz;
                     ndrange=Int(n_chunks))
             end
@@ -211,11 +242,10 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
             # General emitter: _alpha applied in atomic leaf; beta already pre-scaled.
             n_outer     = Int32(_spmv_ndrange(u_A))
             sparse_bufs = _sparse_args(u_A)
-            kern        = _get_spmv_kernel(fmt, T)
-            all_args    = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
+            all_args    = (typeof(fmt), T,
+                           sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
                            input_fn, output_fn, T_alpha, zero(T))
-            kernel_obj  = Base.invokelatest(kern, ka, 64)
-            Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+            _launch_kern(ka, _ust_spmv_kern, all_args, Int(n_outer))
         end
     else
         n_outer     = Int32(_spmv_ndrange(u_A))
@@ -236,11 +266,10 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
         end
 
         if !dispatched
-            kern       = _get_spmv_kernel(fmt, T)
-            all_args   = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
-                          input_fn, output_fn, T_alpha, T_beta)
-            kernel_obj = Base.invokelatest(kern, ka, 64)
-            Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+            all_args = (typeof(fmt), T,
+                        sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
+                        input_fn, output_fn, T_alpha, T_beta)
+            _launch_kern(ka, _ust_spmv_kern, all_args, Int(n_outer))
         end
     end
 
@@ -249,57 +278,44 @@ end
 
 # ─── EmitterSpMVHandle ────────────────────────────────────────────────────────
 #
-# prepare() compiles and caches the specialized kernel once, including the
-# concrete types of input_fn/output_fn.  Subsequent sparse_mv! calls skip
-# format inspection and invokelatest overhead on the kernel lookup.
+# With the @generated kernel architecture, dispatch is free — Julia's method
+# specialization caches the kernel automatically per (FMT, T, IF, OF) tuple.
+# The handle just preserves metadata (n_outer, off, input/output transforms)
+# so repeated calls don't re-extract them; there is no separate "kernel object".
 #
 # input_fn:  applied element-wise to x before each multiply: y = A * input_fn.(x)
 # output_fn: applied to the accumulated row sum before writing:  y[i] = output_fn(acc)
 #
 # Pass identity (the default) for either to generate zero-overhead kernel paths.
-# Example — fused relu-input SpMV followed by relu-output SpMV:
-#
-#   h1 = prepare(EmitterBackend(), SpMVOp, u_A1; output_fn=relu)
-#   h2 = prepare(EmitterBackend(), SpMVOp, u_A2; input_fn=relu)
-#   sparse_mv!(h1, u_A1, u_x, u_tmp)   # y_tmp = relu.(A1 * x)  (1 kernel)
-#   sparse_mv!(h2, u_A2, u_tmp, u_y)   # y     = A2 * relu.(y_tmp) (1 kernel)
-#
-# Compared to the unfused form, this saves one broadcast kernel launch per chain link.
 
-mutable struct EmitterSpMVHandle{T, IF, OF}
-    kernel_obj  # compiled KA kernel (backend + block size already bound)
-    n_outer::Int32
-    off::Int32
-    input_fn::IF
-    output_fn::OF
+struct EmitterSpMVHandle{T, IF, OF, FMT}
+    n_outer   :: Int32
+    off       :: Int32
+    input_fn  :: IF
+    output_fn :: OF
 end
 
 export EmitterSpMVHandle
 
-function JLUST.prepare(::EmitterBackend, ::Type{SpMVOp}, u_A::USTensor{T};
+function JLUST.prepare(::EmitterBackend, ::Type{<:Op{:SpMV}}, u_A::USTensor{T};
                         input_fn::IF=identity, output_fn::OF=identity) where {T, IF, OF}
-    fmt     = format(u_A)
-    ka      = KernelAbstractions.get_backend(nonzeros(u_A))
     off     = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
     n_outer = Int32(_spmv_ndrange(u_A))
-
-    kern = _get_spmv_kernel(fmt, T)
-    # Bind backend + block size; GPU JIT fires on first actual launch.
-    kobj = Base.invokelatest(kern, ka, 64)
-
-    EmitterSpMVHandle{T, IF, OF}(kobj, n_outer, off, input_fn, output_fn)
+    EmitterSpMVHandle{T, IF, OF, typeof(format(u_A))}(n_outer, off, input_fn, output_fn)
 end
 
 function JLUST.sparse_mv!(h::EmitterSpMVHandle, u_A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
     JLUST.sparse_mv!(h, u_A, ust(x), ust(y); kw...)
 end
 
-function JLUST.sparse_mv!(h::EmitterSpMVHandle, u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                           alpha=one(eltype(u_A)), beta=zero(eltype(u_A)))
-    T_A         = eltype(u_A)
+function JLUST.sparse_mv!(h::EmitterSpMVHandle{T, IF, OF, FMT},
+                           u_A::USTensor, u_x::USTensor, u_y::USTensor;
+                           alpha=one(T), beta=zero(T)) where {T, IF, OF, FMT}
+    ka          = KernelAbstractions.get_backend(nonzeros(u_A))
     sparse_bufs = _sparse_args(u_A)
-    all_args    = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y),
-                   h.off, h.n_outer, h.input_fn, h.output_fn, T_A(alpha), T_A(beta))
-    Base.invokelatest(h.kernel_obj, all_args...; ndrange=Int(h.n_outer))
+    args = (FMT, T,
+            sparse_bufs..., nonzeros(u_x), nonzeros(u_y),
+            h.off, h.n_outer, h.input_fn, h.output_fn, T(alpha), T(beta))
+    _launch_kern(ka, _ust_spmv_kern, args, Int(h.n_outer))
     return u_y
 end

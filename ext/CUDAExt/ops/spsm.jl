@@ -20,7 +20,7 @@ end
 
 export CUSPARSESpSMHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SpSMOp},
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpSM}},
                         u_A::USTensor{T,Ti};
                         transa::Char='N', transb::Char='N',
                         uplo::Char='L', diag::Char='N',
@@ -91,7 +91,3 @@ function JLUST.sparse_sm!(h::CUSPARSESpSMHandle{T},
     return u_C
 end
 
-function JLUST.sparse_sm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                           backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_sm!(backend, u_A, u_B, u_C; kw...)
-end

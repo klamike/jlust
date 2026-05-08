@@ -4,8 +4,22 @@ abstract type AbstractLevelFormat end
 
 # ─── Concrete level formats ───────────────────────────────────────────────────
 
-struct DenseLevel     <: AbstractLevelFormat end
-struct BatchLevel     <: AbstractLevelFormat end
+# Parametric on dimension extent: `Sz::Int` when the extent is known statically
+# (e.g. blocked inner dims in BSR), `nothing` when the extent is the matrix-shape-
+# dependent runtime value.  Static extents enable compile-time loop bounds in the
+# emitter and let formats that differ only in block size (BSR(2,2) vs BSR(4,4))
+# carry that distinction in the type system.
+struct DenseLevel{Sz} <: AbstractLevelFormat end
+struct BatchLevel{Sz} <: AbstractLevelFormat end
+DenseLevel()           = DenseLevel{nothing}()
+DenseLevel(sz::Int)    = (sz > 0 ? DenseLevel{sz}() :
+    throw(InvalidTensorFormat("DenseLevel size must be positive, got $sz")))
+BatchLevel()           = BatchLevel{nothing}()
+BatchLevel(sz::Int)    = (sz > 0 ? BatchLevel{sz}() :
+    throw(InvalidTensorFormat("BatchLevel size must be positive, got $sz")))
+dense_size(::DenseLevel{Sz}) where {Sz} = Sz
+batch_size(::BatchLevel{Sz}) where {Sz} = Sz
+
 struct SingletonLevel <: AbstractLevelFormat end
 struct RangeLevel     <: AbstractLevelFormat end
 
@@ -25,10 +39,10 @@ DeltaLevel(bits::Int) = DeltaLevel{bits}()
 # Bit-width accessor for runtime use (Composer / display).
 delta_bits(::DeltaLevel{B}) where {B} = B
 
-Base.hash(::DenseLevel,     h::UInt) = hash(:DenseLevel,     h)
-Base.hash(::BatchLevel,     h::UInt) = hash(:BatchLevel,     h)
-Base.hash(::SingletonLevel, h::UInt) = hash(:SingletonLevel, h)
-Base.hash(::RangeLevel,     h::UInt) = hash(:RangeLevel,     h)
+Base.hash(::DenseLevel{Sz}, h::UInt) where {Sz} = hash(Sz, hash(:DenseLevel, h))
+Base.hash(::BatchLevel{Sz}, h::UInt) where {Sz} = hash(Sz, hash(:BatchLevel, h))
+Base.hash(::SingletonLevel, h::UInt)            = hash(:SingletonLevel, h)
+Base.hash(::RangeLevel,     h::UInt)            = hash(:RangeLevel,     h)
 Base.hash(::CompressedLevel{U,O}, h::UInt) where {U,O} =
     hash(U, hash(O, hash(:CompressedLevel, h)))
 Base.hash(::DeltaLevel{B},        h::UInt) where {B}   =
@@ -97,12 +111,16 @@ const _LevelPair = Pair{_LevelKey, AbstractLevelFormat}
 # coupled as a Vector of Pairs.  They are now stored separately: keys remain a
 # runtime Vector for dim2lvl/lvl2dim metadata; levels is a typed tuple whose
 # type captures the format's structure for dispatch.
-struct TensorFormat{LevelTypes <: Tuple}
+# `Family` (Symbol) lifts the format family tag into the type system so capability
+# checks (e.g. is-BSR, is-SELL) are pure dispatch.  For non-parametric formats
+# Family equals the format's name; parametric builders share a family across all
+# parameter values (Formats.BSRRight((2,2)) and Formats.BSRRight((4,4)) both have
+# Family = :BSR but distinct LevelTypes).
+struct TensorFormat{LevelTypes <: Tuple, Family}
     dimensions  :: Vector{Dimension}
     keys        :: Vector{_LevelKey}     # parallel to `levels`
     levels      :: LevelTypes            # tuple of level instances
     name        :: Symbol
-    family      :: Symbol                # format family tag; equals name for non-parametric formats
     is_identity :: Bool
     is_ordered  :: Bool
     is_unique   :: Bool
@@ -326,12 +344,12 @@ function TensorFormat(
     unique  = isempty(levels) || any(is_unique(lv) for lv in levels)
 
     LT = typeof(levels)
-    TensorFormat{LT}(dims_vec, keys_vec, levels, name, family, identity, ordered, unique)
+    TensorFormat{LT, family}(dims_vec, keys_vec, levels, name, identity, ordered, unique)
 end
 
 # Scalar (zero-dimensional) convenience
 function TensorFormat(::Tuple{}, ::Tuple{}; name::Symbol=:Scalar)
-    TensorFormat{Tuple{}}(Dimension[], _LevelKey[], (), name, name, true, true, true)
+    TensorFormat{Tuple{}, name}(Dimension[], _LevelKey[], (), name, true, true, true)
 end
 
 """
@@ -342,7 +360,8 @@ Return the format family tag.  Non-parametric formats (e.g. `Formats.CSR`) have
 common family tag (`:BSR`) across all block sizes, enabling family-level capability
 queries without string manipulation.
 """
-format_family(fmt::TensorFormat) = fmt.family
+format_family(::TensorFormat{LT, F}) where {LT, F} = F
+format_family(::Type{<:TensorFormat{LT, F}}) where {LT, F} = F
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -364,8 +383,10 @@ end
 
 # ─── Display ──────────────────────────────────────────────────────────────────
 
-Base.show(io::IO, ::DenseLevel)      = print(io, "DenseLevel")
-Base.show(io::IO, ::BatchLevel)      = print(io, "BatchLevel")
+Base.show(io::IO, ::DenseLevel{nothing}) = print(io, "DenseLevel")
+Base.show(io::IO, ::DenseLevel{Sz}) where {Sz} = print(io, "DenseLevel($Sz)")
+Base.show(io::IO, ::BatchLevel{nothing}) = print(io, "BatchLevel")
+Base.show(io::IO, ::BatchLevel{Sz}) where {Sz} = print(io, "BatchLevel($Sz)")
 Base.show(io::IO, ::SingletonLevel)  = print(io, "SingletonLevel")
 Base.show(io::IO, ::RangeLevel)      = print(io, "RangeLevel")
 Base.show(io::IO, ::DeltaLevel{B}) where {B} = print(io, "DeltaLevel($B)")
@@ -408,15 +429,31 @@ function _tf_build_key(node)
     end
 end
 
-function _tf_build_fmt(node)
+# Static size from a level key expression: `_ % N` and `_ ÷ N` patterns paired
+# with `dense` get sized DenseLevel(N) so blocked-modulo dims (BSR/SELL/etc)
+# carry their compile-time extent in the type.  Returns Int or nothing.
+function _tf_static_size(node)
+    (node isa Expr && node.head == :call && length(node.args) == 3) || return nothing
+    node.args[1] == :%             || return nothing
+    node.args[3] isa Integer       || return nothing
+    Int(node.args[3])
+end
+
+function _tf_build_fmt(node, static_size::Union{Int,Nothing}=nothing)
     if node isa Symbol
-        Dict(
-            :dense      => :(DenseLevel()),
-            :batch      => :(BatchLevel()),
-            :compressed => :(CompressedLevel()),
-            :singleton  => :(SingletonLevel()),
-            :range      => :(RangeLevel()),
-        )[node]
+        if node == :dense
+            static_size === nothing ? :(DenseLevel()) : :(DenseLevel($static_size))
+        elseif node == :batch
+            :(BatchLevel())
+        elseif node == :compressed
+            :(CompressedLevel())
+        elseif node == :singleton
+            :(SingletonLevel())
+        elseif node == :range
+            :(RangeLevel())
+        else
+            error("@tensor_format: unknown level format symbol: $node")
+        end
     elseif node isa Expr && node.head == :call
         fname, fargs = node.args[1], node.args[2:end]
         if fname == :compressed
@@ -436,8 +473,10 @@ end
 function _tf_build_pair(spec)
     (spec isa Expr && spec.head == :call && spec.args[1] == :(:)) ||
         error("@tensor_format: expected `key : format`, got: $spec")
-    key_expr = _tf_build_key(spec.args[2])
-    fmt_expr = _tf_build_fmt(spec.args[3])
+    key_node    = spec.args[2]
+    static_size = _tf_static_size(key_node)
+    key_expr    = _tf_build_key(key_node)
+    fmt_expr    = _tf_build_fmt(spec.args[3], static_size)
     :($key_expr => $fmt_expr)
 end
 

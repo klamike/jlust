@@ -10,6 +10,12 @@
 #   • row body             — how to wrap the inner-loop recursion (e.g. allocate
 #                            an accumulator, loop over n_col, etc.)
 #
+# The walker emits code using `KernelIntrinsics` (KI) primitives directly —
+# `KI.get_global_id().x` for the thread index, `Atomix.@atomic` for COO-style
+# atomic writes.  The kernel functions are regular `@generated` Julia functions
+# (specialized per format type), called via `KI.@kernel` at the call site.  No
+# lazy `@eval`, no global cache, no `Base.invokelatest`.
+#
 # The walker takes four Exprs:
 #   row_body_unique : invoked at outer Dense / Compressed-unique levels;
 #                     receives the inner-walk Expr and returns the row-level
@@ -30,6 +36,8 @@
 # inner positions when the level lacks a dedicated method.  Outermost custom
 # levels are an error and must be paired with a DenseLevel outer.
 
+const KI = KernelAbstractions.KernelIntrinsics
+
 # ── Inner-level walker ────────────────────────────────────────────────────────
 
 function _walk_inner(levels, lvl, p_var, pc, cc, leaf)
@@ -37,15 +45,27 @@ function _walk_inner(levels, lvl, p_var, pc, cc, leaf)
     _walk_inner_lv(levels[lvl], levels, lvl, p_var, pc, cc, leaf)
 end
 
-# Inner Dense / Batch — dense loop (uncommon; primarily for batched formats).
-# Requires `_sz<lvl>` to be a kernel argument; not currently emitted by any op.
-function _walk_inner_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc, leaf)
-    sz   = Symbol(:_sz, lvl)
-    lvar = Symbol(:_i, lvl)
+# Inner Dense / Batch — dense loop.  When the level type carries a static size
+# (e.g. blocked inner dims in BSR: DenseLevel{2}), the loop bound is a literal
+# integer the compiler can fully unroll.  When the size is dynamic
+# (DenseLevel{nothing}, e.g. an outer-but-not-outermost Dense), a runtime
+# `_sz<lvl>` kernel argument is referenced — the kernel signature must bind it.
+function _walk_inner_lv(lv::Union{DenseLevel{Sz},BatchLevel{Sz}},
+                        levels, lvl, p_var::Symbol, pc, cc, leaf) where {Sz}
+    lvar  = Symbol(:_i, lvl)
     inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf)
-    quote
-        for $lvar in 1:$sz
-            $inner
+    if Sz === nothing
+        sz = Symbol(:_sz, lvl)
+        quote
+            for $lvar in 1:$sz
+                $inner
+            end
+        end
+    else
+        quote
+            for $lvar in 1:$Sz
+                $inner
+            end
         end
     end
 end
@@ -123,15 +143,16 @@ end
 #
 # Returns: a single Expr that is the complete @kernel body.
 
-function emit_kernel_body(fmt::TensorFormat;
+function emit_kernel_body(levels::Tuple;
                           row_body_unique, row_body_atomic,
                           leaf_unique,     leaf_atomic)
     pc = Ref(0); cc = Ref(0)
-    levels = fmt.levels
-    isempty(levels) && error("emit_kernel_body: format has no levels")
+    isempty(levels) && error("emit_kernel_body: no levels")
     _emit_outer(levels[1], levels, pc, cc,
                 row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
 end
+
+emit_kernel_body(fmt::TensorFormat; kw...) = emit_kernel_body(fmt.levels; kw...)
 
 # Outer Dense / Batch — thread = row directly.
 function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
@@ -139,7 +160,7 @@ function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
     inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_unique)
     body  = row_body_unique(inner)
     quote
-        _tid = @index(Global, Linear)
+        _tid = KI.get_global_id().x
         if _tid <= _n_outer
             _y_idx = _tid
             $body
@@ -148,15 +169,17 @@ function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
 end
 
 # Outer CompressedLevel — fiber-parallel (unique) or NNZ-parallel (non-unique).
+# Outer Compressed has no parent-fiber pos buffer (no pos slot), so pc stays
+# unincremented — matches _level_arg_names which emits crd only at the outer level.
 function _emit_outer(lv::CompressedLevel, levels, pc, cc,
                      row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
-    pc[] += 1; ci = cc[] += 1
+    ci = cc[] += 1
     cs = Symbol(:_crd, ci)
     if is_unique(lv)
         inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_unique)
         body  = row_body_unique(inner)
         quote
-            _tid = @index(Global, Linear)
+            _tid = KI.get_global_id().x
             if _tid <= _n_outer
                 _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
                 $body
@@ -167,7 +190,7 @@ function _emit_outer(lv::CompressedLevel, levels, pc, cc,
         inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_atomic)
         body  = row_body_atomic(inner)
         quote
-            _tid = @index(Global, Linear)
+            _tid = KI.get_global_id().x
             if _tid <= _n_outer
                 _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
                 $body

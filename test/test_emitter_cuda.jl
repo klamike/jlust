@@ -18,7 +18,7 @@ function dense_cuvec(v::Vector{T}) where T
     fmt = Formats.DensedRight(1)
     USTensor{T,Int32,1,CuVector{T},CuVector{Int32},OneBased}(
         (n,), fmt,
-        Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+        (nothing,), (nothing,),
         cv, nothing,
     )
 end
@@ -32,8 +32,8 @@ end
 
     u = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -50,8 +50,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
@@ -71,8 +71,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.DCSR,
-        Dict{Int,CuVector{Int32}}(2 => inner_pos),
-        Dict{Int,CuVector{Int32}}(1 => outer_crd, 2 => inner_crd),
+        (nothing, inner_pos),
+        (outer_crd, inner_crd),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
@@ -91,8 +91,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.COO,
-        Dict{Int,CuVector{Int32}}(),
-        Dict{Int,CuVector{Int32}}(1 => row_crd, 2 => col_crd),
+        (nothing, nothing),
+        (row_crd, col_crd),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
@@ -116,18 +116,18 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_B = USTensor{Float64,Int32,2,CuMatrix{Float64},CuVector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         B_cu, nothing,
     )
     u_C = USTensor{Float64,Int32,2,CuMatrix{Float64},CuVector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         C_cu, nothing,
     )
 
@@ -147,18 +147,18 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuMatrix{Float64},CuVector{Int32},OneBased}(
         (3, 2), Formats.DensedRight(2),
-        Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         A_cu, nothing,
     )
     u_B = USTensor{Float64,Int32,2,CuMatrix{Float64},CuVector{Int32},OneBased}(
         (2, 3), Formats.DensedRight(2),
-        Dict{Int,CuVector{Int32}}(), Dict{Int,CuVector{Int32}}(),
+        (nothing, nothing), (nothing, nothing),
         B_cu, nothing,
     )
     u_C = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -175,8 +175,8 @@ end
 
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (3, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
 
@@ -201,8 +201,8 @@ _fuse_addone(x::Float64) = x + 1.0
     nzval  = CuArray(Float64[1.0, 2.0, 3.0])
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (2, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
@@ -219,8 +219,8 @@ end
     nzval  = CuArray(Float64[1.0, 2.0, 3.0])
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (2, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
@@ -237,8 +237,8 @@ end
     nzval  = CuArray(Float64[1.0, 2.0, 3.0])
     u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
         (2, 3), Formats.CSR,
-        Dict{Int,CuVector{Int32}}(2 => rowptr),
-        Dict{Int,CuVector{Int32}}(2 => colval),
+        (nothing, rowptr),
+        (nothing, colval),
         nzval, nothing,
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])

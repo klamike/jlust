@@ -19,7 +19,7 @@ end
 
 export CUSPARSESDDMMHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SDDMMOp},
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SDDMM}},
                         u_A::USTensor{T}, u_B::USTensor, u_C::USTensor;
                         transa::Char='N', transb::Char='N') where {T<:_CUSPARSE_ELTYPES}
     idx   = _cusparse_index(u_C)
@@ -79,7 +79,3 @@ function JLUST.sparse_sddmm!(::CUSPARSEBackend,
     return u_C
 end
 
-function JLUST.sparse_sddmm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                               backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_sddmm!(backend, u_A, u_B, u_C; kw...)
-end

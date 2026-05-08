@@ -3,8 +3,8 @@
 # sparse_to_dense: scatter stored NNZ into a pre-zeroed dense matrix.
 #   Parallelism: one thread per outer fiber of the sparse tensor (same as SpMV).
 
-function JLUST.supports_backend(::EmitterBackend, op::SparseToDenseOp)
-    _is_emittable(op.src)
+function JLUST.supports_backend(::EmitterBackend, ::Op{:SparseToDense, Tuple{S}}) where {S}
+    _is_emittable(S)
 end
 
 # ─── sparse_to_dense body emitter ─────────────────────────────────────────────
@@ -13,34 +13,33 @@ end
 # `_x_idx` (col); the leaf scatters `_nzval[_nnz_pos]` into the dense matrix.
 # Each NNZ writes to a distinct (row, col), so atomic == non-atomic.
 
-function _emit_s2d_body(fmt::TensorFormat)
+function _emit_s2d_body(levels::Tuple)
     leaf = :(_dense[_y_idx, _x_idx] = _nzval[_nnz_pos])
     row_body = inner -> inner
-    emit_kernel_body(fmt;
+    emit_kernel_body(levels;
                      row_body_unique = row_body, row_body_atomic = row_body,
                      leaf_unique = leaf, leaf_atomic = leaf)
 end
 
-# ─── Kernel cache and launch ──────────────────────────────────────────────────
+_emit_s2d_body(fmt::TensorFormat) = _emit_s2d_body(fmt.levels)
 
-function _get_s2d_kernel(fmt::TensorFormat)
-    key = (fmt.name, Any, :s2d)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
+# ─── @generated sparse_to_dense kernel ───────────────────────────────────────
 
-    body      = _emit_s2d_body(fmt)
-    buf_names = _sparse_arg_names(fmt)
-    arg_names = vcat(buf_names, [:_dense, :_origin_off, :_n_outer])
-    fname     = gensym(:ust_s2d)
-
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
+@generated function _ust_s2d_kern(::Type{FMT}, args::Vararg{Any, M}) where {FMT<:TensorFormat, M}
+    LT          = FMT.parameters[1]
+    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
+    sparse_nms  = _sparse_arg_names_for_levels(levels)
+    standard_nm = (:_dense, :_origin_off, :_n_outer)
+    all_nms     = (sparse_nms..., standard_nm...)
+    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
+    body        = _emit_s2d_body(levels)
+    quote
+        @inbounds begin
+            $(bindings...)
             $body
         end
-        $fname
+        return nothing
     end
-
-    _emitter_cache[key] = kern
-    return kern
 end
 
 # ─── sparse_to_dense ──────────────────────────────────────────────────────────
@@ -53,22 +52,17 @@ function JLUST.sparse_to_dense(::EmitterBackend, u::USTensor{T,I,N,VA,VI,O}) whe
 
     dense_val = KernelAbstractions.zeros(ka, T, extents(u)...)
     VA2 = typeof(dense_val)
-    kern = _get_s2d_kernel(fmt)
 
     sparse_bufs = _sparse_args(u)
-    all_args    = (sparse_bufs..., dense_val, off, n_outer)
-
-    kernel_obj = Base.invokelatest(kern, ka, 64)
-    Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+    args = (typeof(fmt), sparse_bufs..., dense_val, off, n_outer)
+    _launch_kern(ka, _ust_s2d_kern, args, Int(n_outer))
 
     fmt_dense = Formats.DensedRight(N)
     USTensor{T,I,N,VA2,VI,O}(extents(u), fmt_dense,
-                               Dict{Int,VI}(), Dict{Int,VI}(), dense_val, nothing)
+                               JLUST._no_bufs(Val(N), VI), JLUST._no_bufs(Val(N), VI),
+                               dense_val, nothing)
 end
 
-function JLUST.sparse_to_dense(u::USTensor; backend=EmitterBackend(), kw...)
-    JLUST.sparse_to_dense(backend, u; kw...)
-end
 
 # ─── dense_to_sparse ──────────────────────────────────────────────────────────
 

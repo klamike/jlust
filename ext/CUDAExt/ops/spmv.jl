@@ -15,7 +15,7 @@ end
 
 export CUSPARSESpMVHandle
 
-function JLUST.prepare(::CUSPARSEBackend, ::Type{SpMVOp}, u_A::USTensor{T,Ti};
+function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMV}}, u_A::USTensor{T,Ti};
                         transa::Char='N') where {T<:_CUSPARSE_ELTYPES, Ti}
     idx   = _cusparse_index(u_A)
     m, n  = Int64.(extents(u_A))
@@ -72,14 +72,6 @@ function JLUST.sparse_mv!(h::CUSPARSESpMVHandle{T},
     return u_y
 end
 
-# Convenience wrapper — overrides KernelAbstractionsExt's default when CUDA is loaded.
-# Defaults to EmitterBackend (warp-shuffle CSR kernel, occupancy-aware VS).
-# CUSPARSEBackend is still available via explicit backend=CUSPARSEBackend().
-function JLUST.sparse_mv!(u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                           backend=nothing, kw...)
-    be = something(backend, EmitterBackend())
-    JLUST.sparse_mv!(be, u_A, u_x, u_y; kw...)
-end
 
 # ─── CUDA warp-level COO SpMV (hook override) ────────────────────────────────
 #

@@ -358,24 +358,23 @@ function convert_format(u::USTensor{T,I,N,VA,VI,O},
     comp = TensorComposer(fmt, u.extents, lindices, lvals)
     pos_bufs, crd_bufs, val_buf = run!(comp, Tout)
 
-    # Filter empty buffers according to format level types.
-    final_pos = Dict{Int,Vector{Iout}}()
-    final_crd = Dict{Int,Vector{Iout}}()
-    for (idx, lv) in enumerate(fmt.levels)
-        if lv isa CompressedLevel || lv isa DeltaLevel
-            final_pos[idx] = pos_bufs[idx]
-            final_crd[idx] = crd_bufs[idx]
-        elseif lv isa SingletonLevel
-            final_crd[idx] = crd_bufs[idx]
-        end
-        # DenseLevel, BatchLevel, RangeLevel: no buffers
+    # Build typed pos/crd tuples.  The composer's per-level buffers populate the
+    # entries the level type expects (CompressedLevel/DeltaLevel: pos+crd;
+    # SingletonLevel: crd only; DenseLevel/BatchLevel/RangeLevel: nothing).
+    nlvl = length(fmt.levels)
+    off  = O === OneBased ? one(Iout) : zero(Iout)
+    final_pos = ntuple(nlvl) do idx
+        lv = fmt.levels[idx]
+        (lv isa CompressedLevel || lv isa DeltaLevel) ?
+            (off == zero(Iout) ? pos_bufs[idx] : pos_bufs[idx] .+ off) : nothing
     end
-
-    # Composer always produces 0-based indices; adjust to OneBased if needed.
-    if O === OneBased
-        off = one(Iout)
-        for buf in values(final_pos); buf .+= off; end
-        for buf in values(final_crd); buf .+= off; end
+    final_crd = ntuple(nlvl) do idx
+        lv = fmt.levels[idx]
+        if lv isa CompressedLevel || lv isa DeltaLevel || lv isa SingletonLevel
+            off == zero(Iout) ? crd_bufs[idx] : crd_bufs[idx] .+ off
+        else
+            nothing
+        end
     end
 
     USTensor{Tout,Iout,N,Vector{Tout},Vector{Iout},O}(

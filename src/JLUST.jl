@@ -43,7 +43,7 @@ export
 
     # Backend API
     AbstractUSTBackend,
-    AbstractUSTOp,
+    AbstractUSTOp, Op,
     SpVVOp, SpMVOp, SpMMOp, BatchedSpMMOp, SpGEMMOp,
     SpSVOp, SpSMOp, SDDMMOp,
     SparseToDenseOp, DenseToSparseOp,

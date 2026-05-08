@@ -1,184 +1,106 @@
-# ─── Op types ─────────────────────────────────────────────────────────────────
+# ─── Op type ──────────────────────────────────────────────────────────────────
 #
-# Capability queries for multi-operand operations require the full operand
-# signature, not just a single format.  Structured op types carry that
-# information and allow dispatch to specialize on both op class and backend.
+# A single parametric singleton subsumes every operation tag.  The op is
+# identified by:
 #
-# Dense operands use the appropriate Formats.DensedRight(N) format — dense is
-# not a special case, just an all-DenseLevel TensorFormat.
+#   `Tag::Symbol`               — what kind of operation (`:SpMV`, `:Cholesky`, …)
+#   `Formats <: Tuple`          — tuple of operand TensorFormat *types*, in operand order
 #
-# Vector operands (1-D dense) use Formats.DensedRight(1).
+# Capability queries dispatch on the Op type alone — no value-level field
+# access, no per-op struct.  Adding a new op (Cholesky, LDLT, LU, BiCGStab, …)
+# is one const alias plus the backend's `supports_backend` and execution
+# methods; no boilerplate struct.
+#
+# Operand TYPES, not values, drive dispatch.  Because format identity (level
+# structure + family) is now in the TensorFormat type, two formats with the
+# same structural shape always resolve to the same Op type — capability
+# decisions are shared structurally without extra plumbing.
+#
+# Dense operands use `Formats.DensedRight(N)` — dense is not a special case,
+# just a TensorFormat whose levels are all `DenseLevel`.
 
 abstract type AbstractUSTOp end
 
-# ─── Compute ops ──────────────────────────────────────────────────────────────
+struct Op{Tag, Formats <: Tuple} <: AbstractUSTOp end
 
-"""
-    SpVVOp(x_fmt, y_fmt)
-
-Sparse vector dot product: result = xᵀ·y.
-cuSPARSE: `cusparseDotEx` / `cusparseSpVV`.
-"""
-struct SpVVOp <: AbstractUSTOp
-    x::TensorFormat
-    y::TensorFormat
+# Construct an op instance from runtime format values.  The operand format
+# types are captured into the type parameter; the resulting `Op{...}()` is a
+# singleton whose type alone carries all dispatch-relevant information.
+@inline function Op{Tag}(formats::TensorFormat...) where {Tag}
+    Op{Tag, Tuple{(typeof(f) for f in formats)...}}()
 end
 
-"""
-    SpMVOp(A_fmt, x_fmt, y_fmt)
+# Convenience: extract operand format types from an Op type or instance.
+operand_format_types(::Op{Tag, Formats})       where {Tag, Formats} = (Formats.parameters...,)
+operand_format_types(::Type{<:Op{Tag, F}})     where {Tag, F}       = (F.parameters...,)
+op_tag(::Op{Tag})                              where {Tag}          = Tag
+op_tag(::Type{<:Op{Tag}})                      where {Tag}          = Tag
 
-Sparse matrix–dense vector product y = α·A·x + β·y.
-cuSPARSE defaults: x and y are `Formats.DensedRight(1)`, but specialized
-backends may impose different layout constraints on either operand.
-cuSPARSE: `cusparseSpMV`.
-"""
-struct SpMVOp <: AbstractUSTOp
-    A::TensorFormat
-    x::TensorFormat
-    y::TensorFormat
-end
+# ─── Op aliases ───────────────────────────────────────────────────────────────
+#
+# Each named op is a UnionAll alias `Op{:Tag}` — instantiated as
+# `SpMVOp(A_fmt, x_fmt, y_fmt)` produces a singleton of the concrete subtype.
 
-"""
-    SpMMOp(A_fmt, B_fmt, C_fmt)
+"""    SpVVOp(x_fmt, y_fmt)
+Sparse vector dot product: result = xᵀ·y.  cuSPARSE: `cusparseDotEx`/`cusparseSpVV`. """
+const SpVVOp           = Op{:SpVV}
 
-Sparse × dense matrix product C = α·A·B + β·C.
-For cuSPARSE SpMM, B and C are `Formats.DensedRight(2)`.
-cuSPARSE: `cusparseSpMM`.
-"""
-struct SpMMOp <: AbstractUSTOp
-    A::TensorFormat
-    B::TensorFormat
-    C::TensorFormat
-end
+"""    SpMVOp(A_fmt, x_fmt, y_fmt)
+Sparse matrix-dense vector product y = α·A·x + β·y.  cuSPARSE: `cusparseSpMV`. """
+const SpMVOp           = Op{:SpMV}
 
-"""
-    BatchedSpMMOp(A_fmt, B_fmt, C_fmt)
+"""    SpMMOp(A_fmt, B_fmt, C_fmt)
+Sparse × dense matrix product C = α·A·B + β·C.  cuSPARSE: `cusparseSpMM`. """
+const SpMMOp           = Op{:SpMM}
 
-Batched sparse × dense matrix product.
-cuSPARSE: `cusparseSpMM` on `CuSparseArrayCSR` (N-D batched CSR).
-"""
-struct BatchedSpMMOp <: AbstractUSTOp
-    A::TensorFormat
-    B::TensorFormat
-    C::TensorFormat
-end
+"""    BatchedSpMMOp(A_fmt, B_fmt, C_fmt)
+Batched sparse × dense matrix product.  cuSPARSE: `cusparseSpMM` on `CuSparseArrayCSR`. """
+const BatchedSpMMOp    = Op{:BatchedSpMM}
 
-"""
-    SpGEMMOp(A_fmt, B_fmt, C_fmt)
+"""    SpGEMMOp(A_fmt, B_fmt, C_fmt)
+Sparse × sparse matrix product C = α·A·B + β·C.  cuSPARSE: `cusparseSpGEMM`. """
+const SpGEMMOp         = Op{:SpGEMM}
 
-Sparse × sparse matrix product C = α·A·B + β·C.
-cuSPARSE: `cusparseSpGEMM` (CSR×CSR→CSR) or `cusparseSpGEMMreuse`.
-"""
-struct SpGEMMOp <: AbstractUSTOp
-    A::TensorFormat
-    B::TensorFormat
-    C::TensorFormat
-end
+"""    SpSVOp(A_fmt, b_fmt, x_fmt)
+Sparse triangular solve: A·x = α·b (single RHS).  cuSPARSE: `cusparseSpSV`. """
+const SpSVOp           = Op{:SpSV}
 
-"""
-    SpSVOp(A_fmt, b_fmt, x_fmt)
+"""    SpSMOp(A_fmt, B_fmt, C_fmt)
+Sparse triangular solve with multiple RHS: A·X = α·B.  cuSPARSE: `cusparseSpSM`. """
+const SpSMOp           = Op{:SpSM}
 
-Sparse triangular solve: solve A·x = α·b for x (single RHS).
-cuSPARSE defaults: b and x are `Formats.DensedRight(1)`.
-cuSPARSE: `cusparseSpSV`. A must be CSR or CSC (CSC ≡ transposed CSR).
-"""
-struct SpSVOp <: AbstractUSTOp
-    A::TensorFormat
-    b::TensorFormat
-    x::TensorFormat
-end
+"""    SDDMMOp(A_fmt, B_fmt, C_fmt)
+Sampled dense-dense matrix multiply: C = α·(A·B) ∘ sparsity(C) + β·C.  cuSPARSE: `cusparseSDDMM`. """
+const SDDMMOp          = Op{:SDDMM}
 
-"""
-    SpSMOp(A_fmt, B_fmt, C_fmt)
+"""    SparseToDenseOp(src_fmt)
+Convert sparse tensor to dense.  cuSPARSE: `cusparseSparseToDense`. """
+const SparseToDenseOp  = Op{:SparseToDense}
 
-Sparse triangular solve with multiple RHS: solve A·X = α·B for X.
-B and C are dense; cuSPARSE requires `Formats.DensedRight(2)`.
-cuSPARSE: `cusparseSpSM`.
-"""
-struct SpSMOp <: AbstractUSTOp
-    A::TensorFormat
-    B::TensorFormat
-    C::TensorFormat
-end
+"""    DenseToSparseOp(dst_fmt)
+Convert dense tensor to sparse.  cuSPARSE: `cusparseDenseToSparse`. """
+const DenseToSparseOp  = Op{:DenseToSparse}
 
-"""
-    SDDMMOp(A_fmt, B_fmt, C_fmt)
+"""    GatherOp(fmt)
+Gather: `y[idx] = x_dense` for a sparse index vector.  cuSPARSE: `cusparseGather`. """
+const GatherOp         = Op{:Gather}
 
-Sampled dense–dense matrix multiply: C = α·(A∘(B·Dᵀ)) + β·C.
-C is sparse (the sampling mask); A and B are dense.
-cuSPARSE: `cusparseSDDMM`. C must be CSR or COO.
-"""
-struct SDDMMOp <: AbstractUSTOp
-    A::TensorFormat   # dense
-    B::TensorFormat   # dense
-    C::TensorFormat   # sparse result/mask
-end
+"""    ScatterOp(fmt)
+Scatter: `x_dense[idx] = y` for a sparse index vector.  cuSPARSE: `cusparseScatter`. """
+const ScatterOp        = Op{:Scatter}
 
-# ─── Format conversion ops ────────────────────────────────────────────────────
+"""    AxpbyOp(x_fmt, y_fmt)
+Sparse vector scale-and-add: y = α·x + β·y.  cuSPARSE: `cusparseAxpby`. """
+const AxpbyOp          = Op{:Axpby}
 
-"""
-    SparseToDenseOp(src_fmt)
+"""    RotOp(x_fmt, y_fmt)
+Givens rotation applied to sparse x and dense y.  cuSPARSE: `cusparseRot`. """
+const RotOp            = Op{:Rot}
 
-Convert a sparse tensor to a dense tensor.
-cuSPARSE: `cusparseSparseToDense`.
-"""
-struct SparseToDenseOp <: AbstractUSTOp
-    src::TensorFormat
-end
-
-"""
-    DenseToSparseOp(dst_fmt)
-
-Convert a dense tensor to a sparse tensor.
-cuSPARSE: `cusparseDenseToSparse`.
-"""
-struct DenseToSparseOp <: AbstractUSTOp
-    dst::TensorFormat
-end
-
-# ─── Sparse vector ops ────────────────────────────────────────────────────────
-
-"""
-    GatherOp(fmt)
-
-Gather: y[idx] = x_dense for a sparse index vector.
-cuSPARSE: `cusparseGather`.
-"""
-struct GatherOp <: AbstractUSTOp
-    fmt::TensorFormat
-end
-
-"""
-    ScatterOp(fmt)
-
-Scatter: x_dense[idx] = y for a sparse index vector.
-cuSPARSE: `cusparseScatter`.
-"""
-struct ScatterOp <: AbstractUSTOp
-    fmt::TensorFormat
-end
-
-"""
-    AxpbyOp(x_fmt, y_fmt)
-
-Sparse vector scale-and-add: y = α·x + β·y.
-cuSPARSE: `cusparseAxpby`.
-"""
-struct AxpbyOp <: AbstractUSTOp
-    x::TensorFormat   # sparse
-    y::TensorFormat   # dense
-end
-
-"""
-    RotOp(x_fmt, y_fmt)
-
-Givens rotation applied to sparse x and dense y.
-cuSPARSE: `cusparseRot`.
-"""
-struct RotOp <: AbstractUSTOp
-    x::TensorFormat   # sparse
-    y::TensorFormat   # dense
-end
+# Future ops follow the same pattern:
+#   const CholeskyOp = Op{:Cholesky}     # A = L·L'  (factorization)
+#   const LDLTOp     = Op{:LDLT}         # A = L·D·L'
+#   const LUOp       = Op{:LU}           # A = P·L·U
 
 # ─── Operation function declarations ─────────────────────────────────────────
 #

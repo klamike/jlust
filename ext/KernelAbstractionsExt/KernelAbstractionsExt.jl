@@ -2,8 +2,7 @@ module KernelAbstractionsExt
 
 using JLUST, KernelAbstractions, SparseArrays
 import JLUST:
-    USTensor, TensorFormat, AbstractUSTBackend,
-    SpMVOp, SpMMOp, SpGEMMOp, SpSVOp, SpSMOp, SDDMMOp, SparseToDenseOp,
+    USTensor, TensorFormat, AbstractUSTBackend, Op,
     supports_backend, format, extents, index_origin, OneBased,
     positions, coordinates, nonzeros, has_positions, has_coordinates,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
@@ -15,21 +14,30 @@ import JLUST:
     needs_row_guard,
     _bbm_scatter_diag!, _bbm_scatter_off!
 
-_is_dense_fmt(fmt::TensorFormat) =
-    all(lv isa Union{DenseLevel,BatchLevel} for lv in fmt.levels)
+# Type-level dispatch on the LevelTypes tuple: a format is "dense" iff every
+# level type is Dense or Batch.  Hot-path predicates resolve to compile-time
+# constants since LevelTypes is in the type system.
+@generated function _is_dense_fmt(::Type{<:TensorFormat{LT}}) where {LT}
+    all(L <: Union{DenseLevel,BatchLevel} for L in LT.parameters) ? true : false
+end
+_is_dense_fmt(fmt::TensorFormat) = _is_dense_fmt(typeof(fmt))
 
+_is_emittable(::Type{T}) where {T<:TensorFormat} = !_is_dense_fmt(T)
 _is_emittable(fmt::TensorFormat) = !_is_dense_fmt(fmt)
 
-function JLUST.supports_backend(::EmitterBackend, op::SpMVOp)
-    _is_emittable(op.A) && _is_dense_fmt(op.x) && _is_dense_fmt(op.y)
+@inline _is_csr_type(::Type{<:TensorFormat{LT, :CSR}}) where {LT} = true
+@inline _is_csr_type(::Type)                                       = false
+
+function JLUST.supports_backend(::EmitterBackend, ::Op{:SpMV, Tuple{A, X, Y}}) where {A, X, Y}
+    _is_emittable(A) && _is_dense_fmt(X) && _is_dense_fmt(Y)
 end
 
-function JLUST.supports_backend(::EmitterBackend, op::SpMMOp)
-    _is_emittable(op.A) && _is_dense_fmt(op.B) && _is_dense_fmt(op.C)
+function JLUST.supports_backend(::EmitterBackend, ::Op{:SpMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_emittable(A) && _is_dense_fmt(B) && _is_dense_fmt(C)
 end
 
-function JLUST.supports_backend(::EmitterBackend, op::SpGEMMOp)
-    op.A == Formats.CSR && op.B == Formats.CSR && op.C == Formats.CSR
+function JLUST.supports_backend(::EmitterBackend, ::Op{:SpGEMM, Tuple{A, B, C}}) where {A, B, C}
+    _is_csr_type(A) && _is_csr_type(B) && _is_csr_type(C)
 end
 
 # ─── apply_values! ────────────────────────────────────────────────────────────
@@ -46,26 +54,10 @@ function JLUST.apply_values!(f, u::USTensor; backend::EmitterBackend=EmitterBack
     return u
 end
 
-# ─── Convenience wrappers (default backend; overridden by CUDA ext when loaded) ─
-
-function JLUST.sparse_mv!(u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                           backend=EmitterBackend(), kw...)
-    JLUST.sparse_mv!(backend, u_A, u_x, u_y; kw...)
-end
-
-# Default-backend overload for raw AbstractVector operands.
-# Pairs with the explicit-backend overload in src/convenience.jl.
-function JLUST.sparse_mv!(u_A::USTensor, x::AbstractVector, y::AbstractVector;
-                           backend=EmitterBackend(), kw...)
-    JLUST.sparse_mv!(backend, u_A, x, y; kw...)
-end
-
-function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                           backend=EmitterBackend(), kw...)
-    JLUST.sparse_mm!(backend, u_A, u_B, u_C; kw...)
-end
-
 # ─── SpMV / SpMM / SpGEMM / SpSV / SpSM / SDDMM ─────────────────────────────
+# No-backend convenience wrappers live in src/convenience.jl and consult
+# `default_backend` — extensions only override `default_backend` and the
+# explicit-backend execution methods.
 
 include("ops/_walker.jl")
 include("ops/spmv.jl")
