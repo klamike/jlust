@@ -34,16 +34,20 @@ function ust(A::SparseVector{T,I}) where {T,I}
 end
 
 # ─── Dense AbstractArray zero-copy view ───────────────────────────────────────
+#
+# Shared empty dicts used as the positions/coordinates placeholders for dense
+# tensors.  DensedRight levels have no pos/crd buffers; these dicts are never
+# accessed or mutated, so sharing them across all ust(::AbstractArray) calls is
+# safe and avoids 2 Dict allocations per wrapping (8 per BlockSparseMatrix mul!).
+const _DENSE_POS = Dict{Int,Vector{Int}}()
+const _DENSE_CRD = Dict{Int,Vector{Int}}()
 
 function ust(A::AbstractArray{T,N}) where {T,N}
-    dims = Formats.DensedRight(N)
-    pos = Dict{Int,Vector{Int}}()
-    crd = Dict{Int,Vector{Int}}()
     USTensor{T,Int,N,typeof(A),Vector{Int},OneBased}(
         size(A),
-        dims,
-        pos,
-        crd,
+        Formats.DensedRight(N),
+        _DENSE_POS,
+        _DENSE_CRD,
         A,
         A,
     )

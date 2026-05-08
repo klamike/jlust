@@ -1,3 +1,12 @@
+Precompiling packages...
+   2779.3 ms  ✓ JLUST
+  1 dependency successfully precompiled in 3 seconds. 7 already precompiled.
+Precompiling packages...
+   2306.3 ms  ✓ JLUST → KernelAbstractionsExt
+  1 dependency successfully precompiled in 2 seconds. 28 already precompiled.
+Precompiling packages...
+   4622.4 ms  ✓ JLUST → CUDAExt
+  1 dependency successfully precompiled in 5 seconds. 103 already precompiled.
 ========================================================================
 JLUST DCOPF SpMV Feature Tour
 Backend : CUDA (NVIDIA L40S)
@@ -19,14 +28,14 @@ Section 2 — BlockSparseMatrix SpMV: assembled DCOPF constraint matrix
   BlockSparseMatrix shape : 65393 × 68919
     block rows  : 30000 (balance) + 35393 (flow)
     block cols  : 3526 (p_gen) + 35393 (p_f) + 30000 (va)
-  mul!(y, BM, x)          :     37.8 μs  (4 block SpMVs)
+  mul!(y, BM, x)          :     34.9 μs  (4 block SpMVs)
 
   Method (full DCOPF operator)           Time (μs)
   ────────────────────────────────────────────────
-  SparseMatrixCSC (CPU)                      356.4
-  cuSPARSE (GPU reference)                    41.5
-  JLUST BlockSparseMatrix                     37.8  (1.10× vs cuSPARSE)
-  JLUST + CUDA Graph                          17.2  (2.41× vs cuSPARSE)
+  SparseMatrixCSC (CPU)                      355.7
+  cuSPARSE (GPU reference)                    23.4
+  JLUST BlockSparseMatrix                     34.9  (0.67× vs cuSPARSE)
+  JLUST + CUDA Graph                          20.7  (1.13× vs cuSPARSE)
   ────────────────────────────────────────────────
 
 ────────────────────────────────────────────────────────────────────────
@@ -37,10 +46,10 @@ Section 3 — Multi-stage OPF with ramping (BlockBandedMatrix)
 
   Method (T=24)                         Total (μs)    Per period
   ──────────────────────────────────────────────────────────────
-  SparseMatrixCSC (CPU serial)              8728.6         363.7
-  cuSPARSE (GPU serial)                      349.8          14.6
-  JLUST BlockBandedMatrix                    177.9           7.4  (1.97× vs cuSPARSE)
-  JLUST SpMM + CUDA Graph (11 kernels)       148.3           6.2  (2.36× vs cuSPARSE)
+  SparseMatrixCSC (CPU serial)              8702.7         362.6
+  cuSPARSE (GPU serial)                      328.7          13.7
+  JLUST BlockBandedMatrix                    111.2           4.6  (2.96× vs cuSPARSE)
+  JLUST SpMM + CUDA Graph (8 kernels)         91.0           3.8  (3.61× vs cuSPARSE)
   ──────────────────────────────────────────────────────────────
 
 ========================================================================
@@ -49,16 +58,16 @@ Performance Summary  (35393 lines × 30000 buses, Float64)
   Operation                                    Time (μs)
   ──────────────────────────────────────────────────────
   §2  Assembled DCOPF SpMV                              
-      SparseMatrixCSC (CPU)                        356.4
-      cuSPARSE (GPU ref)                            41.5
-      JLUST BlockSparseMatrix                       37.8
-        + CUDA Graph                                17.2
+      SparseMatrixCSC (CPU)                        355.7
+      cuSPARSE (GPU ref)                            23.4
+      JLUST BlockSparseMatrix                       34.9
+        + CUDA Graph                                20.7
   ──────────────────────────────────────────────────────
   §3  Multi-stage SpMV (per period, T=24)               
-      SparseMatrixCSC (CPU serial)                 363.7
-      cuSPARSE (GPU serial)                         14.6
-      JLUST BlockBandedMatrix                        7.4
-        + CUDA Graph (11 kernels)                    6.2
+      SparseMatrixCSC (CPU serial)                 362.6
+      cuSPARSE (GPU serial)                         13.7
+      JLUST BlockBandedMatrix                        4.6
+        + CUDA Graph (8 kernels)                     3.8
   ──────────────────────────────────────────────────────
 
 ────────────────────────────────────────────────────────────────────────
@@ -67,17 +76,17 @@ Visual summary (live numbers from this run)
 
                               §2  DCOPF mul!  (μs, lower is better)   
                            ┌                                        ┐ 
-     SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 356.4   
-        cuSPARSE (GPU ref) ┤■■■■ 41.5                                 
-   JLUST BlockSparseMatrix ┤■■■■ 37.8                                 
-        JLUST + CUDA Graph ┤■■ 17.2                                   
+     SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 355.7   
+        cuSPARSE (GPU ref) ┤■■ 23.4                                   
+   JLUST BlockSparseMatrix ┤■■■ 34.9                                  
+        JLUST + CUDA Graph ┤■■ 20.7                                   
                            └                                        ┘ 
                                                μs                     
                               §3  multi-stage cost per period  (μs, lower is better) 
                               ┌                                        ┐ 
-        SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 363.69   
-           cuSPARSE (GPU ref) ┤■ 14.57                                   
-           JLUST SpMM /period ┤■ 7.41                                    
-   JLUST SpMM + Graph /period ┤■ 6.18                                    
+        SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 362.61   
+           cuSPARSE (GPU ref) ┤■ 13.7                                    
+           JLUST SpMM /period ┤ 4.63                                     
+   JLUST SpMM + Graph /period ┤ 3.79                                     
                               └                                        ┘ 
                                                   μs                     

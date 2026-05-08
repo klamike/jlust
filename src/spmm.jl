@@ -151,37 +151,6 @@ end
 # we fall back to the column-first emitter (avoids register spill).
 
 const _SPMM_NCOL_INLINE_THRESHOLD = 32   # inline up to 32 output columns
-const _SPMM_2D_AVG_NNZ            = 3    # avg NNZ/row above this → 2D for large matrices
-
-# Per-backend cache: SM count queried once, then reused across all SpMM calls.
-const _sm_count_cache = Dict{Any,Int}()
-
-# Conservative default for backends whose SM count we cannot determine.
-_probe_sm_count(::Any) = 80   # ~V100 level; underestimates for L40S, safe for T4+
-
-function _probe_sm_count(ka::KernelAbstractions.GPU)
-    # Try to query the CUDA SM count via Base.loaded_modules.
-    # Falls back to the default if CUDA is not loaded or the query fails.
-    cuda_id = Base.PkgId(Base.UUID("052768ef-5323-5732-b1bb-66c8b64840ba"), "CUDA")
-    if haskey(Base.loaded_modules, cuda_id)
-        cuda = Base.loaded_modules[cuda_id]
-        try
-            dev = cuda.device()
-            return Int(cuda.attribute(dev, cuda.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
-        catch
-        end
-    end
-    return 80
-end
-
-# Threshold n_rows below which 2D is always chosen (1D has < ~6 warps/SM).
-# Scales with SM count: threshold ≈ 3 blocks/SM × group_size(64) × n_SMs = 192 × n_SMs.
-# Cached after first call; device properties are constant within a session.
-function _spmm_2d_max_rows(ka)
-    get!(_sm_count_cache, typeof(ka)) do
-        192 * _probe_sm_count(ka)
-    end
-end
 
 function _emit_spmm_body_nnzfirst(fmt::TensorFormat, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
     pc = Ref(0); cc = Ref(0)
@@ -458,98 +427,6 @@ function _get_spmm_nf_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) w
     return kern
 end
 
-# ─── 2D NNZ-first SpMM (one thread per (row, col) pair) ─────────────────────
-#
-# Problem: 1D NNZ-first launches n_rows threads.  For medium networks (9K–14K
-# buses) this gives only 2–3 warps/SM on the L40S (142 SMs), leaving most SMs
-# bandwidth-starved.  For 30K buses it's still only ~6 warps/SM.
-#
-# Fix: launch n_rows × n_col threads.  Each thread handles exactly one output
-# element — 1 accumulator instead of n_col.  For T=24 this is 24× more blocks:
-#   9241 Bbus  (1D):  9241 rows  →  145 blocks →  2 warps/SM
-#   9241 Bbus  (2D): 221784      → 3466 blocks → 48 warps/SM  (hardware limit)
-#   30000 Bbus (2D): 720000      → fully saturated at 48 warps/SM
-# Lower register pressure (1 vs 24 Float64 accumulators) lets more blocks coexist
-# per SM, reinforcing the occupancy gain.
-#
-# The B reads B[x_idx, col] remain non-coalesced across a warp (consecutive
-# threads have different col values at stride n_rows_B).  Latency hiding via the
-# abundant concurrent warps compensates; no layout change is required.
-#
-# Applied for all CSR-like formats when n_col ≤ _SPMM_NCOL_INLINE_THRESHOLD.
-# Non-CSR formats (DCSR, COO) continue to use the 1D NNZ-first path.
-
-function _emit_spmm_2d_body_csr(::Type{T}, n_col::Int, zero_beta::Bool, guard::Bool) where T
-    acc_write = if zero_beta
-        :(_C[_row, _col] = _alpha * _acc)
-    else
-        :(_C[_row, _col] = _alpha * _acc + _beta * _C[_row, _col])
-    end
-    inner = quote
-        _acc = $(zero(T))
-        for _i2 in (_lo + 1):_hi
-            _x_idx = Int(_crd1[_i2]) - Int(_origin_off) + 1
-            _acc  += _nzval[_i2] * _B[_x_idx, _col]
-        end
-        $acc_write
-    end
-    work = guard ? :(if _lo < _hi; $inner; end) : inner
-    quote
-        _lin = @index(Global, Linear) - 1
-        _row = _lin ÷ $(n_col) + 1
-        _col = _lin % $(n_col) + 1
-        if _row <= _n_outer
-            _lo = Int(_pos1[_row])     - Int(_origin_off)
-            _hi = Int(_pos1[_row + 1]) - Int(_origin_off)
-            $work
-        end
-    end
-end
-
-function _get_spmm_2d_beta0_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d0, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, true, false)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha]
-    fname     = gensym(:ust_spmm_2d0)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
-function _get_spmm_2d_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, false, false)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta]
-    fname     = gensym(:ust_spmm_2d)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
-function _get_spmm_2d_beta0_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d0g, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, true, true)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha]
-    fname     = gensym(:ust_spmm_2d0g)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
-function _get_spmm_2d_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2dg, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, false, true)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta]
-    fname     = gensym(:ust_spmm_2dg)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
 # ─── Tiled NNZ-first SpMM emitter ────────────────────────────────────────────
 #
 # For large k (> _SPMM_NCOL_INLINE_THRESHOLD), the full NNZ-first emitter would
@@ -726,54 +603,28 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     sparse_bufs = _sparse_args(u_A)
 
     if !is_coo_like && n_col <= _SPMM_NCOL_INLINE_THRESHOLD
-        # NNZ-first, n_col baked in as a compile-time constant.
-        # CSR-like formats use the 2D kernel (ndrange = n_rows × n_col) for better SM
-        # occupancy: 24× more thread blocks → 48 warps/SM vs 2–6 for the 1D path.
-        # Non-CSR formats (DCSR, COO) fall back to the 1D path.
-        if _is_csr_like_for_guard(fmt)
-            # 2D when: (a) guarded path (sparse rows → threads for empty rows are cheap),
-            # (b) small matrix (1D has < 6 warps/SM so latency isn't hidden), or
-            # (c) dense-row matrix (avg NNZ/row > threshold so many B-loads benefit from hiding).
-            # 1D is better for large, low-NNZ matrices (e.g. identity): ILP in one thread
-            # pipelines all 24 B-reads efficiently; 2D overhead > occupancy benefit there.
-            _use_2d = skip_empty_rows ||
-                      Int(n_outer) <= _spmm_2d_max_rows(ka) ||
-                      length(nonzeros(u_A)) > _SPMM_2D_AVG_NNZ * Int(n_outer)
-            if _use_2d
-                if iszero(T_beta)
-                    kern = skip_empty_rows ?
-                        _get_spmm_2d_beta0_guarded_kernel(fmt, T, n_col) :
-                        _get_spmm_2d_beta0_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
-                else
-                    kern = skip_empty_rows ?
-                        _get_spmm_2d_guarded_kernel(fmt, T, n_col) :
-                        _get_spmm_2d_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
-                end
-                kernel_obj = Base.invokelatest(kern, ka, 64)
-                Base.invokelatest(kernel_obj, all_args...; ndrange = Int(n_outer) * n_col)
+        # NNZ-first: n_col baked in → compiler unrolls column loop, registers hold accumulators.
+        # Beta=0 path: omits C read entirely, eliminating fill!+read overhead for accumulation.
+        if iszero(T_beta)
+            if skip_empty_rows && _is_csr_like_for_guard(fmt)
+                # Guarded beta=0: skip empty-row writes; caller pre-zeroed those positions
+                # (or a prior dense SpMM already wrote correct zeros there).
+                kern = _get_spmm_nf_beta0_guarded_kernel(fmt, T, n_col)
             else
-                # 1D NNZ-first for large low-density CSR (identity-like)
-                if iszero(T_beta)
-                    kern = _get_spmm_nf_beta0_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
-                else
-                    kern = _get_spmm_nf_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
-                end
-                kernel_obj = Base.invokelatest(kern, ka, 64)
-                Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
-            end
-        else
-            # 1D NNZ-first for non-CSR (DCSR, COO, etc.)
-            if iszero(T_beta)
                 kern = _get_spmm_nf_beta0_kernel(fmt, T, n_col)
-                all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
+            end
+            all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
+            kernel_obj = Base.invokelatest(kern, ka, 64)
+            Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+        else
+            if skip_empty_rows && _is_csr_like_for_guard(fmt)
+                # Guarded beta=1: accumulate only for non-empty rows; empty rows retain their
+                # existing C value (written correctly by prior dense SpMM).
+                kern = _get_spmm_nf_guarded_kernel(fmt, T, n_col)
             else
                 kern = _get_spmm_nf_kernel(fmt, T, n_col)
-                all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
             end
+            all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
             kernel_obj = Base.invokelatest(kern, ka, 64)
             Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
         end

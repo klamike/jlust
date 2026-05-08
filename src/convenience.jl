@@ -339,8 +339,10 @@ function LinearAlgebra.mul!(y::AbstractVector, A::BlockSparseMatrix, x::Abstract
     end
 
     # General path: one kernel call per non-null block.
+    # No fill! needed: the first non-null block per row uses beta=false (ZERO_BETA),
+    # which writes 0 for empty rows. BlockSparseMatrix constructor guarantees every
+    # row block has at least one non-null entry.
     nb_r, nb_c = size(A.blocks)
-    fill!(y, zero(eltype(A)))
 
     for i in 1:nb_r
         y_sl      = view(y, A._row_off[i]+1 : A._row_off[i+1])

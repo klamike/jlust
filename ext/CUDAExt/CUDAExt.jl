@@ -278,5 +278,6 @@ include("ops/spsv.jl")
 include("ops/spsm.jl")
 include("ops/sddmm.jl")
 include("ops/conversion.jl")
+include("ops/block_mul.jl")
 
 end # module CUDAExt

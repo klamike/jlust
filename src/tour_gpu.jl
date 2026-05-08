@@ -386,9 +386,9 @@ println("  " * "─"^64)
 # Full plugin: struct + level_step + constructor.  ~5 lines of user code.
 #
 # On GPU, DiagonalLevel (276 KB struct read) loses to CSR (553 KB) because
-# the CSR warp-shuffle vector kernel (hardware-aware VS, 1 NNZ/row) is
-# memory-bandwidth-optimal for this pattern.  At n >> L2 capacity the 2×
-# bandwidth reduction tips the balance; on CPU DiagonalLevel wins at all sizes.
+# the CSR warp-shuffle vector kernel (VS=2, 1 NNZ/row) is memory-bandwidth
+# optimal for this pattern.  At n >> L2 capacity the 2× bandwidth reduction
+# tips the balance; on CPU DiagonalLevel wins at all tested sizes.
 
 println("\n" * "─"^72)
 println("Section 4 — DiagonalLevel (n×n diagonal matrix)")

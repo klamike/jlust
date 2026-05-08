@@ -73,11 +73,11 @@ function JLUST.sparse_mv!(h::CUSPARSESpMVHandle{T},
 end
 
 # Convenience wrapper — overrides KernelAbstractionsExt's default when CUDA is loaded.
-# Defaults to CUSPARSEBackend for CUDA arrays, EmitterBackend for everything else.
+# Defaults to EmitterBackend (warp-shuffle CSR kernel, occupancy-aware VS).
+# CUSPARSEBackend is still available via explicit backend=CUSPARSEBackend().
 function JLUST.sparse_mv!(u_A::USTensor, u_x::USTensor, u_y::USTensor;
                            backend=nothing, kw...)
-    be = something(backend,
-                   nonzeros(u_A) isa CuArray ? CUSPARSEBackend() : EmitterBackend())
+    be = something(backend, EmitterBackend())
     JLUST.sparse_mv!(be, u_A, u_x, u_y; kw...)
 end
 
@@ -131,7 +131,7 @@ end
 # Dispatches on CuVector to intercept the KernelAbstractionsExt COO path.
 function JLUST._coo_spmv_specialized!(
         row_crd::CuVector, col_crd::CuVector,
-        nzval::CuVector{T}, x::CuVector{T}, y::CuVector{T},
+        nzval::CuVector{T}, x::AbstractVector{T}, y::AbstractVector{T},
         origin_off::Int32, n_nnz::Int32) where T
     n_nnz == Int32(0) && return true
     threads = 256
@@ -219,29 +219,66 @@ function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer,
     return nothing
 end
 
-# Select VS based on average NNZ/row (computed over all rows, including empty).
-# Thresholds derived empirically from the L40S benchmark suite:
-#   < 4  → VS=2   (ultra-sparse; 2 threads/row keeps occupancy)
-#   < 8  → VS=4   (sparse with moderate or heavy empty-row fraction)
-#   < 16 → VS=8   (moderately dense; more parallelism per row)
-#   < 32 → VS=16  (dense rows; parallelize within-row loads aggressively)
-#   ≥ 32 → VS=32  (warp-per-row; row NNZ >> warp width)
+# Cached SM count: queried once from CUDA device, reused across all SpMV calls.
+# Reset to 0 to force a re-query (e.g. after device switch).
+const _cuda_n_SMs = Ref{Int}(0)
+function _cuda_sm_count()
+    if _cuda_n_SMs[] == 0
+        _cuda_n_SMs[] = Int(CUDA.attribute(CUDA.device(),
+                                           CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
+    end
+    _cuda_n_SMs[]
+end
+
+# Select VS (threads per CSR row) using two criteria combined with max():
+#
+#   NNZ-based floor (vs_nnz): enough inner-loop iterations per thread to
+#   amortise the warp-shuffle overhead and hide latency within the thread.
+#     avg_nnz < 4  → VS=2,  < 8  → VS=4,  < 16 → VS=8,
+#     < 32         → VS=16, ≥ 32 → VS=32.
+#
+#   Occupancy-based floor (vs_occ): enough thread blocks so that the SM
+#   stays bandwidth-bound rather than latency-bound.  Target ≥ 6 blocks/SM
+#   (= 48 warps/SM at 8 warps/256-thread block, matching the hardware limit).
+#   blocks = ⌈n_rows × VS / 256⌉ ≥ 6 × n_SMs  →  VS ≥ ⌈6 × n_SMs × 256 / n_rows⌉.
+#   Result rounded up to the next power of two in {2,4,8,16,32}.
+#
+#   Example — L40S (142 SMs), negI (35 393 rows, avg_nnz=1):
+#     vs_nnz=2 (avg_nnz<4), vs_occ=⌈6×142×256/35393⌉=⌈6.2⌉=8  →  VS=8.
+#     With VS=2: 277 blocks/142 SMs = 15 warps/SM (latency-bound).
+#     With VS=8: 1106 blocks/142 SMs = 62 warps/SM → capped at 48 (bandwidth-bound). ✓
 #
 # For VS=32 the warp mask formula (UInt32(1)<<32)-1 wraps to 0xffffffff by
 # UInt32 overflow semantics on GPU, giving the correct full-warp mask.
 function JLUST._csr_spmv_specialized!(
         pos::CuVector, crd::CuVector,
-        nzval::CuVector{T}, x::CuVector{T}, y::CuVector{T},
+        nzval::CuVector{T}, x::AbstractVector{T}, y::AbstractVector{T},
         origin_off::Int32, n_outer::Int32, beta::T) where T
     n_outer == Int32(0) && return true
     avg_nnz = length(nzval) / Int(n_outer)
-    vs = avg_nnz < 4.0  ? 2  :
-         avg_nnz < 8.0  ? 4  :
-         avg_nnz < 16.0 ? 8  :
-         avg_nnz < 32.0 ? 16 : 32
-    zero_beta = Val(iszero(beta))
+    n_SMs   = _cuda_sm_count()
     threads = 256
-    blocks  = cld(Int(n_outer) * vs, threads)
+
+    # NNZ-based floor: enough inner iterations per thread to hide latency.
+    # Split at 2 so avg_nnz ∈ [2,4) maps to VS=4 rather than VS=2.
+    vs_nnz = avg_nnz < 2.0  ? 2  :
+             avg_nnz < 4.0  ? 4  :
+             avg_nnz < 8.0  ? 8  :
+             avg_nnz < 16.0 ? 16 :
+             avg_nnz < 32.0 ? 24 : 32
+
+    # Occupancy floor: VS such that blocks/SM ≥ 6.
+    # Capped at vs_nnz × 2: beyond one doubling, idle threads outweigh the
+    # occupancy gain (e.g. VS=32 for avg_nnz=4 wastes 87% of threads).
+    vs_occ_raw = cld(6 * n_SMs * threads, Int(n_outer))
+    vs_occ = vs_occ_raw <= 2  ? 2  :
+             vs_occ_raw <= 4  ? 4  :
+             vs_occ_raw <= 8  ? 8  :
+             vs_occ_raw <= 16 ? 16 : 32
+
+    vs        = min(max(vs_nnz, min(vs_occ, vs_nnz * 2)), 32)
+    zero_beta = Val(iszero(beta))
+    blocks    = cld(Int(n_outer) * vs, threads)
     if vs == 2
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
             pos, crd, nzval, x, y, origin_off, n_outer, Val(2), beta, zero_beta)
