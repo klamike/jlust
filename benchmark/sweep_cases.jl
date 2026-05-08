@@ -1,0 +1,297 @@
+# sweep_cases.jl — JLUST performance across network sizes
+#
+# Benchmarks the DCOPF BlockSparseMatrix and multi-stage BlockBandedMatrix
+# across six pglib-opf cases ranging from 1354 to 30000 buses.  Cases are
+# downloaded on first run and cached in .cache/pglib/.
+#
+# Usage:
+#   cd ~/bench/JLUST && julia --project=benchmark benchmark/sweep_cases.jl
+
+using Printf, Random, Downloads
+using JLUST, JLUST.Formats
+using SparseArrays, LinearAlgebra
+using KernelAbstractions
+using BenchmarkTools
+
+const HAS_CUDA  = try; using CUDA;  CUDA.functional();  catch; false; end
+const HAS_METAL = !HAS_CUDA && try; using Metal; Metal.functional(); catch; false; end
+
+function to_device(x::AbstractArray{T}) where T
+    arr = (HAS_METAL && T === Float64) ? Float32.(x) : x
+    HAS_CUDA  ? CUDA.CuArray(arr)   :
+    HAS_METAL ? Metal.MtlArray(arr) : arr
+end
+
+function sync()
+    HAS_CUDA  && CUDA.synchronize()
+    HAS_METAL && Metal.synchronize()
+end
+
+const FloatType = HAS_METAL ? Float32 : Float64
+
+const _PGLIB_URL   = "https://raw.githubusercontent.com/power-grid-lib/pglib-opf/master/"
+const _PGLIB_CACHE = joinpath(dirname(abspath(@__FILE__)), "..", ".cache", "pglib")
+
+function _pglib_file(case::String)
+    mkpath(_PGLIB_CACHE)
+    path = joinpath(_PGLIB_CACHE, case * ".m")
+    if !isfile(path)
+        url = _PGLIB_URL * case * ".m"
+        print("    Fetching $case ... ")
+        Downloads.download(url, path)
+        println("$(filesize(path) ÷ 1024) KB")
+    end
+    path
+end
+
+function _mp_table(txt::String, name::String)
+    m = match(Regex("mpc\\.$name\\s*=\\s*\\[(.*?)\\]\\s*;", "s"), txt)
+    m === nothing && return zeros(0, 0)
+    rows = Vector{Vector{FloatType}}()
+    for seg in split(m.captures[1], ';')
+        seg = strip(seg)
+        isempty(seg) && continue
+        vals = [v for v in tryparse.(FloatType, split(seg)) if v !== nothing]
+        isempty(vals) && continue
+        push!(rows, vals)
+    end
+    isempty(rows) && return zeros(0, 0)
+    nc = maximum(length, rows)
+    M  = zeros(length(rows), nc)
+    for (i, r) in enumerate(rows); M[i, 1:length(r)] .= r; end
+    M
+end
+
+function load_pglib(case::String)
+    txt = replace(read(_pglib_file(case), String), r"%[^\n]*" => "")
+
+    bus_d = _mp_table(txt, "bus")
+    gen_d = _mp_table(txt, "gen")
+    br_d  = _mp_table(txt, "branch")
+
+    br  = br_d[ br_d[:, 11] .== 1, :]
+    gen = gen_d[gen_d[:,  8] .== 1, :]
+
+    n_bus  = size(bus_d, 1)
+    n_line = size(br,    1)
+    n_gen  = size(gen,   1)
+
+    id2i = Dict(Int(bus_d[i, 1]) => i for i in 1:n_bus)
+
+    from_b = [id2i[Int(b)] for b in br[:, 1]]
+    to_b   = [id2i[Int(b)] for b in br[:, 2]]
+    b_k = FloatType.(ifelse.(abs.(br[:, 4]) .< 1e-10, zero(FloatType), one(FloatType) ./ br[:, 4]))
+
+    Bf = sparse([1:n_line; 1:n_line], [from_b; to_b],
+                FloatType.([b_k; -b_k]), n_line, n_bus)
+
+    gen_b = [id2i[Int(b)] for b in gen[:, 1]]
+    Cg    = sparse(gen_b, 1:n_gen, ones(FloatType, n_gen), n_bus, n_gen)
+
+    d_b = zeros(FloatType, n_bus)
+    for k in 1:n_line; d_b[from_b[k]] += b_k[k]; d_b[to_b[k]] += b_k[k]; end
+    Bbus = sparse([from_b; to_b; 1:n_bus], [to_b; from_b; 1:n_bus],
+                  FloatType.([-b_k; -b_k; d_b]), n_bus, n_bus)
+
+    I_l = sparse(FloatType(1)*I, n_line, n_line)
+    (; Cg, Bf, Bbus, negI=-I_l, n_bus, n_line, n_gen)
+end
+
+# ── benchmark one case ────────────────────────────────────────────────────────
+
+function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
+    d = load_pglib(case)
+    (; Cg, Bf, Bbus, negI, n_bus, n_line, n_gen) = d
+
+    # §2: BlockSparseMatrix
+    u_Cg   = csr_tensor(Cg;    device=to_device)
+    u_Bbus = csr_tensor(-Bbus; device=to_device)
+    u_negI = csr_tensor(negI;  device=to_device)
+    u_Bf   = csr_tensor(Bf;    device=to_device)
+    BM = BlockSparseMatrix([
+        u_Cg   nothing  u_Bbus;
+        nothing u_negI  u_Bf
+    ])
+
+    n_var = n_gen + n_line + n_bus
+    n_con = n_bus + n_line
+    x_bm  = to_device(randn(n_var))
+    y_bm  = similar(x_bm, n_con)
+
+    for _ in 1:3; mul!(y_bm, BM, x_bm); sync(); end
+    t_jlust_s2 = @belapsed(begin mul!($y_bm, $BM, $x_bm); $sync() end,
+                            samples=n_s2, evals=1) * 1e6
+
+    # §2: CUDA Graph
+    t_graph_s2 = if HAS_CUDA
+        g = CUDA.capture() do; mul!(y_bm, BM, x_bm); end
+        e = CUDA.instantiate(g)
+        CUDA.launch(e); CUDA.synchronize()
+        @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
+                  samples=n_s2, evals=1) * 1e6
+    else
+        NaN
+    end
+
+    # §2: cuSPARSE reference
+    t_cusparse_s2 = if HAS_CUDA
+        A_full = vcat(
+            hcat(Cg,                        spzeros(n_bus, n_line), -Bbus),
+            hcat(spzeros(n_line, n_gen),    negI,                    Bf))
+        A_cu = CUDA.CUSPARSE.CuSparseMatrixCSR(A_full)
+        x_cu = CUDA.CuArray(Vector{Float64}(x_bm))
+        y_cu = CUDA.CuArray(zeros(Float64, n_con))
+        mul!(y_cu, A_cu, x_cu); CUDA.synchronize()
+        @belapsed(begin mul!($y_cu, $A_cu, $x_cu); CUDA.synchronize() end,
+                  samples=n_s2, evals=1) * 1e6
+    else
+        NaN
+    end
+
+    # §2: CPU CSC reference
+    A_cpu = vcat(
+        hcat(Cg,                        spzeros(n_bus, n_line), -Bbus),
+        hcat(spzeros(n_line, n_gen),    negI,                    Bf))
+    x_cpu = randn(n_var)
+    y_cpu = zeros(n_con)
+    mul!(y_cpu, A_cpu, x_cpu)
+    t_cpu_s2 = @belapsed(mul!($y_cpu, $A_cpu, $x_cpu), samples=n_s2, evals=1) * 1e6
+
+    # §3: BlockBandedMatrix
+    R_cpu  = sparse(1:n_gen, 1:n_gen, ones(n_gen), n_gen, n_var)
+    u_posR = csr_tensor(R_cpu;  device=to_device)
+    u_negR = csr_tensor(-R_cpu; device=to_device)
+
+    n_rmp    = n_gen
+    n_row_ms = T*n_con + (T-1)*n_rmp
+    n_col_ms = T*n_var
+    BM_ms    = BlockBandedMatrix(BM, u_negR, u_posR, T, n_con, n_rmp, n_var)
+
+    x_ms = to_device(randn(n_col_ms))
+    y_ms = similar(x_ms, n_row_ms)
+
+    mul!(y_ms, BM_ms, x_ms)
+    for _ in 1:3; mul!(y_ms, BM_ms, x_ms); sync(); end
+    t_jlust_s3 = @belapsed(begin mul!($y_ms, $BM_ms, $x_ms); $sync() end,
+                            samples=n_s3, evals=1) * 1e6
+
+    # §3: CUDA Graph
+    t_graph_s3 = if HAS_CUDA
+        g = CUDA.capture() do; mul!(y_ms, BM_ms, x_ms); end
+        e = CUDA.instantiate(g)
+        CUDA.launch(e); CUDA.synchronize()
+        @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
+                  samples=n_s3, evals=1) * 1e6
+    else
+        NaN
+    end
+
+    # §3: serial cuSPARSE reference
+    t_cusparse_s3 = if HAS_CUDA
+        A_cu2 = CUDA.CUSPARSE.CuSparseMatrixCSR(A_cpu)
+        xp_cu = CUDA.CuArray(randn(n_var))
+        yp_cu = CUDA.CuArray(zeros(n_con))
+        @belapsed(begin
+            for _ in 1:$T; mul!($yp_cu, $A_cu2, $xp_cu); end
+            CUDA.synchronize()
+        end, samples=10, evals=1) * 1e6
+    else
+        NaN
+    end
+
+    # §3: serial CPU reference
+    xp_cpu = randn(n_var)
+    yp_cpu = zeros(n_con)
+    t_cpu_s3 = @belapsed(begin
+        for _ in 1:$T; mul!($yp_cpu, $A_cpu, $xp_cpu); end
+    end, samples=5, evals=1) * 1e6
+
+    # correctness check: JLUST §2 output vs sparse CPU reference
+    ok = let x_ref = Vector{Float64}(x_bm),
+             y_ref  = Vector{Float64}(A_cpu * x_ref),
+             y_got  = Vector{Float64}(y_bm)
+        norm(y_got .- y_ref) / (norm(y_ref) + 1e-30) < 1e-6
+    end
+
+    (; n_bus, n_line, n_gen,
+       t_cpu_s2, t_cusparse_s2, t_jlust_s2, t_graph_s2,
+       t_cpu_s3, t_cusparse_s3, t_jlust_s3, t_graph_s3,
+       ok)
+end
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+const CASES = [
+    "pglib_opf_case1354_pegase",
+    "pglib_opf_case2869_pegase",
+    "pglib_opf_case6470_rte",
+    "pglib_opf_case9241_pegase",
+    "pglib_opf_case13659_pegase",
+    "pglib_opf_case30000_goc",
+]
+
+const _backend = HAS_CUDA  ? "CUDA ($(CUDA.name(CUDA.device())))" :
+                 HAS_METAL ? "Metal ($(Metal.current_device().name))" :
+                 "CPU"
+
+println("="^80)
+println("JLUST multi-case sweep   (T=24, $(FloatType), $_backend)")
+println("="^80)
+println()
+
+results = Pair{String,Any}[]
+for case in CASES
+    short = replace(case, "pglib_opf_case" => "")
+    print("  $short ... ")
+    flush(stdout)
+    r = bench_case(case)
+    push!(results, case => r)
+    println("$(r.n_bus) buses  ok=$(r.ok)")
+end
+
+# ── §2 table ─────────────────────────────────────────────────────────────────
+
+println()
+println("─"^80)
+println("§2  Single DCOPF  mul!(y, BM, x)  —  time (μs), lower is better")
+println("─"^80)
+@printf("  %-18s  %6s %6s %6s  │  %8s  %8s  %8s  %8s  │  %s\n",
+        "Case", "buses", "lines", "gens",
+        "CPU-CSC", "cuSPARSE", "JLUST", "Graph", "Graph/cuSPARSE")
+println("  " * "─"^78)
+for (case, r) in results
+    short = replace(case, "pglib_opf_case" => "")
+    speedup = isnan(r.t_cusparse_s2) ? "—" :
+              @sprintf("%.2f×", r.t_cusparse_s2 / r.t_graph_s2)
+    @printf("  %-18s  %6d %6d %6d  │  %8.1f  %8.1f  %8.1f  %8.1f  │  %s\n",
+            short, r.n_bus, r.n_line, r.n_gen,
+            r.t_cpu_s2, r.t_cusparse_s2, r.t_jlust_s2, r.t_graph_s2, speedup)
+end
+println("  " * "─"^78)
+
+# ── §3 table ─────────────────────────────────────────────────────────────────
+
+println()
+println("─"^80)
+println("§3  Multi-stage T=24  —  per-period time (μs), lower is better")
+println("─"^80)
+@printf("  %-18s  %6s %6s %6s  │  %8s  %8s  %8s  %8s  │  %s\n",
+        "Case", "buses", "lines", "gens",
+        "CPU/T", "cuSP/T", "JLUST/T", "Graph/T", "Graph/cuSP")
+println("  " * "─"^78)
+for (case, r) in results
+    short = replace(case, "pglib_opf_case" => "")
+    speedup = isnan(r.t_cusparse_s3) ? "—" :
+              @sprintf("%.2f×", r.t_cusparse_s3 / r.t_graph_s3)
+    @printf("  %-18s  %6d %6d %6d  │  %8.1f  %8.2f  %8.2f  %8.2f  │  %s\n",
+            short, r.n_bus, r.n_line, r.n_gen,
+            r.t_cpu_s3/24, r.t_cusparse_s3/24, r.t_jlust_s3/24, r.t_graph_s3/24, speedup)
+end
+println("  " * "─"^78)
+
+println()
+println("Correctness (JLUST vs cuSPARSE, rel. err < 1e-6):")
+for (case, r) in results
+    short = replace(case, "pglib_opf_case" => "")
+    println("  $(short): $(r.ok ? "✓" : "✗ FAILED")")
+end

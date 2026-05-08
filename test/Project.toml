@@ -1,8 +1,9 @@
 [deps]
-Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 JLUST = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 JLUST = {path = ".."}

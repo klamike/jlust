@@ -1,0 +1,122 @@
+========================================================================
+JLUST DCOPF Feature Tour
+Backend : CUDA (NVIDIA L40S)
+Julia   : 1.12.6
+========================================================================
+
+────────────────────────────────────────────────────────────────────────
+Section 1 — Constructors
+────────────────────────────────────────────────────────────────────────
+  pglib_opf_case30000_goc: 30000 buses  35393 lines  3526 gens  (demo)
+  pglib_opf_case30000_goc: 30000 buses  35393 lines  3526 gens  (benchmark)
+
+  csr_tensor  (Cg)   : ✓  (3526 nnz, 30000×3526)
+  dcsr_tensor (Cg)   : ✓  2278 active rows / 30000 total (7.6% non-empty — generator buses only)
+
+────────────────────────────────────────────────────────────────────────
+Section 2 — BlockSparseMatrix: DCOPF constraint matrix
+────────────────────────────────────────────────────────────────────────
+  BlockSparseMatrix shape : 65393 × 68919
+    block rows  : 30000 (balance) + 35393 (flow)
+    block cols  : 3526 (p_gen) + 35393 (p_f) + 30000 (va)
+  mul!(y, BM, x)          :     36.7 μs  (4 block SpMVs)
+
+  Method (full DCOPF operator)           Time (μs)
+  ────────────────────────────────────────────────
+  Julia SparseMatrixCSC                      331.2
+  CUDA cuSPARSE (monolithic)                  24.1
+  JLUST BlockSparseMatrix                     36.7  (0.66× vs cuSPARSE)
+  JLUST BlockSparseMatrix (Graph)             16.8  (0.70× faster than cuSPARSE)
+  N-1 contingency (line trip)                 22.2  (1 swap + graph replay)
+  ────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────
+Section 3 — Multi-stage OPF with ramping (BlockBandedMatrix)
+────────────────────────────────────────────────────────────────────────
+  Ramp R   : 3526 × 68919, 3526 nnz
+  Full M   : 1650530 × 1654056  (T=24, 3 unique objects)
+
+  Method (T=24)                           Total (μs)    Per period
+  ────────────────────────────────────────────────────────────────
+  SparseMatrixCSC (CPU serial)                8799.8         366.7
+  cuSPARSE (GPU serial)                        348.8          14.5
+  JLUST BlockBandedMatrix                      176.3           7.3  (1.98× vs cuSPARSE)
+  JLUST SpMM + CUDA Graph (11 kernels)         150.2           6.3  (2.32× vs cuSPARSE)
+  ────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────
+Section 4 — DiagonalLevel (n×n diagonal matrix)
+────────────────────────────────────────────────────────────────────────
+  Format : [row, col] -> (row: DenseLevel, col: DiagonalLevel)
+  Hook   : level_step only  (GPU + CPU paths auto-generated)
+  Residual vs CSR I_line : 0.00e+00  ✓
+
+  Kernel                          Time(μs)    vs CSR
+  ──────────────────────────────────────────────────
+  CSR I_line                          12.5  baseline
+  DiagonalLevel                       16.4      0.76×
+
+  Struct read per SpMV (excl. x/y) at n_line=35393:
+    CSR          :  553 KB
+    DiagonalLevel:  277 KB  (2.0× less)
+
+  BM mul! CSR identity    :     36.7 μs
+  BM mul! DiagLevel ident :     43.6 μs  (0.84×)
+
+  Full plugin: struct + level_step + constructor.  ~5 lines of user code.
+
+  Note: on GPU, DiagonalLevel loses to CSR because CSR triggers the
+  warp-shuffle vector kernel (VS=2, 1 NNZ/row).  At n >> L2 capacity
+  the 2× bandwidth reduction wins; on CPU it wins at all tested sizes.
+
+========================================================================
+Performance Summary  (35393 lines × 30000 buses, Float64)
+========================================================================
+  Operation                                      Time (μs)
+  ────────────────────────────────────────────────────────
+  DCOPF mul! JLUST BlockSparseMatrix                  36.7
+    with DiagonalLevel -I block                       43.6
+    with CUDA Graph                                   16.8
+    N-1 contingency (swap + Graph replay)             22.2
+    Julia SparseMatrixCSC (reference)                331.2
+    CUDA cuSPARSE monolithic (reference)              24.1
+  ────────────────────────────────────────────────────────
+  Multi-stage T=24                                   176.3
+    with CUDA Graph (11 kernels)                     150.2
+    per period                                         7.3 μs
+  ────────────────────────────────────────────────────────
+  DiagonalLevel I_line SpMV (§4)                      16.4
+
+────────────────────────────────────────────────────────────────────────
+Future improvements (in priority order)
+────────────────────────────────────────────────────────────────────────
+  1. DCSR Cg for generator contingency
+       When a generator trips, its column in Cg goes to zero.  Tracking
+       active generators with DCSR lets EmitterBackend skip zero rows natively.
+       update_block_values! should accept a format change (DCSR re-slice)
+       rather than requiring the same USTensor structure.
+
+  2. Complex USTensor for AC OPF
+       Complex{Float64} element type with appropriate SpMV semantics.  The
+       emitter body needs a `conj` leaf for the Hermitian case.
+
+
+────────────────────────────────────────────────────────────────────────
+Visual summary (live numbers from this run)
+────────────────────────────────────────────────────────────────────────
+
+                                §2  DCOPF mul!  (μs, lower is better)   
+                             ┌                                        ┐ 
+   SparseMatrixCSC (CPU ref) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 331.2   
+         cuSPARSE (1 kernel) ┤■■ 24.1                                   
+        JLUST BM (4 kernels) ┤■■■■ 36.7                                 
+       JLUST BM (CUDA Graph) ┤■■ 16.8                                   
+                             └                                        ┘ 
+                                                 μs                     
+                            §3  multi-stage cost per period  (μs, lower is better) 
+                            ┌                                        ┐ 
+    single DCOPF (no Graph) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 36.67   
+           T=24  per-period ┤■■■■■■■ 7.35                              
+   T=24  CUDA Graph /period ┤■■■■■■ 6.26                               
+                            └                                        ┘ 
+                                                μs                     

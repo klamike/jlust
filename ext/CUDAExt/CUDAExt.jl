@@ -12,7 +12,8 @@ import JLUST:
     SpMVOp, SpMMOp, SpGEMMOp, SpSVOp, SpSMOp,
     sparse_mv!, sparse_mm!, sparse_gemm!, sparse_sv!, sparse_sm!, sparse_sddmm!,
     sparse_to_dense, dense_to_sparse,
-    prepare, update_values!
+    prepare, update_values!,
+    CUSPARSEBackend, EmitterBackend
 
 import CUDA.CUSPARSE:
     CuSparseMatrixDescriptor, CuDenseVectorDescriptor, CuDenseMatrixDescriptor,
@@ -157,7 +158,7 @@ _adaptor(::CUDADevice) = CuArray
 
 # ─── Backend capability ───────────────────────────────────────────────────────
 
-struct CUSPARSEBackend <: AbstractUSTBackend end
+# CUSPARSEBackend is defined in JLUST core (src/backends.jl); imported above.
 
 # Generic-API formats (cusparseSpMV / cusparseSpMM / cusparseSpSV / cusparseSpSM).
 const _CUSPARSE_GENERIC_FORMATS = Set([Formats.CSR, Formats.CSC, Formats.COO])
@@ -266,8 +267,6 @@ function JLUST.validate_storage(u::USTensor, backend::CUSPARSEBackend; op = :unk
     # are added in Phase 4 alongside _prepare.
     return nothing
 end
-
-export CUSPARSEBackend
 
 # ─── cuSPARSE execution paths ─────────────────────────────────────────────────
 

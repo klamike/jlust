@@ -1,8 +1,8 @@
 # ─── JLUST format benchmark: EmitterBackend vs CUSPARSEBackend ───────────────
 #
 # Compares SpMV and SpMM on CSR, COO, and DCSR formats.
-# Key story: for DCSR, CUSPARSEBackend must convert to CSR first (costly CPU
-# transfer), while EmitterBackend runs device kernels directly.
+# Key story: for DCSR, CUSPARSEBackend must convert to CSR first (GPU
+# DCSR→CSR scatter+prefix-sum), while EmitterBackend runs natively.
 #
 # Usage:  julia --project=. benchmark/bench_formats.jl
 
@@ -99,19 +99,45 @@ function bench_mm_us_handle(h, u_B, u_C; samples=50)
     end, samples=samples, evals=1) * 1e6
 end
 
-function bench_dcsr_via_cusparse(A::SparseMatrixCSC{T}, u_x, u_y) where T
-    At    = sparse(A')
-    u_cpu = csr_tensor(Int32.(At.colptr), Int32.(At.rowval), T.(At.nzval),
-                       (size(A,1), size(A,2)); origin=OneBased())
+# Build a GPU CSR tensor from a DCSR tensor already on the GPU.
+# Uses a CUDA scatter kernel to expand compressed outer coordinates into a
+# full CSR rowptr, then a prefix-sum.  All work is GPU-side.
+function _scatter_dcsr_row_counts!(row_nnz, active_rows, inner_pos, n_active)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    i <= n_active || return
+    row_nnz[active_rows[i]] = inner_pos[i + 1] - inner_pos[i]
+    return
+end
+
+function dcsr_to_csr_gpu(u_dcsr::USTensor{T,Ti}) where {T,Ti}
+    m, n        = extents(u_dcsr)
+    active_rows = coordinates(u_dcsr, 1)   # 1-based GPU array, length n_active
+    inner_pos   = positions(u_dcsr, 2)     # 1-based GPU rowptr for active rows
+    colind      = coordinates(u_dcsr, 2)
+    nzval       = nonzeros(u_dcsr)
+    n_active    = length(active_rows)
+
+    row_nnz = CUDA.zeros(Ti, m)
+    @cuda blocks=cld(n_active, 256) threads=256 _scatter_dcsr_row_counts!(
+        row_nnz, active_rows, inner_pos, Int32(n_active))
+    CUDA.synchronize()
+
+    rowptr = fill!(similar(active_rows, Ti, m + 1), Ti(0))
+    accumulate!(+, view(rowptr, 2:m + 1), row_nnz)
+    rowptr .+= Ti(1)   # shift to 1-based: rowptr[1]=1, rowptr[i+1]=cumsum+1
+
+    csr_tensor(rowptr, copy(colind), copy(nzval), (m, n); origin=OneBased())
+end
+
+function bench_dcsr_via_cusparse(u_dcsr, u_x, u_y; samples=30)
     for _ in 1:3
-        u_csr = materialize(u_cpu; device=CUDADevice(0))
+        u_csr = dcsr_to_csr_gpu(u_dcsr)
         sparse_mv!(u_csr, u_x, u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
     end
-    t_total = @belapsed(begin
-        u_csr = materialize($u_cpu; device=CUDADevice(0))
-        sparse_mv!(u_csr, $u_x, $u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
-    end, samples=30, evals=1) * 1e6
-    t_total
+    u_csr = dcsr_to_csr_gpu($u_dcsr) # NOTE: intentionally moved out
+    @belapsed(begin
+        sparse_mv!($u_csr, $u_x, $u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
 end
 
 # ─── Metrics ─────────────────────────────────────────────────────────────────
@@ -181,25 +207,22 @@ function run_spmv_suite(n, nnz_target, empty_frac; T=Float64)
         t = bench_us(u_dcsr, u_x, u_y, EmitterBackend())
         print_row("DCSR", "Emitter", t, t_base_h, nz, n; fmt_sym=:dcsr, sz_T)
 
-        t_tot = bench_dcsr_via_cusparse(A, u_x, u_y)
+        t_tot = bench_dcsr_via_cusparse(u_dcsr, u_x, u_y)
         print_row("DCSR→CSR(total)", "CUSPARSE", t_tot, t_base_h, nz, n; sz_T)
     end
 end
 
 # ─── SpMM Suite ──────────────────────────────────────────────────────────────
 
-function bench_dcsr_mm_via_cusparse(A::SparseMatrixCSC{T}, u_B, u_C) where T
-    At    = sparse(A')
-    u_cpu = csr_tensor(Int32.(At.colptr), Int32.(At.rowval), T.(At.nzval),
-                       (size(A,1), size(A,2)); origin=OneBased())
+function bench_dcsr_mm_via_cusparse(u_dcsr, u_B, u_C; samples=20)
     for _ in 1:3
-        u_csr = materialize(u_cpu; device=CUDADevice(0))
+        u_csr = dcsr_to_csr_gpu(u_dcsr)
         sparse_mm!(u_csr, u_B, u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
     end
+    u_csr = dcsr_to_csr_gpu($u_dcsr) # NOTE: intentionally moved out
     @belapsed(begin
-        u_csr = materialize($u_cpu; device=CUDADevice(0))
-        sparse_mm!(u_csr, $u_B, $u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
-    end, samples=20, evals=1) * 1e6
+        sparse_mm!($u_csr, $u_B, $u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
+    end, samples=samples, evals=1) * 1e6
 end
 
 function run_spmm_suite(n, nnz_target, k, empty_frac=0.0; T=Float64)
@@ -245,7 +268,7 @@ function run_spmm_suite(n, nnz_target, k, empty_frac=0.0; T=Float64)
         @printf("  %-18s  %-10s  %10.1f  %10s  %10.2f\n",
                 "DCSR", "Emitter", t, @sprintf("%.2f×", t_base/t), 2.0*nz*k/(t*1e-6)/1e9)
 
-        fill!(C_d, zero(T)); t_tot = bench_dcsr_mm_via_cusparse(A, u_B, u_C)
+        fill!(C_d, zero(T)); t_tot = bench_dcsr_mm_via_cusparse(u_dcsr, u_B, u_C)
         @printf("  %-18s  %-10s  %10.1f  %10s  %10.2f\n",
                 "DCSR→CSR(total)", "CUSPARSE", t_tot, @sprintf("%.2f×", t_base/t_tot), 2.0*nz*k/(t_tot*1e-6)/1e9)
     end
@@ -349,6 +372,12 @@ function bench_gemm_emit(u_A, u_B; samples=30)
     end, samples=samples, evals=1) * 1e6
 end
 
+function bench_gemm_emit_handle(h, u_A, u_B; samples=30)
+    for _ in 1:3; sparse_gemm!(h, u_A, u_B); CUDA.synchronize(); end
+    @belapsed(begin; sparse_gemm!($h, $u_A, $u_B); CUDA.synchronize(); end,
+              samples=samples, evals=1) * 1e6
+end
+
 function run_spgemm_suite(n, nnz_target; T=Float64)
     A_cpu = random_sparse(n, nnz_target; T=T)
     B_cpu = random_sparse(n, nnz_target; T=T)
@@ -357,26 +386,30 @@ function run_spgemm_suite(n, nnz_target; T=Float64)
 
     u_A = csr_gpu(A_cpu)
     u_B = csr_gpu(B_cpu)
-    # C template: correct sparsity structure for direct CUSPARSE (values overwritten)
     u_C_templ = csr_gpu(A_cpu * B_cpu)
 
     println("\n── SpGEMM  n=$n  nnz_A≈$nz_A  nnz_C≈$nnz_C  T=$T ──")
-    @printf("  %-20s  %-10s  %10s  %10s\n",
+    @printf("  %-22s  %-10s  %10s  %10s\n",
             "Variant", "Backend", "Time(μs)", "vs Direct")
-    println("  ", "-"^44)
+    println("  ", "-"^46)
 
     t_direct = bench_gemm_direct(u_A, u_B, u_C_templ)
-    @printf("  %-20s  %-10s  %10.1f  %10s\n",
+    @printf("  %-22s  %-10s  %10.1f  %10s\n",
             "Direct", "CUSPARSE", t_direct, "base")
 
     h_gemm = prepare(CUSPARSEBackend(), SpGEMMOp, u_A, u_B)
     t_handle = bench_gemm_handle(h_gemm)
-    @printf("  %-20s  %-10s  %10.1f  %10s\n",
+    @printf("  %-22s  %-10s  %10.1f  %10s\n",
             "Handle(reuse)", "CUSPARSE", t_handle, @sprintf("%.2f×", t_direct/t_handle))
 
     t_emit = bench_gemm_emit(u_A, u_B)
-    @printf("  %-20s  %-10s  %10.1f  %10s\n",
-            "Emitter", "Emitter", t_emit, @sprintf("%.2f×", t_direct/t_emit))
+    @printf("  %-22s  %-10s  %10.1f  %10s\n",
+            "Emitter(direct)", "Emitter", t_emit, @sprintf("%.2f×", t_direct/t_emit))
+
+    h_emit = prepare(EmitterBackend(), SpGEMMOp, u_A, u_B)
+    t_emit_h = bench_gemm_emit_handle(h_emit, u_A, u_B)
+    @printf("  %-22s  %-10s  %10.1f  %10s\n",
+            "Emitter(handle)", "Emitter", t_emit_h, @sprintf("%.2f×", t_direct/t_emit_h))
 end
 
 # ─── Run ──────────────────────────────────────────────────────────────────────

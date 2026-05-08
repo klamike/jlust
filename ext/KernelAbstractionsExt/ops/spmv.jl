@@ -1,18 +1,49 @@
 # ─── Emitter: arg name/value collection ───────────────────────────────────────
+#
+# These three functions are the extension points for custom AbstractLevelFormat
+# subtypes.  Add methods in user code (or JLUST extensions) to plug a new level
+# type into the emitter without touching _sparse_arg_names / _sparse_args.
+#
+#   _level_arg_names(lv, pc, cc) → Vector{Symbol}
+#       Returns the @kernel arg names contributed by level `lv`.
+#       pc/cc are Ref counters for pos/crd naming (increment as needed).
+#
+#   _level_has_nzval(lv) → Bool
+#       Return false if the level encodes values implicitly (e.g. IncidenceLevel
+#       where values are always ±1).  If ANY level returns false, :_nzval is
+#       omitted from the @kernel signature.
+#
+#   _level_args(lv, u, lvl_idx, dummy_pos) → Vector{AbstractArray}
+#       Returns the actual array arguments for level `lv` in USTensor `u`.
+#       Must be consistent with the names returned by _level_arg_names.
+
+# AbstractLevelFormat fallbacks delegate to the public JLUST extension hooks so
+# that user-defined level types only need to extend JLUST.level_* functions.
+_level_arg_names(lv::AbstractLevelFormat,             pc::Ref, cc::Ref) = JLUST.level_arg_names(lv, pc, cc)
+_level_arg_names(::Union{CompressedLevel,DeltaLevel}, pc::Ref, cc::Ref) =
+    [Symbol(:_pos, pc[] += 1), Symbol(:_crd, cc[] += 1)]
+_level_arg_names(::SingletonLevel,                    pc::Ref, cc::Ref) =
+    [Symbol(:_crd, cc[] += 1)]
+
+_level_has_nzval(lv::AbstractLevelFormat) = JLUST.level_has_nzval(lv)
+_level_has_nzval(::Union{DenseLevel,BatchLevel,CompressedLevel,SingletonLevel,DeltaLevel,RangeLevel}) = true
+
+_level_args(lv::AbstractLevelFormat, u::USTensor, lvl::Int, dummy_pos) = JLUST.level_args(lv, u, lvl, dummy_pos)
+function _level_args(lv::Union{CompressedLevel,DeltaLevel}, u::USTensor, lvl::Int, dummy_pos)
+    pos = has_positions(u, lvl) ? positions(u, lvl) : dummy_pos
+    AbstractArray[pos, coordinates(u, lvl)]
+end
+_level_args(::SingletonLevel, u::USTensor, lvl::Int, dummy_pos) =
+    AbstractArray[coordinates(u, lvl)]
 
 # Symbolic arg names matching the order the emitter expects for the sparse A.
 function _sparse_arg_names(fmt::TensorFormat)
     names = Symbol[]
     pc = Ref(0); cc = Ref(0)
     for (_, lv) in fmt.levels
-        if lv isa Union{CompressedLevel,DeltaLevel}
-            push!(names, Symbol(:_pos, pc[] += 1))
-            push!(names, Symbol(:_crd, cc[] += 1))
-        elseif lv isa SingletonLevel
-            push!(names, Symbol(:_crd, cc[] += 1))
-        end
+        append!(names, _level_arg_names(lv, pc, cc))
     end
-    push!(names, :_nzval)
+    all(_level_has_nzval(p.second) for p in fmt.levels) && push!(names, :_nzval)
     names
 end
 
@@ -23,14 +54,9 @@ function _sparse_args(u::USTensor{T,I,N,VA,VI,O}) where {T,I,N,VA,VI,O}
     dummy_pos = VI(undef, 0)
     args = AbstractArray[]
     for (lvl, (_, lv)) in enumerate(u.format.levels)
-        if lv isa Union{CompressedLevel,DeltaLevel}
-            pos = has_positions(u, lvl) ? positions(u, lvl) : dummy_pos
-            push!(args, pos, coordinates(u, lvl))
-        elseif lv isa SingletonLevel
-            push!(args, coordinates(u, lvl))
-        end
+        append!(args, _level_args(lv, u, lvl, dummy_pos))
     end
-    push!(args, nonzeros(u))
+    all(_level_has_nzval(p.second) for p in u.format.levels) && push!(args, nonzeros(u))
     args
 end
 
@@ -52,46 +78,71 @@ end
 # Two passes of counters (pc, cc) track pos/crd buffer names to match
 # _sparse_arg_names ordering exactly.
 #
-# p_var:      Symbol name of the current 1-based fiber position variable,
-#             or nothing for the outermost level (becomes thread index).
-# needs_atomic: true when y writes must use @atomic (e.g. COO-like patterns).
+# p_var:         Symbol name of the current 1-based fiber position variable,
+#                or nothing for the outermost level (becomes thread index).
+# needs_atomic:  true when y writes must use @atomic (e.g. COO-like patterns).
+# input_fn_sym:  Symbol for the per-element input transform (default :_input_fn).
+#                Applied as _input_fn(_x[_x_idx]) at each leaf.
+# output_fn_sym: Symbol for the post-accumulation output transform (default :_output_fn).
+#                Applied as _output_fn(_acc) at each row write.
+#
+# Julia specializes kernels on the concrete types of _input_fn/_output_fn, so
+# passing `identity` compiles to zero overhead.
 
-function _emit_spmv_body(fmt::TensorFormat, ::Type{T}) where T
+function _emit_spmv_body(fmt::TensorFormat, ::Type{T};
+                          input_fn_sym::Symbol=:_input_fn,
+                          output_fn_sym::Symbol=:_output_fn) where T
     pc = Ref(0); cc = Ref(0)
     _, lv1 = fmt.levels[1]
     na = lv1 isa CompressedLevel && !is_unique(lv1)   # COO-like → atomic
-    _emit_spmv_level(fmt.levels, 1, nothing, pc, cc, T, na)
+    _emit_spmv_level(fmt.levels, 1, nothing, pc, cc, T, na, input_fn_sym, output_fn_sym)
 end
 
-function _emit_spmv_level(levels, lvl, p_var, pc, cc, T, needs_atomic) # TODO: separate atomic vs non-atomic?
+function _emit_spmv_level(levels, lvl, p_var, pc, cc, T, needs_atomic,
+                           input_fn_sym, output_fn_sym)
     if lvl > length(levels)
-        # Leaf: accumulate or atomic-write.
+        # Leaf: accumulate or atomic-write, applying input_fn to each x element.
         return needs_atomic ?
-            :(KernelAbstractions.@atomic _y[_y_idx] += _nzval[_nnz_pos] * _x[_x_idx]) :
-            :(_acc += _nzval[_nnz_pos] * _x[_x_idx])
+            :(KernelAbstractions.@atomic _y[_y_idx] += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx])) :
+            :(_acc += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx]))
     end
     _, lv = levels[lvl]
-    _emit_spmv_lv(lv, levels, lvl, p_var, pc, cc, T, needs_atomic)
+    _emit_spmv_lv(lv, levels, lvl, p_var, pc, cc, T, needs_atomic, input_fn_sym, output_fn_sym)
+end
+
+# AbstractLevelFormat (custom user types) → delegate to public JLUST.emit_spmv_lv.
+# Inner position: forward (lv, p_var, input_fn_sym) — the minimal signature users implement.
+# Outermost (::Nothing): custom levels must be inner levels paired with a DenseLevel outer.
+function _emit_spmv_lv(lv::AbstractLevelFormat, _levels, _lvl, p_var::Symbol,
+                        _pc, _cc, _T, _na, input_fn_sym, _output_fn_sym)
+    JLUST.emit_spmv_lv(lv, p_var, input_fn_sym)
+end
+
+function _emit_spmv_lv(lv::AbstractLevelFormat, _levels, _lvl, ::Nothing,
+                        _pc, _cc, _T, _na, _input_fn_sym, _output_fn_sym)
+    error("emit_spmv_lv: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
 end
 
 # DenseLevel / BatchLevel (outermost) → thread = dense row index
-function _emit_spmv_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc, T, _)
-    inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, false)
+function _emit_spmv_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc, T, _,
+                        input_fn_sym, output_fn_sym)
+    inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, false, input_fn_sym, output_fn_sym)
     quote
         _tid = @index(Global, Linear)
         if _tid <= _n_outer
             _acc  = $(zero(T))
             $inner
-            _y[_tid] = _acc
+            _y[_tid] = _alpha * $output_fn_sym(_acc) + _beta * _y[_tid]
         end
     end
 end
 
 # DenseLevel / BatchLevel (non-outermost) → dense loop (uncommon for SpMV)
-function _emit_spmv_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc, T, na)
+function _emit_spmv_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc, T, na,
+                        input_fn_sym, output_fn_sym)
     sz  = Symbol(:_sz, lvl)
     lv2 = Symbol(:_i, lvl)
-    inner = _emit_spmv_level(levels, lvl + 1, lv2, pc, cc, T, na)
+    inner = _emit_spmv_level(levels, lvl + 1, lv2, pc, cc, T, na, input_fn_sym, output_fn_sym)
     quote
         for $lv2 in 1:$sz
             $inner
@@ -102,24 +153,25 @@ end
 # CompressedLevel (outermost)
 #   unique   → fiber-parallel (DCSR-like): one thread per non-empty row, no atomics
 #   non-unique → NNZ-parallel (COO-like): one thread per NNZ, atomic y update
-function _emit_spmv_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T, _)
+function _emit_spmv_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T, _,
+                        input_fn_sym, output_fn_sym)
     pc[] += 1; ci = cc[] += 1
     cs = Symbol(:_crd, ci)
     if is_unique(lv)
-        inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, false)
+        inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, false, input_fn_sym, output_fn_sym)
         quote
             _tid = @index(Global, Linear)
             if _tid <= _n_outer
                 _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1   # 1-based row
                 _acc   = $(zero(T))
                 $inner
-                _y[_y_idx] = _acc
+                _y[_y_idx] = _alpha * $output_fn_sym(_acc) + _beta * _y[_y_idx]
             end
         end
     else
         # Non-unique: thread = NNZ index within the single outer fiber.
         # Row index comes directly from crd (not from a fiber pos lookup).
-        inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, true)
+        inner = _emit_spmv_level(levels, lvl + 1, :_tid, pc, cc, T, true, input_fn_sym, output_fn_sym)
         quote
             _tid = @index(Global, Linear)
             if _tid <= _n_outer
@@ -131,11 +183,12 @@ function _emit_spmv_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T, _
 end
 
 # CompressedLevel (non-outermost) → inner fiber loop; crd stores x dimension index
-function _emit_spmv_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
+function _emit_spmv_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T, na,
+                        input_fn_sym, output_fn_sym)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar = Symbol(:_i, lvl)
-    inner = _emit_spmv_level(levels, lvl + 1, lvar, pc, cc, T, na)
+    inner = _emit_spmv_level(levels, lvl + 1, lvar, pc, cc, T, na, input_fn_sym, output_fn_sym)
     quote
         _lo = Int($ps[$p_var])     - Int(_origin_off)
         _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
@@ -148,10 +201,11 @@ function _emit_spmv_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T,
 end
 
 # SingletonLevel → one coordinate per position (COO column index)
-function _emit_spmv_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
+function _emit_spmv_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, na,
+                        input_fn_sym, output_fn_sym)
     ci = cc[] += 1
     cs = Symbol(:_crd, ci)
-    inner = _emit_spmv_level(levels, lvl + 1, p_var, pc, cc, T, na)
+    inner = _emit_spmv_level(levels, lvl + 1, p_var, pc, cc, T, na, input_fn_sym, output_fn_sym)
     quote
         _x_idx   = Int($cs[$p_var]) - Int(_origin_off) + 1
         _nnz_pos = $p_var
@@ -160,12 +214,13 @@ function _emit_spmv_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, 
 end
 
 # DeltaLevel (non-outermost) → accumulated delta decode + inner loop
-function _emit_spmv_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
+function _emit_spmv_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na,
+                        input_fn_sym, output_fn_sym)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar   = Symbol(:_i, lvl)
     corig  = Symbol(:_corig, lvl)
-    inner  = _emit_spmv_level(levels, lvl + 1, lvar, pc, cc, T, na)
+    inner  = _emit_spmv_level(levels, lvl + 1, lvar, pc, cc, T, na, input_fn_sym, output_fn_sym)
     quote
         _lo = Int($ps[$p_var])     - Int(_origin_off)
         _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
@@ -182,7 +237,8 @@ end
 
 # RangeLevel: paired add/sub dimension reconstruction (DIA-like)
 # Deferred to Phase 5 — throws a clear error for now.
-function _emit_spmv_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na)
+function _emit_spmv_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na,
+                        input_fn_sym, output_fn_sym)
     error("EmitterBackend SpMV: RangeLevel (DIA-style) kernels not yet emitted. " *
           "Use convert_format to CSR or DCSR first.")
 end
@@ -230,12 +286,14 @@ end
 const _emitter_cache = Dict{Any, Any}()
 
 function _get_spmv_kernel(fmt::TensorFormat, ::Type{T}) where T
+    # Julia JIT-specializes on the concrete (input_fn, output_fn) types at call
+    # time — no need for separate @kernel functions per transform pair.
     key = (fmt, T, :spmv)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
     body      = _emit_spmv_body(fmt, T)
     buf_names = _sparse_arg_names(fmt)
-    arg_names = vcat(buf_names, [:_x, :_y, :_origin_off, :_n_outer])
+    arg_names = vcat(buf_names, [:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta])
     fname     = gensym(:ust_spmv)
 
     kern = @eval begin
@@ -252,21 +310,23 @@ end
 # ─── sparse_mv! ───────────────────────────────────────────────────────────────
 
 function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                          alpha=one(eltype(u_A)), beta=zero(eltype(u_A)))
-    beta  == 0 || error("EmitterBackend sparse_mv!: beta ≠ 0 not yet supported")
-    alpha == 1 || error("EmitterBackend sparse_mv!: alpha ≠ 1 not yet supported")
+                          alpha=one(eltype(u_A)), beta=zero(eltype(u_A)),
+                          input_fn::IF=identity, output_fn::OF=identity) where {IF, OF}
+    fmt          = format(u_A)
+    T            = eltype(u_A)
+    T_alpha      = T(alpha)
+    T_beta       = T(beta)
+    ka           = KernelAbstractions.get_backend(nonzeros(u_A))
+    off          = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
 
-    fmt     = format(u_A)
-    T       = eltype(u_A)
-    ka      = KernelAbstractions.get_backend(nonzeros(u_A))
-    off     = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
+    _, lv1       = fmt.levels[1]
+    is_coo_like  = lv1 isa CompressedLevel && !is_unique(lv1)
+    use_identity = IF === typeof(identity) && OF === typeof(identity)
 
-    # Dispatch: COO-like (sorted, non-unique outer) → chunked kernel to reduce
-    # atomic contention.  All other formats → general recursive emitter.
-    _, lv1 = fmt.levels[1]
-    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1)
-
-    if is_coo_like
+    # COO specialized path: only when alpha=1, beta=0 (atomic += accumulates directly;
+    # scaling y would need a separate kernel, so defer to error for now).
+    if is_coo_like && use_identity && iszero(T_beta)
+        isone(T_alpha) || error("EmitterBackend sparse_mv!: alpha ≠ 1 not yet supported for COO format")
         fill!(nonzeros(u_y), zero(T))
         row_crd = coordinates(u_A, 1)
         col_crd = coordinates(u_A, 2)
@@ -281,28 +341,91 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
                 ndrange=Int(n_chunks))
         end
     else
+        is_coo_like && !iszero(T_beta) &&
+            error("EmitterBackend sparse_mv!: beta ≠ 0 not supported for COO format")
+
         n_outer     = Int32(_spmv_ndrange(u_A))
         sparse_bufs = _sparse_args(u_A)
 
-        # Try CSR-vector hook: DenseLevel outermost + unique CompressedLevel inner.
-        # CUDAExt overrides with a vector (multi-thread-per-row) kernel.
+        # CSR-vector hook: DenseLevel outer + unique CompressedLevel inner, no fusion.
+        # CUDAExt overrides with a warp-shuffle vector kernel (supports all beta values).
+        # Val{ZERO_BETA} specialization avoids the y-read when beta=0.
         dispatched = false
-        if lv1 isa Union{DenseLevel,BatchLevel} && length(fmt.levels) >= 2
+        if use_identity &&
+                lv1 isa Union{DenseLevel,BatchLevel} && length(fmt.levels) >= 2
             lv2 = fmt.levels[2][2]
             if lv2 isa CompressedLevel && is_unique(lv2)
                 dispatched = JLUST._csr_spmv_specialized!(
                     sparse_bufs[1], sparse_bufs[2],
-                    nonzeros(u_A), nonzeros(u_x), nonzeros(u_y), off, n_outer)
+                    nonzeros(u_A), nonzeros(u_x), nonzeros(u_y), off, n_outer, T_beta)
             end
         end
 
         if !dispatched
             kern       = _get_spmv_kernel(fmt, T)
-            all_args   = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer)
+            all_args   = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
+                          input_fn, output_fn, T_alpha, T_beta)
             kernel_obj = Base.invokelatest(kern, ka, 64)
             Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
         end
     end
 
+    return u_y
+end
+
+# ─── EmitterSpMVHandle ────────────────────────────────────────────────────────
+#
+# prepare() compiles and caches the specialized kernel once, including the
+# concrete types of input_fn/output_fn.  Subsequent sparse_mv! calls skip
+# format inspection and invokelatest overhead on the kernel lookup.
+#
+# input_fn:  applied element-wise to x before each multiply: y = A * input_fn.(x)
+# output_fn: applied to the accumulated row sum before writing:  y[i] = output_fn(acc)
+#
+# Pass identity (the default) for either to generate zero-overhead kernel paths.
+# Example — fused relu-input SpMV followed by relu-output SpMV:
+#
+#   h1 = prepare(EmitterBackend(), SpMVOp, u_A1; output_fn=relu)
+#   h2 = prepare(EmitterBackend(), SpMVOp, u_A2; input_fn=relu)
+#   sparse_mv!(h1, u_A1, u_x, u_tmp)   # y_tmp = relu.(A1 * x)  (1 kernel)
+#   sparse_mv!(h2, u_A2, u_tmp, u_y)   # y     = A2 * relu.(y_tmp) (1 kernel)
+#
+# Compared to the unfused form, this saves one broadcast kernel launch per chain link.
+
+mutable struct EmitterSpMVHandle{T, IF, OF}
+    kernel_obj  # compiled KA kernel (backend + block size already bound)
+    n_outer::Int32
+    off::Int32
+    input_fn::IF
+    output_fn::OF
+end
+
+export EmitterSpMVHandle
+
+function JLUST.prepare(::EmitterBackend, ::Type{SpMVOp}, u_A::USTensor{T};
+                        input_fn::IF=identity, output_fn::OF=identity) where {T, IF, OF}
+    fmt     = format(u_A)
+    ka      = KernelAbstractions.get_backend(nonzeros(u_A))
+    off     = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
+    n_outer = Int32(_spmv_ndrange(u_A))
+
+    kern = _get_spmv_kernel(fmt, T)
+    # Bind backend + block size; GPU JIT fires on first actual launch.
+    kobj = Base.invokelatest(kern, ka, 64)
+
+    EmitterSpMVHandle{T, IF, OF}(kobj, n_outer, off, input_fn, output_fn)
+end
+
+function JLUST.sparse_mv!(h::EmitterSpMVHandle, u_A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
+    JLUST.sparse_mv!(h, u_A, ust(x), ust(y); kw...)
+end
+
+function JLUST.sparse_mv!(h::EmitterSpMVHandle, u_A::USTensor, u_x::USTensor, u_y::USTensor;
+                           alpha=one(eltype(u_A)), beta=zero(eltype(u_A)))
+    T_A         = eltype(u_A)
+    sparse_bufs = _sparse_args(u_A)
+    all_args    = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y),
+                   h.off, h.n_outer, h.input_fn, h.output_fn, T_A(alpha), T_A(beta))
+    Base.invokelatest(h.kernel_obj, all_args...; ndrange=Int(h.n_outer))
     return u_y
 end

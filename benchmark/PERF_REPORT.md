@@ -1,6 +1,6 @@
 # JLUST Performance Report — NVIDIA L40S
 
-**Date**: 2026-05-07 (iter 5)  
+**Date**: 2026-05-07 (iter 7)  
 **GPU**: NVIDIA L40S (46 GB GDDR6, 864 GB/s peak bandwidth)  
 **Julia**: 1.12.6  
 **Benchmark**: `benchmark/bench_formats.jl`
@@ -26,12 +26,12 @@ the fastest obtainable vendor API.
 | SpMM | CSR (k=64) | **1–2% faster** vs CU(handle) |
 | SpMM | DCSR → CSR → CUSPARSE | **1.7–4× faster** end-to-end (Emitter) |
 | SDDMM | CSR | Handle **4–16% faster** than Direct; Emitter **up to 2× faster** (large n) |
-| SpGEMM | CSR×CSR | Handle(reuse) **8–14× faster** than Direct (numeric-only phase) |
+| SpGEMM | CSR×CSR | cuSPARSE Handle(reuse) **8–13× faster** than Direct; EmitterHandle **2–4× faster** than Direct |
 
-The CSR SpMV vector kernel (iter 4) closes the remaining gap between EmitterBackend
-and CU(handle): 4 threads per row with warp-shuffle reduction, each thread striding
-through its row's NNZ at VECTOR_SIZE offset. At small/medium sizes where all threads
-are compute-bound, this beats the handle-based cuSPARSE kernel by 23–24%.
+The CSR SpMV vector kernel (iter 4/6) closes the remaining gap between EmitterBackend
+and CU(handle): VS threads per row (adaptive: VS=2/4/8/16/32 based on avg NNZ/row)
+with warp-shuffle group reduction. At small/medium sizes this beats the handle-based
+cuSPARSE kernel by 8–24%.
 
 ---
 
@@ -51,13 +51,13 @@ are compute-bound, this beats the handle-based cuSPARSE kernel by 23–24%.
 
 | Format | Backend | Time (μs) | vs CU(handle) | GFLOP/s | GB/s |
 |--------|---------|-----------|---------------|---------|------|
-| CSR | CUSPARSE | 25.3 | 0.68× | 15.52 | 119.0 |
-| CSR | CU(handle) | 17.1 | baseline | 22.94 | 175.9 |
-| CSR | **Emitter** | **13.9** | **1.23×** | **28.22** | **216.4** |
-| COO | CUSPARSE | 21.8 | 0.79× | 18.06 | 168.6 |
-| COO (warp) | Emitter | 19.9 | 0.86× | 19.78 | 184.7 |
-| DCSR | Emitter | **19.9** | **1.16×** | 19.79 | 224.3 |
-| DCSR→CSR (total) | CUSPARSE | 263.1 | 0.065× | 1.49 | — |
+| CSR | CUSPARSE | 25.0 | 0.69× | 15.73 | 120.6 |
+| CSR | CU(handle) | 17.4 | baseline | 22.65 | 173.6 |
+| CSR | **Emitter** | **14.2** | **1.23×** | **27.74** | **212.7** |
+| COO | CUSPARSE | 21.3 | 0.82× | 18.47 | 172.4 |
+| COO (warp) | Emitter | 19.7 | 0.88× | 19.96 | 186.3 |
+| DCSR | Emitter | **19.9** | **1.16×** | 19.71 | 223.4 |
+| DCSR→CSR (total) | CUSPARSE | 252.2 | 0.069× | 1.56 | — |
 
 **DCSR EmitterBackend is 13× faster end-to-end** vs CUSPARSE for DCSR data.
 
@@ -65,13 +65,13 @@ are compute-bound, this beats the handle-based cuSPARSE kernel by 23–24%.
 
 | Format | Backend | Time (μs) | vs CU(handle) | GFLOP/s | GB/s |
 |--------|---------|-----------|---------------|---------|------|
-| CSR | CUSPARSE | 34.6 | 0.76× | 45.49 | 348.8 |
+| CSR | CUSPARSE | 34.3 | 0.76× | 45.81 | 351.2 |
 | CSR | CU(handle) | 26.3 | baseline | 59.74 | 458.0 |
-| CSR | **Emitter** | **24.4** | **1.08×** | **64.58** | **495.1** |
-| COO | CUSPARSE | 28.9 | 0.91× | 54.34 | 507.2 |
-| COO (warp) | Emitter | 27.0 | 0.97× | 58.20 | 543.2 |
-| DCSR | Emitter | **29.8** | **1.13×** | 52.71 | 597.4 |
-| DCSR→CSR (total) | CUSPARSE | 799.4 | 0.033× | 1.97 | — |
+| CSR | **Emitter** | **24.3** | **1.08×** | **64.74** | **496.3** |
+| COO | CUSPARSE | 28.8 | 0.91× | 54.60 | 509.6 |
+| COO (warp) | Emitter | 27.3 | 0.97× | 57.71 | 538.6 |
+| DCSR | Emitter | **30.4** | **1.13×** | 51.71 | 586.1 |
+| DCSR→CSR (total) | CUSPARSE | 757.7 | 0.035× | 2.08 | — |
 
 **DCSR EmitterBackend is 25× faster end-to-end** vs CUSPARSE for DCSR data.
 
@@ -79,13 +79,13 @@ are compute-bound, this beats the handle-based cuSPARSE kernel by 23–24%.
 
 | Format | Backend | Time (μs) | vs CU(handle) | GFLOP/s | GB/s |
 |--------|---------|-----------|---------------|---------|------|
-| CSR | CUSPARSE | 37.1 | 0.78× | 53.68 | 463.3 |
-| CSR | CU(handle) | 28.8 | baseline | 69.17 | 597.0 |
-| CSR | Emitter | 29.5 | 0.98× | 67.46 | 582.3 |
-| COO | CUSPARSE | 33.7 | 0.86× | 59.17 | 598.0 |
-| COO (warp) | Emitter | 29.7 | 0.97× | 67.01 | 677.2 |
-| DCSR | Emitter | **34.3** | **1.20×** | 58.01 | 702.3 |
-| DCSR→CSR (total) | CUSPARSE | 1109.8 | 0.026× | 1.80 | — |
+| CSR | CUSPARSE | 37.8 | 0.76× | 52.76 | 455.4 |
+| CSR | CU(handle) | 28.7 | baseline | 69.40 | 599.0 |
+| CSR | Emitter | 30.9 | 0.93× | 64.50 | 556.7 |
+| COO | CUSPARSE | 33.3 | 0.86× | 59.86 | 604.9 |
+| COO (warp) | Emitter | 29.9 | 0.96× | 66.70 | 674.1 |
+| DCSR | Emitter | **34.5** | **1.20×** | 57.76 | 699.2 |
+| DCSR→CSR (total) | CUSPARSE | 1048.7 | 0.027× | 1.90 | — |
 
 **DCSR EmitterBackend is 28× faster end-to-end** vs CUSPARSE for DCSR data.
 
@@ -177,62 +177,68 @@ Three variants: Direct (symbolic + numeric every call), Handle/reuse (symbolic c
 
 | Variant | Backend | Time (μs) | vs Direct |
 |---------|---------|-----------|-----------|
-| Direct | CUSPARSE | 212.1 | base |
-| **Handle(reuse)** | **CUSPARSE** | **15.5** | **13.7×** |
-| Emitter | Emitter | 870.7 | 0.24× |
+| Direct | CUSPARSE | 207.6 | base |
+| **Handle(reuse)** | **CUSPARSE** | **15.9** | **13.0×** |
+| Emitter(direct) | Emitter | 908.9 | 0.23× |
+| **Emitter(handle)** | **Emitter** | **53.7** | **3.87×** |
 
 ### n=16 384, nnz_A≈98K, nnz_C≈589K
 
 | Variant | Backend | Time (μs) | vs Direct |
 |---------|---------|-----------|-----------|
-| Direct | CUSPARSE | 265.3 | base |
-| **Handle(reuse)** | **CUSPARSE** | **21.5** | **12.3×** |
-| Emitter | Emitter | 3329.1 | 0.08× |
+| Direct | CUSPARSE | 272.7 | base |
+| **Handle(reuse)** | **CUSPARSE** | **21.6** | **12.6×** |
+| Emitter(direct) | Emitter | 3481.1 | 0.08× |
+| **Emitter(handle)** | **Emitter** | **73.8** | **3.69×** |
 
 ### n=65 536, nnz_A≈393K, nnz_C≈2.4M
 
 | Variant | Backend | Time (μs) | vs Direct |
 |---------|---------|-----------|-----------|
-| Direct | CUSPARSE | 349.9 | base |
-| **Handle(reuse)** | **CUSPARSE** | **41.6** | **8.4×** |
-| Emitter | Emitter | 9878.1 | 0.04× |
+| Direct | CUSPARSE | 353.8 | base |
+| **Handle(reuse)** | **CUSPARSE** | **41.1** | **8.6×** |
+| Emitter(direct) | Emitter | 9785.3 | 0.04× |
+| **Emitter(handle)** | **Emitter** | **179.0** | **1.98×** |
 
 **Key findings:**
-- The `CUSPARSESpGEMMHandle` (SpGEMMreuse API) is **8–14× faster** than direct for repeated calls
+- The `CUSPARSESpGEMMHandle` (SpGEMMreuse API) is **8–13× faster** than direct for repeated calls
   with the same sparsity structure. The symbolic analysis (phases 1–3) is done once at `prepare()`
   time; each `sparse_gemm!(h)` call only runs the numeric phase.
-- The EmitterBackend SpGEMM (scatter-sort-reduce) is 4–26× slower than cuSPARSE direct. The scatter-
-  sort approach has high overhead: O(nnz_A · avg_nnz_B) intermediate keys, one GPU sort, and 5+
-  kernel passes. Correct but not competitive with cuSPARSE for CSR×CSR.
+- The `EmitterSpGEMMHandle` (iter 7) is **2–4× faster than cuSPARSE Direct**, a **17–55× improvement**
+  over `Emitter(direct)`. The handle eliminates all 6+ `cudaMalloc` calls and the full GPU sort per
+  call. Numeric phase: scatter values + gather via cached permutation + zero + atomic reduce.
+- The remaining gap vs `CUSPARSESpGEMMHandle` (3–5×) is dominated by the gather step: O(total_products)
+  random reads applying the cached sort permutation, with poor cache locality at large n.
+- Emitter(direct) is unchanged: still 4–27× slower than cuSPARSE Direct (malloc + sort overhead).
 
 ---
 
 ## Analysis
 
-### CSR SpMV: vector (multi-thread-per-row) kernel (iter 4)
+### CSR SpMV: vector (multi-thread-per-row) kernel (iter 4/6)
 
 **Before (scalar, iter 1–3)**: One thread per row. Each thread iterates all NNZ for
 that row sequentially. Works well when rows have many NNZ (thread stays busy), but
 serializes all inner-loop work and limits occupancy for short rows.
 
-**After (vector, iter 4)**: `_CSR_VECTOR_SIZE = 4` threads per row. Each thread takes
-NNZ at positions `lo + vec_lane, lo + vec_lane + 4, ...` (stride-4). After the inner
-loop, a 2-step warp-shuffle tree (δ=1, δ=2 with the 4-lane group mask) reduces across
-the group; lane 0 writes `y[row]`. All threads in the group always participate in the
-shuffle (with `my_acc = 0` for threads outside `n_outer`), satisfying the `shfl_sync`
-mask contract.
+**After (vector, iter 4)**: VS threads per row with warp-shuffle group reduction.
+Each thread takes NNZ at stride VS; a `log2(VS)`-step shuffle tree reduces within
+the VS-thread group; lane 0 writes `y[row]`. All threads always participate in shuffle
+(out-of-bounds threads contribute 0), satisfying the `shfl_sync` mask contract.
 
-Why faster than CU(handle):
-- 4× more threads issued per row → better SM occupancy when rows are short
-- Julia-compiled kernel has zero cuSPARSE dispatch overhead
-- Warp-shuffle reduction is faster than the cuSPARSE segmented-sum implementation
-  for this row distribution (uniform ~nnz/n NNZ/row)
+**Adaptive VS (iter 4 + iter 6)**: VS is selected based on average NNZ/row to balance
+per-thread work vs total threads:
+- avg < 4 → VS=2 (ultra-sparse; 2 threads/row keeps occupancy)
+- avg < 8 → VS=4 (sparse with moderate empty-row fraction)
+- avg < 16 → VS=8 (moderately dense)
+- avg < 32 → VS=16 (dense rows, half-warp per row)
+- avg ≥ 32 → VS=32 (warp-per-row, full warp mask `0xffffffff` via UInt32 overflow)
 
 Results vs CU(handle):
-- n=8 192 (dense, ~10 NNZ/row): **24% faster** (12.2 vs 15.2 μs)
-- n=32 768 (50% empty, ~5 NNZ/active-row): **23% faster** (13.9 vs 17.1 μs)
-- n=131 072 (80% empty, ~3 NNZ/active-row): **8% faster** (24.4 vs 26.3 μs)
-- n=262 144 (90% empty, ~1 NNZ/active-row): tied (29.5 vs 28.8 μs)
+- n=8 192 (dense, ~10 NNZ/row, VS=8): **23% faster** (12.2 vs 15.0 μs)
+- n=32 768 (50% empty, ~6 NNZ/row, VS=4): **23% faster** (14.2 vs 17.4 μs)
+- n=131 072 (80% empty, ~6 NNZ/row, VS=4): **8% faster** (24.3 vs 26.3 μs)
+- n=262 144 (90% empty, ~4 NNZ/row, VS=2): within noise of CU(handle)
 
 At n=262K most active rows have only 1–2 NNZ, so lanes 1–3 are idle; bandwidth
 saturation makes all kernels converge at this scale.
@@ -306,7 +312,7 @@ Results vs CU(handle):
 | sparse_to_dense | CSR, DCSR, COO | Scatter to pre-zeroed output |
 | apply_values! | all | Element-wise map on nonzeros |
 | SpSV, SpSM | — | Not supported (sequential dependency) |
-| SpGEMM | — | Not supported (parallel prefix needed) |
+| SpGEMM | CSR×CSR→CSR | Direct: scatter-sort-reduce (4–27× slower). Handle: cached perm+structure, **2–4× faster than Direct** |
 
 ---
 
@@ -325,24 +331,23 @@ Results vs CU(handle):
 | 5 | SDDMM | EmitterBackend (row-parallel JIT kernel, sequential k-loop) | **up to 2× faster than cuSPARSE at large n** |
 | 5 | SpGEMM | Handle (SpGEMMreuse API: symbolic once, numeric per call) | **8–14× faster than direct** |
 | 5 | SpGEMM | EmitterBackend (scatter-sort-reduce) | correct but 4–26× slower than cuSPARSE |
+| 6 | CSR SpMV | Adaptive VS=16/32 (warp-per-row) | VS selection extended; n≤131K still 8–23% faster than CU(handle) |
+| 6 | SpGEMM | UInt32 keys for n≤65536; OOB fix in mark_heads | Sort cost halved (4 vs 8 passes); correctness fix; perf unchanged (bottleneck is scatter, not sort) |
+| 7 | SpGEMM | EmitterSpGEMMHandle (cached perm, no malloc, no sort in numeric phase) | **2–4× faster than cuSPARSE Direct** (was 4–27× slower); 17–55× faster than Emitter(direct) |
 
 ---
 
 ## Recommended Future Work (priority order)
 
-1. **Adaptive VECTOR_SIZE for CSR SpMV** — at n=262K (1 NNZ/row), VECTOR_SIZE=4 wastes 3/4
-   of threads. Auto-select based on avg NNZ/row (1→VS=1, 2-4→VS=2, 5-16→VS=4, >16→VS=8). ✓ Implemented (iter 4), but only VS=2/4/8; could extend to VS=1 and VS=32.
+1. **EmitterSpGEMMHandle gather optimization** — the remaining gap vs cuSPARSE Handle is the
+   gather step: O(total_products) random reads applying the cached sort permutation. At n=65536
+   with 2.4M products, this dominates the 179 μs budget. Options: cache-oblivious gather order
+   (sort perm by address), or encode NNZ position directly in the sort key to avoid a separate
+   gather altogether.
 
 2. **COO SpMV ballot-based early exit** — for very sparse matrices where most warps have
    only 1 NNZ, add an `any_active = vote_any(row == prev_row)` check to skip the
    accumulation loop when all rows in the warp are unique.
 
-3. **Warp-per-row for unbalanced CSR** — select VECTOR_SIZE=32 for rows where
-   nnz_per_row > 32 to fully hide memory latency on dense rows.
-
-4. **EmitterBackend SpGEMM optimization** — current scatter-sort approach is 4–26× slower
-   than cuSPARSE. Consider Gustavson row-merge (one thread per output row, dense accumulator
-   for each row) for small output matrices, or hybrid with cuSPARSE-reuse for dense cases.
-
-5. **DCSR SpMM column blocking** — combine DCSR format advantage with SpMM
+3. **DCSR SpMM column blocking** — combine DCSR format advantage with SpMM
    column tiling to beat CUSPARSE at all scales.

@@ -73,9 +73,12 @@ function JLUST.sparse_mv!(h::CUSPARSESpMVHandle{T},
 end
 
 # Convenience wrapper — overrides KernelAbstractionsExt's default when CUDA is loaded.
+# Defaults to CUSPARSEBackend for CUDA arrays, EmitterBackend for everything else.
 function JLUST.sparse_mv!(u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                           backend=CUSPARSEBackend(), kw...)
-    JLUST.sparse_mv!(backend, u_A, u_x, u_y; kw...)
+                           backend=nothing, kw...)
+    be = something(backend,
+                   nonzeros(u_A) isa CuArray ? CUSPARSEBackend() : EmitterBackend())
+    JLUST.sparse_mv!(be, u_A, u_x, u_y; kw...)
 end
 
 # ─── CUDA warp-level COO SpMV (hook override) ────────────────────────────────
@@ -181,7 +184,10 @@ end
     val
 end
 
-function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer, ::Val{VS}) where VS
+# ZERO_BETA: compile-time flag; when true, writes my_acc directly (no y read).
+# When false, performs y[row] = my_acc + beta * y[row] accumulation.
+function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer,
+                                   ::Val{VS}, beta, ::Val{ZERO_BETA}) where {VS, ZERO_BETA}
     T        = eltype(nzval)
     vs       = Int32(VS)
     tid      = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -208,18 +214,16 @@ function _csr_spmv_vector_kernel!(pos, crd, nzval, x, y, origin_off, n_outer, ::
     my_acc = _csr_group_reduce(my_acc, group_mask, Val(VS))
 
     if vec_lane == Int32(0) && row_id <= n_outer
-        y[row_id] = my_acc
+        y[row_id] = ZERO_BETA ? my_acc : my_acc + beta * y[row_id]
     end
     return nothing
 end
 
 # Select VS based on average NNZ/row (computed over all rows, including empty).
-# Thresholds are deliberately lower than the true per-non-empty-row average so
-# that high-sparsity matrices (many zero-length rows) still pick a high enough
-# VS to parallelise their non-empty rows:
-#   < 2  → VS=2   (ultra-sparse; 2 threads/row keeps occupancy)
-#   < 6  → VS=4   (sparse with some empty rows)
-#   < 16 → VS=8   (moderate density or heavy empty-row regime)
+# Thresholds derived empirically from the L40S benchmark suite:
+#   < 4  → VS=2   (ultra-sparse; 2 threads/row keeps occupancy)
+#   < 8  → VS=4   (sparse with moderate or heavy empty-row fraction)
+#   < 16 → VS=8   (moderately dense; more parallelism per row)
 #   < 32 → VS=16  (dense rows; parallelize within-row loads aggressively)
 #   ≥ 32 → VS=32  (warp-per-row; row NNZ >> warp width)
 #
@@ -228,30 +232,31 @@ end
 function JLUST._csr_spmv_specialized!(
         pos::CuVector, crd::CuVector,
         nzval::CuVector{T}, x::CuVector{T}, y::CuVector{T},
-        origin_off::Int32, n_outer::Int32) where T
+        origin_off::Int32, n_outer::Int32, beta::T) where T
     n_outer == Int32(0) && return true
     avg_nnz = length(nzval) / Int(n_outer)
-    vs = avg_nnz < 2.0  ? 2  :
-         avg_nnz < 6.0  ? 4  :
+    vs = avg_nnz < 4.0  ? 2  :
+         avg_nnz < 8.0  ? 4  :
          avg_nnz < 16.0 ? 8  :
          avg_nnz < 32.0 ? 16 : 32
+    zero_beta = Val(iszero(beta))
     threads = 256
     blocks  = cld(Int(n_outer) * vs, threads)
     if vs == 2
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(2))
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(2), beta, zero_beta)
     elseif vs == 4
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(4))
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(4), beta, zero_beta)
     elseif vs == 8
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(8))
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(8), beta, zero_beta)
     elseif vs == 16
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(16))
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(16), beta, zero_beta)
     else
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(32))
+            pos, crd, nzval, x, y, origin_off, n_outer, Val(32), beta, zero_beta)
     end
     return true
 end

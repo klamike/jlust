@@ -80,3 +80,10 @@ function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;
                            backend=CUSPARSEBackend(), kw...)
     JLUST.sparse_mm!(backend, u_A, u_B, u_C; kw...)
 end
+
+# cuSPARSE rejects SubArray outputs; route to EmitterBackend (our KA kernel) instead.
+# This fires when row_bufs are views into the stacked diag_out buffer.
+function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor,
+                           u_C::USTensor{T,Ti,N,<:SubArray}; kw...) where {T,Ti,N}
+    JLUST.sparse_mm!(EmitterBackend(), u_A, u_B, u_C; kw...)
+end

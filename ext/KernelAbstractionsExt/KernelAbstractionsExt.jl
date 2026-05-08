@@ -7,16 +7,12 @@ import JLUST:
     supports_backend, format, extents, index_origin, OneBased,
     positions, coordinates, nonzeros, has_positions, has_coordinates,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
-    is_unique, is_ordered, format_family, Formats,
+    AbstractLevelFormat, is_unique, is_ordered, format_family, Formats,
     apply_values!, sparse_mv!, sparse_mm!, sparse_gemm!,
     sparse_sv!, sparse_sm!, sparse_sddmm!, sparse_to_dense, dense_to_sparse,
-    csr_tensor
-
-# ─── EmitterBackend ───────────────────────────────────────────────────────────
-
-struct EmitterBackend <: AbstractUSTBackend end
-
-export EmitterBackend
+    csr_tensor, prepare,
+    EmitterBackend, level_has_nzval, level_arg_names, level_args, emit_spmv_lv,
+    _bbm_scatter_diag!, _bbm_scatter_ramp!
 
 _is_dense_fmt(fmt::TensorFormat) =
     all(lv isa Union{DenseLevel,BatchLevel} for (_, lv) in fmt.levels)
@@ -54,6 +50,13 @@ end
 function JLUST.sparse_mv!(u_A::USTensor, u_x::USTensor, u_y::USTensor;
                            backend=EmitterBackend(), kw...)
     JLUST.sparse_mv!(backend, u_A, u_x, u_y; kw...)
+end
+
+# Default-backend overload for raw AbstractVector operands.
+# Pairs with the explicit-backend overload in src/convenience.jl.
+function JLUST.sparse_mv!(u_A::USTensor, x::AbstractVector, y::AbstractVector;
+                           backend=EmitterBackend(), kw...)
+    JLUST.sparse_mv!(backend, u_A, x, y; kw...)
 end
 
 function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor, u_C::USTensor;

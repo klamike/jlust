@@ -11,6 +11,7 @@ include("ops.jl")
 include("backends.jl")
 include("interop.jl")
 include("convert.jl")
+include("convenience.jl")
 
 export
     # Errors
@@ -46,6 +47,8 @@ export
     SparseToDenseOp, DenseToSparseOp,
     GatherOp, ScatterOp, AxpbyOp, RotOp,
     supports_backend, supports_convert, validate_storage,
+    EmitterBackend, CUSPARSEBackend,
+    level_has_nzval, level_arg_names, level_args, emit_spmv_lv, level_step,
 
     # Tensor
     AbstractUSTensor, USTensor,
@@ -53,8 +56,8 @@ export
     format, extents, index_origin, memory_space,
     # nnz and nonzeros come from SparseArrays (extended for USTensor)
 
-    # Interop
-    ust, csr_tensor, csc_tensor, coo_tensor,
+    # Interop / constructors
+    ust, csr_tensor, csc_tensor, coo_tensor, dcsr_tensor,
 
     # Convert
     convert_format, convert_index_type, convert_value_type,
@@ -75,6 +78,15 @@ export
     sparse_vv, sparse_sv!, sparse_sm!, sparse_sddmm!,
     sparse_to_dense, dense_to_sparse,
     sparse_gather!, sparse_scatter!, sparse_axpby!, sparse_rot!,
-    prepare, update_values!
+    prepare, update_values!,
+
+    # Custom level format constructor helper
+    make_tensor,
+
+    # Block matrix
+    BlockSparseMatrix,
+    update_block_values!,
+    batch_mul!, batch_mul,
+    BlockBandedMatrix
 
 end  # module JLUST

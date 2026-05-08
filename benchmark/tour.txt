@@ -1,0 +1,79 @@
+========================================================================
+JLUST DCOPF Feature Tour
+Backend : CUDA (NVIDIA L40S)
+Julia   : 1.12.6
+========================================================================
+
+────────────────────────────────────────────────────────────────────────
+Section 1 — Constructors
+────────────────────────────────────────────────────────────────────────
+  pglib_opf_case30000_goc: 30000 buses  35393 lines  3526 gens  (demo)
+  pglib_opf_case30000_goc: 30000 buses  35393 lines  3526 gens  (benchmark)
+
+  csr_tensor  (Cg)   : ✓  (3526 nnz, 30000×3526)
+  dcsr_tensor (Cg)   : ✓  2278 active rows / 30000 total (7.6% non-empty — generator buses only)
+
+────────────────────────────────────────────────────────────────────────
+Section 2 — BlockSparseMatrix: DCOPF constraint matrix
+────────────────────────────────────────────────────────────────────────
+  BlockSparseMatrix shape : 65393 × 68919
+    block rows  : 30000 (balance) + 35393 (flow)
+    block cols  : 3526 (p_gen) + 35393 (p_f) + 30000 (va)
+  mul!(y, BM, x)          :     36.8 μs  (4 block SpMVs)
+
+  Method (full DCOPF operator)           Time (μs)
+  ────────────────────────────────────────────────
+  SparseMatrixCSC (CPU)                      335.5
+  cuSPARSE (GPU reference)                    23.2
+  JLUST BlockSparseMatrix                     36.8  (0.63× vs cuSPARSE)
+  JLUST + CUDA Graph                          16.9  (1.37× vs cuSPARSE)
+  ────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────
+Section 3 — Multi-stage OPF with ramping (BlockBandedMatrix)
+────────────────────────────────────────────────────────────────────────
+  Ramp R   : 3526 × 68919, 3526 nnz
+  Full M   : 1650530 × 1654056  (T=24, 3 unique objects)
+
+  Method (T=24)                         Total (μs)    Per period
+  ──────────────────────────────────────────────────────────────
+  SparseMatrixCSC (CPU serial)              8148.1         339.5
+  cuSPARSE (GPU serial)                      318.4          13.3
+  JLUST BlockBandedMatrix                    176.1           7.3  (1.81× vs cuSPARSE)
+  JLUST SpMM + CUDA Graph (11 kernels)       147.2           6.1  (2.16× vs cuSPARSE)
+  ──────────────────────────────────────────────────────────────
+
+========================================================================
+Performance Summary  (35393 lines × 30000 buses, Float64)
+========================================================================
+  Operation                                  Time (μs)
+  ────────────────────────────────────────────────────
+  SparseMatrixCSC (CPU)                          335.5
+  cuSPARSE (GPU reference)                        23.2
+  JLUST §2 BlockSparseMatrix                      36.8
+    with CUDA Graph                               16.9
+  ────────────────────────────────────────────────────
+  JLUST §3 SpMM (per period, T=24)                 7.3
+    with CUDA Graph (11 kernels)                   6.1
+  ────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────
+Visual summary (live numbers from this run)
+────────────────────────────────────────────────────────────────────────
+
+                              §2  DCOPF mul!  (μs, lower is better)   
+                           ┌                                        ┐ 
+     SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 335.5   
+        cuSPARSE (GPU ref) ┤■■ 23.2                                   
+   JLUST BlockSparseMatrix ┤■■■■ 36.8                                 
+        JLUST + CUDA Graph ┤■■ 16.9                                   
+                           └                                        ┘ 
+                                               μs                     
+                              §3  multi-stage cost per period  (μs, lower is better) 
+                              ┌                                        ┐ 
+        SparseMatrixCSC (CPU) ┤■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 339.5   
+           cuSPARSE (GPU ref) ┤■ 13.27                                   
+           JLUST SpMM /period ┤■ 7.34                                    
+   JLUST SpMM + Graph /period ┤■ 6.13                                    
+                              └                                        ┘ 
+                                                  μs                     

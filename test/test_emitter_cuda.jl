@@ -185,4 +185,140 @@ end
     @test Array(nonzeros(u_D)) ≈ [1.0 0.0 2.0; 0.0 3.0 0.0; 4.0 0.0 5.0]
 end
 
+# ─── Operator fusion: input_fn / output_fn ───────────────────────────────────
+#
+# Named functions required — GPU kernels cannot use closures with captures.
+# Zero-capture lambdas (e.g. x -> 2x) are also fine on CUDA.jl >= 5.x.
+
+_fuse_double(x::Float64) = 2.0 * x
+_fuse_addone(x::Float64) = x + 1.0
+
+@testset "sparse_mv! GPU CSR input_fn" begin
+    # A = [1 0 2; 0 3 0]  (2×3), x = [1,2,3]
+    # A * (2*x) = [1*2 + 2*6, 3*4] = [14, 12]
+    rowptr = CuArray(Int32[1, 3, 4])
+    colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
+        (2, 3), Formats.CSR,
+        Dict{Int,CuVector{Int32}}(2 => rowptr),
+        Dict{Int,CuVector{Int32}}(2 => colval),
+        nzval, nothing,
+    )
+    u_x = dense_cuvec([1.0, 2.0, 3.0])
+    u_y = dense_cuvec(zeros(Float64, 2))
+    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda(), input_fn=_fuse_double)
+    @test Array(nonzeros(u_y)) ≈ [14.0, 12.0]
+end
+
+@testset "sparse_mv! GPU CSR output_fn" begin
+    # A = [1 0 2; 0 3 0], x = [1,2,3]
+    # (A*x) .+ 1 = [7+1, 6+1] = [8, 7]
+    rowptr = CuArray(Int32[1, 3, 4])
+    colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
+        (2, 3), Formats.CSR,
+        Dict{Int,CuVector{Int32}}(2 => rowptr),
+        Dict{Int,CuVector{Int32}}(2 => colval),
+        nzval, nothing,
+    )
+    u_x = dense_cuvec([1.0, 2.0, 3.0])
+    u_y = dense_cuvec(zeros(Float64, 2))
+    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda(), output_fn=_fuse_addone)
+    @test Array(nonzeros(u_y)) ≈ [8.0, 7.0]
+end
+
+@testset "EmitterSpMVHandle prepare + sparse_mv! GPU CSR" begin
+    # A = [1 0 2; 0 3 0], x = [1,2,3]
+    # A*(2*x) .+ 1 = [14+1, 12+1] = [15, 13]
+    rowptr = CuArray(Int32[1, 3, 4])
+    colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u_A = USTensor{Float64,Int32,2,CuVector{Float64},CuVector{Int32},OneBased}(
+        (2, 3), Formats.CSR,
+        Dict{Int,CuVector{Int32}}(2 => rowptr),
+        Dict{Int,CuVector{Int32}}(2 => colval),
+        nzval, nothing,
+    )
+    u_x = dense_cuvec([1.0, 2.0, 3.0])
+    u_y = dense_cuvec(zeros(Float64, 2))
+
+    h = prepare(EmitterBackend_cuda(), SpMVOp, u_A;
+                 input_fn=_fuse_double, output_fn=_fuse_addone)
+    @test h isa _kaext_cuda.EmitterSpMVHandle
+
+    sparse_mv!(h, u_A, u_x, u_y)
+    @test Array(nonzeros(u_y)) ≈ [15.0, 13.0]
+
+    # Second call reuses compiled kernel — result must be stable
+    fill!(nonzeros(u_y), 0.0)
+    sparse_mv!(h, u_A, u_x, u_y)
+    @test Array(nonzeros(u_y)) ≈ [15.0, 13.0]
+end
+
+# ─── UX improvements: constructors, raw vectors, mul!, BlockSparseMatrix ──────
+
+@testset "csr_tensor keyword args" begin
+    rowptr = CuArray(Int32[1, 3, 4]); colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u = csr_tensor(rowptr, colval, nzval; m=2, n=3)
+    @test size(u) == (2, 3)
+    @test format(u) == Formats.CSR
+end
+
+@testset "dcsr_tensor" begin
+    oc = CuArray(Int32[1, 3]); ip = CuArray(Int32[1, 3, 5])
+    ic = CuArray(Int32[1, 3, 1, 3]); nz = CuArray(Float64[1.0, 2.0, 4.0, 5.0])
+    u = dcsr_tensor(oc, ip, ic, nz; m=3, n=3)
+    @test size(u) == (3, 3)
+    @test format(u) == Formats.DCSR
+end
+
+@testset "sparse_mv! raw CuVector operands" begin
+    rowptr = CuArray(Int32[1, 3, 4]); colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u_A = csr_tensor(rowptr, colval, nzval; m=2, n=3)
+    x = CuArray([1.0, 2.0, 3.0]); y = CUDA.zeros(Float64, 2)
+    sparse_mv!(EmitterBackend_cuda(), u_A, x, y)
+    @test Array(y) ≈ [7.0, 6.0]
+end
+
+@testset "mul! and * for USTensor" begin
+    rowptr = CuArray(Int32[1, 3, 4]); colval = CuArray(Int32[1, 3, 2])
+    nzval  = CuArray(Float64[1.0, 2.0, 3.0])
+    u_A = csr_tensor(rowptr, colval, nzval; m=2, n=3)
+    x = CuArray([1.0, 2.0, 3.0]); y = CUDA.zeros(Float64, 2)
+    mul!(y, u_A, x)
+    @test Array(y) ≈ [7.0, 6.0]
+    @test Array(u_A * x) ≈ [7.0, 6.0]
+end
+
+@testset "BlockSparseMatrix diagonal" begin
+    rp1 = CuArray(Int32[1,3,4]); cv1 = CuArray(Int32[1,3,2]); nz1 = CuArray(Float64[1,2,3])
+    rp2 = CuArray(Int32[1,2,4]); cv2 = CuArray(Int32[2,1,3]); nz2 = CuArray(Float64[1,1,1])
+    A1 = csr_tensor(rp1, cv1, nz1; m=2, n=3)   # [1 0 2; 0 3 0]
+    A2 = csr_tensor(rp2, cv2, nz2; m=2, n=3)   # [0 1 0; 1 0 1]
+
+    BM = BlockSparseMatrix([A1 nothing; nothing A2])
+    @test size(BM) == (4, 6)
+    x = CuArray([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    # A1*[1,2,3]=[7,6], A2*[4,5,6]=[5,10]
+    @test Array(BM * x) ≈ [7.0, 6.0, 5.0, 10.0]
+    y = CUDA.zeros(Float64, 4); mul!(y, BM, x)
+    @test Array(y) ≈ [7.0, 6.0, 5.0, 10.0]
+end
+
+@testset "BlockSparseMatrix accumulate" begin
+    rp1 = CuArray(Int32[1,3,4]); cv1 = CuArray(Int32[1,3,2]); nz1 = CuArray(Float64[1,2,3])
+    rp2 = CuArray(Int32[1,2,4]); cv2 = CuArray(Int32[2,1,3]); nz2 = CuArray(Float64[1,1,1])
+    A1 = csr_tensor(rp1, cv1, nz1; m=2, n=3)   # [1 0 2; 0 3 0]
+    A2 = csr_tensor(rp2, cv2, nz2; m=2, n=3)   # [0 1 0; 1 0 1]
+
+    BM = BlockSparseMatrix([A1 A2])             # single block row, two block cols
+    x = CuArray([1.0, 2.0, 3.0, 1.0, 2.0, 3.0])
+    # A1*[1,2,3]=[7,6], A2*[1,2,3]=[2,4], sum=[9,10]
+    @test Array(BM * x) ≈ [9.0, 10.0]
+end
+
 end  # if gpu_available()
