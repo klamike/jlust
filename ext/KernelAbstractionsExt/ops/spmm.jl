@@ -15,7 +15,7 @@ end
 function _emit_spmm_level(levels, lvl, p_var, pc, cc, T, needs_atomic)
     if lvl > length(levels)
         return needs_atomic ?
-            :(KernelAbstractions.@atomic _C[_y_idx, _col] += _nzval[_nnz_pos] * _B[_x_idx, _col]) :
+            :(KernelAbstractions.@atomic _C[_y_idx, _col] += _alpha * _nzval[_nnz_pos] * _B[_x_idx, _col]) :
             :(_acc += _nzval[_nnz_pos] * _B[_x_idx, _col])
     end
     _, lv = levels[lvl]
@@ -213,7 +213,7 @@ function _emit_spmm_level_nf(levels, lvl, p_var, pc, cc, T, needs_atomic, n_col,
         # Leaf: accumulate nzval * B[x_idx, col] for all output columns.
         col_updates = Expr(:block, [
             needs_atomic ?
-                :(KernelAbstractions.@atomic _C[_y_idx, $(c)] += _nzval[_nnz_pos] * _B[_x_idx, $(c)]) :
+                :(KernelAbstractions.@atomic _C[_y_idx, $(c)] += _alpha * _nzval[_nnz_pos] * _B[_x_idx, $(c)]) :
                 :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, $(c)])
             for c in 1:n_col]...)
         return col_updates
@@ -747,11 +747,9 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
                   length(fmt.levels) >= 2 && fmt.levels[2].second isa SingletonLevel
 
-    # COO-like patterns use @atomic += and cannot scale existing C values.
+    # COO-like: pre-scale C by beta; atomic += accumulates into this baseline.
     if is_coo_like
-        iszero(T_beta)  || error("EmitterBackend sparse_mm!: beta ≠ 0 not supported for COO format")
-        isone(T_alpha)  || error("EmitterBackend sparse_mm!: alpha ≠ 1 not yet supported for COO format")
-        fill!(nonzeros(u_C), zero(T))
+        iszero(T_beta) ? fill!(nonzeros(u_C), zero(T)) : (nonzeros(u_C) .*= T_beta)
     end
 
     sparse_bufs = _sparse_args(u_A)

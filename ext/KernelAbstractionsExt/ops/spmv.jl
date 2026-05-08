@@ -103,7 +103,7 @@ function _emit_spmv_level(levels, lvl, p_var, pc, cc, T, needs_atomic,
     if lvl > length(levels)
         # Leaf: accumulate or atomic-write, applying input_fn to each x element.
         return needs_atomic ?
-            :(KernelAbstractions.@atomic _y[_y_idx] += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx])) :
+            :(KernelAbstractions.@atomic _y[_y_idx] += _alpha * _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx])) :
             :(_acc += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx]))
     end
     _, lv = levels[lvl]
@@ -235,8 +235,6 @@ function _emit_spmv_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na,
     end
 end
 
-# RangeLevel: paired add/sub dimension reconstruction (DIA-like)
-# Deferred to Phase 5 — throws a clear error for now.
 function _emit_spmv_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na,
                         input_fn_sym, output_fn_sym)
     error("EmitterBackend SpMV: RangeLevel (DIA-style) kernels not yet emitted. " *
@@ -327,27 +325,34 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
                    length(fmt.levels) >= 2 && fmt.levels[2].second isa SingletonLevel
     use_identity = IF === typeof(identity) && OF === typeof(identity)
 
-    # COO specialized path: only when alpha=1, beta=0 (atomic += accumulates directly;
-    # scaling y would need a separate kernel, so defer to error for now).
-    if is_coo_like && use_identity && iszero(T_beta)
-        isone(T_alpha) || error("EmitterBackend sparse_mv!: alpha ≠ 1 not yet supported for COO format")
-        fill!(nonzeros(u_y), zero(T))
-        row_crd = coordinates(u_A, 1)
-        col_crd = coordinates(u_A, 2)
-        nzv     = nonzeros(u_A)
-        nx      = nonzeros(u_x)
-        ny      = nonzeros(u_y)
-        n_nnz   = Int32(length(row_crd))
-        if !JLUST._coo_spmv_specialized!(row_crd, col_crd, nzv, nx, ny, off, n_nnz)
-            n_chunks = Int32(cld(Int(n_nnz), _COO_CHUNK))
-            Base.invokelatest(_coo_spmv_chunked!, ka, 64)(
-                row_crd, col_crd, nzv, nx, ny, off, n_nnz;
-                ndrange=Int(n_chunks))
+    if is_coo_like
+        # Pre-scale y by beta; atomic += accumulates into this baseline.
+        iszero(T_beta) ? fill!(nonzeros(u_y), zero(T)) : (nonzeros(u_y) .*= T_beta)
+        if use_identity && isone(T_alpha)
+            # Specialized chunked kernel: lower atomic contention than generic emitter.
+            row_crd = coordinates(u_A, 1)
+            col_crd = coordinates(u_A, 2)
+            nzv     = nonzeros(u_A)
+            nx      = nonzeros(u_x)
+            ny      = nonzeros(u_y)
+            n_nnz   = Int32(length(row_crd))
+            if !JLUST._coo_spmv_specialized!(row_crd, col_crd, nzv, nx, ny, off, n_nnz)
+                n_chunks = Int32(cld(Int(n_nnz), _COO_CHUNK))
+                Base.invokelatest(_coo_spmv_chunked!, ka, 64)(
+                    row_crd, col_crd, nzv, nx, ny, off, n_nnz;
+                    ndrange=Int(n_chunks))
+            end
+        else
+            # General emitter: _alpha applied in atomic leaf; beta already pre-scaled.
+            n_outer     = Int32(_spmv_ndrange(u_A))
+            sparse_bufs = _sparse_args(u_A)
+            kern        = _get_spmv_kernel(fmt, T)
+            all_args    = (sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
+                           input_fn, output_fn, T_alpha, zero(T))
+            kernel_obj  = Base.invokelatest(kern, ka, 64)
+            Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
         end
     else
-        is_coo_like && !iszero(T_beta) &&
-            error("EmitterBackend sparse_mv!: beta ≠ 0 not supported for COO format")
-
         n_outer     = Int32(_spmv_ndrange(u_A))
         sparse_bufs = _sparse_args(u_A)
 

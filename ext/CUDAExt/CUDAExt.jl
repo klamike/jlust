@@ -3,7 +3,7 @@ module CUDAExt
 using CUDA, CUDA.CUSPARSE
 using JLUST, JLUST.Formats
 using SparseArrays
-import SparseArrays: nnz, nonzeros, rowvals
+import SparseArrays: nonzeros, rowvals
 import Adapt
 import JLUST:
     USTensor, TensorFormat, AbstractUSTBackend,
@@ -260,8 +260,6 @@ end
 
 function JLUST.validate_storage(u::USTensor, backend::CUSPARSEBackend; op = :unknown)
     invoke(JLUST.validate_storage, Tuple{USTensor, AbstractUSTBackend}, u, backend; op)
-    # cuSPARSE-specific buffer checks (sorted coords, block-size divisibility, etc.)
-    # are added in Phase 4 alongside _prepare.
     return nothing
 end
 
