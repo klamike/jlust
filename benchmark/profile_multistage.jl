@@ -155,7 +155,7 @@ _run_bbm_spmm! = (X2, row_bufs, diags, nb_r, nb_c) -> begin
             b = diags.blocks[i, j]; b === nothing && continue
             JLUST.needs_row_guard(b) && continue
             col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
-            JLUST.sparse_mm!(b, col_view, row_bufs[i];
+            JLUST.execute(SpMMOp, b, col_view, row_bufs[i];
                              beta=first_dense ? 0.0 : 1.0)
             first_dense = false
         end
@@ -165,10 +165,10 @@ _run_bbm_spmm! = (X2, row_bufs, diags, nb_r, nb_c) -> begin
             col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
             if first_dense
                 fill!(row_bufs[i], 0.0)
-                JLUST.sparse_mm!(b, col_view, row_bufs[i]; beta=0.0, skip_empty_rows=true)
+                JLUST.execute(SpMMOp, b, col_view, row_bufs[i]; beta=0.0, skip_empty_rows=true)
                 first_dense = false
             else
-                JLUST.sparse_mm!(b, col_view, row_bufs[i]; beta=1.0, skip_empty_rows=true)
+                JLUST.execute(SpMMOp, b, col_view, row_bufs[i]; beta=1.0, skip_empty_rows=true)
             end
         end
         first_dense && fill!(row_bufs[i], 0.0)
@@ -190,12 +190,12 @@ for j in 1:nb_c, i in 1:nb_r
     col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
     β = first_dense ? 0.0 : 1.0
     t_block = @belapsed(begin
-        JLUST.sparse_mm!($b, $col_view, $row_bufs[$i]; beta=$β)
+        JLUST.execute(SpMMOp, $b, $col_view, $row_bufs[$i]; beta=$β)
         CUDA.synchronize()
     end, samples=N, evals=1) * 1e6
     sz = size(b)
     @printf("      block[%d,%d] CSR (%dx%d, beta=%.0f): %6.1f μs\n", i, j, sz[1], sz[2], β, t_block)
-    JLUST.sparse_mm!(b, col_view, row_bufs[i]; beta=β)
+    JLUST.execute(SpMMOp, b, col_view, row_bufs[i]; beta=β)
     global first_dense = false
 end; sync()
 println("    -- pass 2 (sparse, guarded):")
@@ -204,12 +204,12 @@ for j in 1:nb_c, i in 1:nb_r
     !JLUST.needs_row_guard(b) && continue
     col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
     t_block = @belapsed(begin
-        JLUST.sparse_mm!($b, $col_view, $row_bufs[$i]; beta=1.0, skip_empty_rows=true)
+        JLUST.execute(SpMMOp, $b, $col_view, $row_bufs[$i]; beta=1.0, skip_empty_rows=true)
         CUDA.synchronize()
     end, samples=N, evals=1) * 1e6
     sz = size(b)
     @printf("      block[%d,%d] CSR (%dx%d, guarded beta=1): %6.1f μs\n", i, j, sz[1], sz[2], t_block)
-    JLUST.sparse_mm!(b, col_view, row_bufs[i]; beta=1.0, skip_empty_rows=true)
+    JLUST.execute(SpMMOp, b, col_view, row_bufs[i]; beta=1.0, skip_empty_rows=true)
 end; sync()
 
 # Fused diag scatter (new: 1 kernel) vs old (T*nb_r copyto!)

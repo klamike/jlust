@@ -4,7 +4,7 @@
 
 # ─── Handle ──────────────────────────────────────────────────────────────────
 
-mutable struct CUSPARSESpMVHandle{T}
+mutable struct CUSPARSESpMVHandle{T} <: JLUST.AbstractKernelHandle
     spmat_desc::CuSparseMatrixDescriptor
     dnvec_x::CuDenseVectorDescriptor
     dnvec_y::CuDenseVectorDescriptor
@@ -19,25 +19,22 @@ function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMV}}, u_A::USTensor{T,T
                         transa::Char='N') where {T<:_CUSPARSE_ELTYPES, Ti}
     idx   = _cusparse_index(u_A)
     m, n  = Int64.(extents(u_A))
-    spmat_desc = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
-
+    spmat = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
     x_len = transa == 'N' ? n : m
     y_len = transa == 'N' ? m : n
     descX = CuDenseVectorDescriptor(T, x_len)
     descY = CuDenseVectorDescriptor(T, y_len)
     algo  = CUSPARSE_SPMV_ALG_DEFAULT
+    α_ref = Ref{T}(one(T));  β_ref = Ref{T}(zero(T))
 
-    alpha_ref = Ref{T}(one(T));  beta_ref = Ref{T}(zero(T))
-    buf_sz = Ref{Csize_t}(0)
-    cusparseSpMV_bufferSize(
-        handle(), transa, alpha_ref, spmat_desc, descX, beta_ref, descY,
-        T, algo, buf_sz)
-    ws = CUDA.zeros(UInt8, max(1, Int(buf_sz[])))
-    cusparseSpMV_preprocess(
-        handle(), transa, alpha_ref, spmat_desc, descX, beta_ref, descY,
-        T, algo, ws)
-
-    CUSPARSESpMVHandle{T}(spmat_desc, descX, descY, ws, transa, algo)
+    ws = _cusparse_workspace() do buf_sz, buf
+        if buf === CUDA.CU_NULL
+            cusparseSpMV_bufferSize(handle(), transa, α_ref, spmat, descX, β_ref, descY, T, algo, buf_sz)
+        else
+            cusparseSpMV_preprocess(handle(), transa, α_ref, spmat, descX, β_ref, descY, T, algo, buf)
+        end
+    end
+    CUSPARSESpMVHandle{T}(spmat, descX, descY, ws, transa, algo)
 end
 
 function JLUST.update_values!(h::CUSPARSESpMVHandle, u_A::USTensor)
@@ -46,29 +43,33 @@ function JLUST.update_values!(h::CUSPARSESpMVHandle, u_A::USTensor)
 end
 
 # ─── Execution ────────────────────────────────────────────────────────────────
+#
+# Direct path uses CUDA.jl's high-level `CUSPARSE.mv!` — graph-capture safe and
+# avoids per-call descriptor allocation.  The handle path (below) is for code
+# that calls SpMV repeatedly with the same matrix; it pre-builds descriptors
+# and workspace at `prepare()` time and reuses them across invocations.
 
-# Direct path — builds a fresh descriptor each call (no handle caching).
-function JLUST.sparse_mv!(::CUSPARSEBackend,
-                           u_A::USTensor{T,Ti}, u_x::USTensor, u_y::USTensor;
-                           transa::Char='N',
-                           alpha=one(T), beta=zero(T)) where {T<:_CUSPARSE_ELTYPES,Ti}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:SpMV, F},
+                       u_A::USTensor{T,Ti}, u_x::USTensor, u_y::USTensor;
+                       transa::Char='N',
+                       alpha=one(T), beta=zero(T)) where {F, T<:_CUSPARSE_ELTYPES, Ti}
     cusA = _to_cuspmat(u_A)
     idx  = _cusparse_index(u_A)
     CUSPARSE.mv!(transa, T(alpha), cusA, nonzeros(u_x), T(beta), nonzeros(u_y), idx)
     return u_y
 end
 
-# Handle path — only updates dense data pointers; no allocation, no descriptor rebuild.
-function JLUST.sparse_mv!(h::CUSPARSESpMVHandle{T},
-                           u_x::USTensor, u_y::USTensor;
-                           alpha=one(T), beta=zero(T)) where T
-    cusparseDnVecSetValues(h.dnvec_x, nonzeros(u_x))
-    cusparseDnVecSetValues(h.dnvec_y, nonzeros(u_y))
-    cusparseSpMV(
-        handle(), h.transa,
-        Ref{T}(alpha), h.spmat_desc, h.dnvec_x,
-        Ref{T}(beta),  h.dnvec_y,
-        T, h.algo, h.workspace)
+# Handle path: A's descriptor is baked in at prepare time, so execute only
+# takes the dense operands.  Refresh A's values via `update_values!(h, u_A)`.
+function JLUST.execute(h::CUSPARSESpMVHandle{T},
+                       u_x::USTensor, u_y::USTensor;
+                       alpha=one(T), beta=zero(T)) where T
+    _cusparse_set_dense!(h.dnvec_x, nonzeros(u_x))
+    _cusparse_set_dense!(h.dnvec_y, nonzeros(u_y))
+    cusparseSpMV(handle(), h.transa,
+                 Ref{T}(alpha), h.spmat_desc, h.dnvec_x,
+                 Ref{T}(beta),  h.dnvec_y,
+                 T, h.algo, h.workspace)
     return u_y
 end
 
@@ -144,36 +145,19 @@ end
 # Group mask: VS consecutive bits starting at the group's base lane.
 # All threads in the group participate unconditionally so that shfl_sync
 # sees a consistent mask; threads beyond n_outer contribute 0.
-
-@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{2}) where T
-    val += CUDA.shfl_down_sync(mask, val, Int32(1))
-    val
-end
-@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{4}) where T
-    val += CUDA.shfl_down_sync(mask, val, Int32(1))
-    val += CUDA.shfl_down_sync(mask, val, Int32(2))
-    val
-end
-@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{8}) where T
-    val += CUDA.shfl_down_sync(mask, val, Int32(1))
-    val += CUDA.shfl_down_sync(mask, val, Int32(2))
-    val += CUDA.shfl_down_sync(mask, val, Int32(4))
-    val
-end
-@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{16}) where T
-    val += CUDA.shfl_down_sync(mask, val, Int32(1))
-    val += CUDA.shfl_down_sync(mask, val, Int32(2))
-    val += CUDA.shfl_down_sync(mask, val, Int32(4))
-    val += CUDA.shfl_down_sync(mask, val, Int32(8))
-    val
-end
-@inline function _csr_group_reduce(val::T, mask::UInt32, ::Val{32}) where T
-    val += CUDA.shfl_down_sync(mask, val, Int32(1))
-    val += CUDA.shfl_down_sync(mask, val, Int32(2))
-    val += CUDA.shfl_down_sync(mask, val, Int32(4))
-    val += CUDA.shfl_down_sync(mask, val, Int32(8))
-    val += CUDA.shfl_down_sync(mask, val, Int32(16))
-    val
+#
+# log2(VS)-step warp shuffle reduction emitted at compile time.  VS must be a
+# power of two ≤ 32; verified at the @generated boundary.
+@generated function _csr_group_reduce(val, mask::UInt32, ::Val{VS}) where VS
+    @assert VS isa Integer && VS > 0 && (VS & (VS - 1)) == 0 && VS <= 32 "VS must be a power of 2 in {1,2,4,8,16,32}"
+    body = Expr(:block)
+    δ = 1
+    while δ < VS
+        push!(body.args, :(val += CUDA.shfl_down_sync(mask, val, Int32($δ))))
+        δ <<= 1
+    end
+    push!(body.args, :(return val))
+    body
 end
 
 # ZERO_BETA: compile-time flag; when true, writes my_acc directly (no y read).
@@ -271,21 +255,20 @@ function JLUST._csr_spmv_specialized!(
     vs        = min(max(vs_nnz, min(vs_occ, vs_nnz * 2)), 32)
     zero_beta = Val(iszero(beta))
     blocks    = cld(Int(n_outer) * vs, threads)
-    if vs == 2
+    _vs_dispatch(vs) do vsv
         CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(2), beta, zero_beta)
-    elseif vs == 4
-        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(4), beta, zero_beta)
-    elseif vs == 8
-        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(8), beta, zero_beta)
-    elseif vs == 16
-        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(16), beta, zero_beta)
-    else
-        CUDA.@cuda threads=threads blocks=blocks _csr_spmv_vector_kernel!(
-            pos, crd, nzval, x, y, origin_off, n_outer, Val(32), beta, zero_beta)
+            pos, crd, nzval, x, y, origin_off, n_outer, vsv, beta, zero_beta)
     end
     return true
+end
+
+# Lift a runtime `vs ∈ {2,4,8,16,32}` to a compile-time `Val(vs)` and call `f`.
+# Anything else is rejected — the kernel only specializes for these unroll widths.
+@inline function _vs_dispatch(f::F, vs::Int) where F
+    vs == 2  && return f(Val(2))
+    vs == 4  && return f(Val(4))
+    vs == 8  && return f(Val(8))
+    vs == 16 && return f(Val(16))
+    vs == 32 && return f(Val(32))
+    error("_vs_dispatch: vs=$vs not in {2,4,8,16,32}")
 end

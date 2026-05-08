@@ -1,12 +1,13 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 JLUST = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
+cuSPARSE = "b26da814-b3bc-49ef-b0ee-c816305aa060"
 
 [sources]
 JLUST = {path = ".."}

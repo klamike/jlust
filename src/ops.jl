@@ -97,15 +97,57 @@ const AxpbyOp          = Op{:Axpby}
 Givens rotation applied to sparse x and dense y.  cuSPARSE: `cusparseRot`. """
 const RotOp            = Op{:Rot}
 
+# ─── Aggregate / block-structure ops ─────────────────────────────────────────
+# Composite operations over aggregate matrices (BlockSparseMatrix,
+# BlockBandedMatrix).  Each is an Op tag like the atomic ones; `execute`
+# dispatches on the tag and the matrix's concrete type.
+
+"""    BlockSpMVOp(A_BlockSparseMatrix, x_fmt, y_fmt)
+Block sparse matrix × dense vector. """
+const BlockSpMVOp      = Op{:BlockSpMV}
+
+"""    BlockSpMMOp(A_BlockSparseMatrix, B_fmt, C_fmt)
+Block sparse matrix × dense matrix (multi-RHS / batched-mul). """
+const BlockSpMMOp      = Op{:BlockSpMM}
+
+"""    BBMSpMVOp(M_BlockBandedMatrix, x_fmt, y_fmt)
+Block-banded matrix × dense vector (multi-period DCOPF / MPC structure). """
+const BBMSpMVOp        = Op{:BBMSpMV}
+
 # Future ops follow the same pattern:
 #   const CholeskyOp = Op{:Cholesky}     # A = L·L'  (factorization)
 #   const LDLTOp     = Op{:LDLT}         # A = L·D·L'
 #   const LUOp       = Op{:LU}           # A = P·L·U
 
-# ─── Operation function declarations ─────────────────────────────────────────
+# ─── Unified execute entry point ─────────────────────────────────────────────
 #
-# Declared here so the full operation API is visible in one place.
-# Backend extensions (KernelAbstractionsExt, CUDAExt) add concrete methods.
+# `execute(backend_or_handle, op_or_op_type, args...; kw...)` is the single
+# canonical dispatch surface for op execution.  Backend extensions implement
+# *one* method per supported (backend, op) pair:
+#
+#     execute(::EmitterBackend, ::Op{:SpMV, Tuple{A,X,Y}}, u_A, u_x, u_y; kw...) where {A,X,Y} = ...
+#     execute(::CUSPARSEBackend, ::Op{:SpMM, Tuple{A,B,C}}, u_A, u_B, u_C; kw...) where {A,B,C} = ...
+#
+# Per-op named functions (sparse_mv!, sparse_mm!, …) are user-facing aliases —
+# they build the Op instance, resolve the backend via `default_backend`, and
+# delegate to `execute`.  Adding a new op is a Tag, an `execute` method per
+# backend, and a one-line wrapper.
+#
+# Handle paths use the same entry: `execute(handle, args...; kw...)` is the
+# overload backends define for amortized-analysis execution.
+function execute end
+
+# ─── Auxiliary function declarations ─────────────────────────────────────────
+#
+# All op execution flows through `execute` (declared above) — there are no
+# per-op named functions.  The two functions below are non-Op operations that
+# don't fit the (op, operands...) shape:
+#
+#   `apply_values!` is a sparsity-preserving in-place map (single tensor + a
+#   function).  No formats to capture in an Op tag.
+#
+#   `materialize` moves a tensor to a different device / changes index origin.
+#   It's a tensor transformation, not an algebraic op.
 
 function materialize end
 
@@ -117,101 +159,7 @@ Returns `u`. Does not change the sparsity structure.
 """
 function apply_values! end
 
-"""
-    sparse_mv!(A, x, y; backend, alpha=1, beta=0) -> y
-
-Compute `y = alpha * A * x + beta * y` where `A` is sparse and `x`, `y` are dense.
-Backend extensions add concrete methods dispatching on `backend` as a positional arg.
-"""
-function sparse_mv! end
-
-"""
-    sparse_mm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> C
-
-Compute `C = alpha * op(A) * op(B) + beta * C` where `A` is sparse, `B` and `C` are dense.
-"""
-function sparse_mm! end
-
-"""
-    sparse_vv(x, y; backend) -> Number
-
-Sparse vector dot product. `x` is sparse (COO-style), `y` is dense.
-"""
-function sparse_vv end
-
-"""
-    sparse_sv!(A, b, x; backend, uplo='L', diag='N', transa='N', alpha=1) -> x
-
-Sparse triangular solve: `A * x = alpha * b`. `b` and `x` are dense vectors.
-"""
-function sparse_sv! end
-
-"""
-    sparse_sm!(A, B, C; backend, uplo='L', diag='N', transa='N', alpha=1) -> C
-
-Sparse triangular solve with multiple RHS: solve `A * X = alpha * B`. `B`, `C` dense.
-"""
-function sparse_sm! end
-
-"""
-    sparse_sddmm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> C
-
-Sampled dense-dense matmul: `C = alpha * (op(A) * op(B)) ∘ sparsity(C) + beta * C`.
-`C` is sparse (mask); `A`, `B` are dense.
-"""
-function sparse_sddmm! end
-
-"""
-    sparse_gemm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> USTensor
-
-Compute sparse-sparse matrix product. Because SpGEMM may produce a result with a
-different sparsity structure than the input `C`, the returned USTensor may not share
-buffers with `C`. For beta=0 (default) `C` is used only for sizing; for beta≠0 `C`
-must already carry the exact sparsity pattern of op(A)*op(B).
-"""
-function sparse_gemm! end
-
-"""
-    sparse_to_dense(u; backend) -> USTensor{dense}
-
-Convert a sparse `USTensor` to a dense `USTensor`.
-"""
-function sparse_to_dense end
-
-"""
-    dense_to_sparse(u, fmt; backend) -> USTensor{sparse}
-
-Convert a dense `USTensor` to a sparse `USTensor` with format `fmt`.
-"""
-function dense_to_sparse end
-
-"""
-    sparse_gather!(y, x_dense; backend) -> y
-
-Gather: `y[idx] = x_dense[y.indices]` for a sparse vector `y`.
-"""
-function sparse_gather! end
-
-"""
-    sparse_scatter!(x_dense, y; backend) -> x_dense
-
-Scatter: `x_dense[y.indices] = y.values` for a sparse vector `y`.
-"""
-function sparse_scatter! end
-
-"""
-    sparse_axpby!(alpha, x, beta, y; backend) -> y
-
-Scale-and-add: `y = alpha * x + beta * y` where `x` is sparse, `y` is dense.
-"""
-function sparse_axpby! end
-
-"""
-    sparse_rot!(x, y, c, s; backend) -> (x, y)
-
-Apply Givens rotation to sparse `x` and dense `y`.
-"""
-function sparse_rot! end
+# ─── Handle / preparation API ────────────────────────────────────────────────
 
 """
     prepare(backend, OpType, u_A; kwargs...) -> handle
@@ -225,6 +173,8 @@ supports it) runs format analysis so subsequent calls pay no allocation or analy
 
     h = prepare(CUSPARSEBackend(), SpMVOp, u_A)
     h = prepare(CUSPARSEBackend(), SpMMOp, u_A; n_cols=k)
+
+Use `execute(handle, args...; kw...)` to invoke the prepared op.
 """
 function prepare end
 

@@ -72,9 +72,12 @@ _bbm_eltype(A::AbstractMatrix) = eltype(A)
 _bbm_eltype(A::AbstractVector) = eltype(first(A))
 Base.eltype(M::BlockBandedMatrix) = _bbm_eltype(M.diags)
 
-# ── mul! ──────────────────────────────────────────────────────────────────────
+# ── BBMSpMV: execute(BBMSpMVOp, M, x, y) ─────────────────────────────────────
+# `mul!(y, M::BlockBandedMatrix, x)` is a thin wrapper around `execute`.
 
-function LinearAlgebra.mul!(y::AbstractVector, M::BlockBandedMatrix, x::AbstractVector)
+function execute(::Type{<:Op{:BBMSpMV}}, M::BlockBandedMatrix,
+                 x::AbstractVector, y::AbstractVector;
+                 backend::Union{AbstractUSTBackend,Nothing}=nothing)
     (; diags, off_diags, T, bw, n_diag_rows, n_off_rows, n_cols, _buf, _spmm_bufs) = M
 
     cum_off  = cumsum([0; n_off_rows])
@@ -116,6 +119,10 @@ function LinearAlgebra.mul!(y::AbstractVector, M::BlockBandedMatrix, x::Abstract
 
     return y
 end
+
+LinearAlgebra.mul!(y::AbstractVector, M::BlockBandedMatrix, x::AbstractVector;
+                    backend::Union{AbstractUSTBackend,Nothing}=nothing) =
+    execute(BBMSpMVOp, M, x, y; backend=backend)
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -171,7 +178,7 @@ function _bbm_apply_diags!(y, diag::BlockSparseMatrix, x,
             b = diag.blocks[i, j]; b === nothing && continue
             needs_row_guard(b) && continue
             col_view = view(X2, diag._col_off[j]+1:diag._col_off[j+1], :)
-            sparse_mm!(b, col_view, row_bufs[i];
+            execute(SpMMOp, b, ust(col_view), ust(row_bufs[i]);
                        beta = first_dense ? zero(eltype(row_bufs[i])) : one(eltype(row_bufs[i])))
             first_dense = false
         end
@@ -182,10 +189,10 @@ function _bbm_apply_diags!(y, diag::BlockSparseMatrix, x,
             col_view = view(X2, diag._col_off[j]+1:diag._col_off[j+1], :)
             if first_dense
                 fill!(row_bufs[i], zero(eltype(row_bufs[i])))
-                sparse_mm!(b, col_view, row_bufs[i]; beta=0.0, skip_empty_rows=true)
+                execute(SpMMOp, b, ust(col_view), ust(row_bufs[i]); beta=0.0, skip_empty_rows=true)
                 first_dense = false
             else
-                sparse_mm!(b, col_view, row_bufs[i]; beta=1.0, skip_empty_rows=true)
+                execute(SpMMOp, b, ust(col_view), ust(row_bufs[i]); beta=1.0, skip_empty_rows=true)
             end
         end
         first_dense && fill!(row_bufs[i], zero(eltype(row_bufs[i])))

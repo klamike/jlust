@@ -65,37 +65,37 @@ end
 
 function bench_us(u_A, u_x, u_y, backend; samples=50)
     for _ in 1:3
-        sparse_mv!(u_A, u_x, u_y; backend=backend); CUDA.synchronize()
+        execute(SpMVOp, u_A, u_x, u_y; backend=backend); CUDA.synchronize()
     end
     @belapsed(begin
-        sparse_mv!($u_A, $u_x, $u_y; backend=$backend); CUDA.synchronize()
+        execute(SpMVOp, $u_A, $u_x, $u_y; backend=$backend); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_us_handle(h, u_x, u_y; samples=50)
     for _ in 1:3
-        sparse_mv!(h, u_x, u_y); CUDA.synchronize()
+        execute(SpMVOp, h, u_x, u_y); CUDA.synchronize()
     end
     @belapsed(begin
-        sparse_mv!($h, $u_x, $u_y); CUDA.synchronize()
+        execute(SpMVOp, $h, $u_x, $u_y); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_mm_us(u_A, u_B, u_C, backend; samples=50)
     for _ in 1:3
-        sparse_mm!(u_A, u_B, u_C; backend=backend); CUDA.synchronize()
+        execute(SpMMOp, u_A, u_B, u_C; backend=backend); CUDA.synchronize()
     end
     @belapsed(begin
-        sparse_mm!($u_A, $u_B, $u_C; backend=$backend); CUDA.synchronize()
+        execute(SpMMOp, $u_A, $u_B, $u_C; backend=$backend); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_mm_us_handle(h, u_B, u_C; samples=50)
     for _ in 1:3
-        sparse_mm!(h, u_B, u_C); CUDA.synchronize()
+        execute(SpMMOp, h, u_B, u_C); CUDA.synchronize()
     end
     @belapsed(begin
-        sparse_mm!($h, $u_B, $u_C); CUDA.synchronize()
+        execute(SpMMOp, $h, $u_B, $u_C); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
@@ -132,11 +132,11 @@ end
 function bench_dcsr_via_cusparse(u_dcsr, u_x, u_y; samples=30)
     for _ in 1:3
         u_csr = dcsr_to_csr_gpu(u_dcsr)
-        sparse_mv!(u_csr, u_x, u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
+        execute(SpMVOp, u_csr, u_x, u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
     end
     u_csr = dcsr_to_csr_gpu($u_dcsr) # NOTE: intentionally moved out
     @belapsed(begin
-        sparse_mv!($u_csr, $u_x, $u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
+        execute(SpMVOp, $u_csr, $u_x, $u_y; backend=CUSPARSEBackend()); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
@@ -217,11 +217,11 @@ end
 function bench_dcsr_mm_via_cusparse(u_dcsr, u_B, u_C; samples=20)
     for _ in 1:3
         u_csr = dcsr_to_csr_gpu(u_dcsr)
-        sparse_mm!(u_csr, u_B, u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
+        execute(SpMMOp, u_csr, u_B, u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
     end
     u_csr = dcsr_to_csr_gpu($u_dcsr) # NOTE: intentionally moved out
     @belapsed(begin
-        sparse_mm!($u_csr, $u_B, $u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
+        execute(SpMMOp, $u_csr, $u_B, $u_C; backend=CUSPARSEBackend()); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
@@ -282,23 +282,23 @@ end
 #           EmitterBackend (JIT kernel).
 
 function bench_sddmm_direct(u_A, u_B, u_C; samples=50)
-    for _ in 1:3; sparse_sddmm!(CUSPARSEBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
+    for _ in 1:3; execute(SDDMMOp, CUSPARSEBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
     @belapsed(begin
-        sparse_sddmm!(CUSPARSEBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
+        execute(SDDMMOp, CUSPARSEBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_sddmm_handle(h, u_A, u_B, u_C; samples=50)
-    for _ in 1:3; sparse_sddmm!(h, u_A, u_B, u_C); CUDA.synchronize(); end
+    for _ in 1:3; execute(SDDMMOp, h, u_A, u_B, u_C); CUDA.synchronize(); end
     @belapsed(begin
-        sparse_sddmm!($h, $u_A, $u_B, $u_C); CUDA.synchronize()
+        execute(SDDMMOp, $h, $u_A, $u_B, $u_C); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_sddmm_emit(u_A, u_B, u_C; samples=50)
-    for _ in 1:3; sparse_sddmm!(EmitterBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
+    for _ in 1:3; execute(SDDMMOp, EmitterBackend(), u_A, u_B, u_C); CUDA.synchronize(); end
     @belapsed(begin
-        sparse_sddmm!(EmitterBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
+        execute(SDDMMOp, EmitterBackend(), $u_A, $u_B, $u_C); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
@@ -353,28 +353,28 @@ end
 #           EmitterBackend (scatter-sort-reduce per call).
 
 function bench_gemm_direct(u_A, u_B, u_C_templ; samples=30)
-    for _ in 1:3; sparse_gemm!(CUSPARSEBackend(), u_A, u_B, u_C_templ); CUDA.synchronize(); end
+    for _ in 1:3; execute(SpGEMMOp, CUSPARSEBackend(), u_A, u_B, u_C_templ); CUDA.synchronize(); end
     @belapsed(begin
-        sparse_gemm!(CUSPARSEBackend(), $u_A, $u_B, $u_C_templ); CUDA.synchronize()
+        execute(SpGEMMOp, CUSPARSEBackend(), $u_A, $u_B, $u_C_templ); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_gemm_handle(h; samples=30)
-    for _ in 1:3; sparse_gemm!(h); CUDA.synchronize(); end
-    @belapsed(begin; sparse_gemm!($h); CUDA.synchronize(); end,
+    for _ in 1:3; execute(SpGEMMOp, h); CUDA.synchronize(); end
+    @belapsed(begin; execute(SpGEMMOp, $h); CUDA.synchronize(); end,
               samples=samples, evals=1) * 1e6
 end
 
 function bench_gemm_emit(u_A, u_B; samples=30)
-    for _ in 1:3; sparse_gemm!(EmitterBackend(), u_A, u_B); CUDA.synchronize(); end
+    for _ in 1:3; execute(SpGEMMOp, EmitterBackend(), u_A, u_B); CUDA.synchronize(); end
     @belapsed(begin
-        sparse_gemm!(EmitterBackend(), $u_A, $u_B); CUDA.synchronize()
+        execute(SpGEMMOp, EmitterBackend(), $u_A, $u_B); CUDA.synchronize()
     end, samples=samples, evals=1) * 1e6
 end
 
 function bench_gemm_emit_handle(h, u_A, u_B; samples=30)
-    for _ in 1:3; sparse_gemm!(h, u_A, u_B); CUDA.synchronize(); end
-    @belapsed(begin; sparse_gemm!($h, $u_A, $u_B); CUDA.synchronize(); end,
+    for _ in 1:3; execute(SpGEMMOp, h, u_A, u_B); CUDA.synchronize(); end
+    @belapsed(begin; execute(SpGEMMOp, $h, $u_A, $u_B); CUDA.synchronize(); end,
               samples=samples, evals=1) * 1e6
 end
 

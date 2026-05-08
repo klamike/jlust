@@ -7,7 +7,7 @@
 
 # ─── Handle ──────────────────────────────────────────────────────────────────
 
-mutable struct CUSPARSESpSMHandle{T}
+mutable struct CUSPARSESpSMHandle{T} <: JLUST.AbstractKernelHandle
     spmat_desc :: CuSparseMatrixDescriptor
     dnmat_B    :: CuDenseMatrixDescriptor   # RHS (input)
     dnmat_C    :: CuDenseMatrixDescriptor   # solution (output)
@@ -27,34 +27,26 @@ function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpSM}},
                         n_cols::Int=1, alpha=one(T)) where {T<:_CUSPARSE_ELTYPES, Ti}
     idx  = _cusparse_index(u_A)
     m, _ = Int64.(extents(u_A))
-    cusA = _to_cuspmat(u_A)
-
-    descA = CuSparseMatrixDescriptor(cusA, idx)
-    cusparse_uplo = Ref{cusparseFillMode_t}(uplo)
-    cusparse_diag = Ref{cusparseDiagType_t}(diag)
+    descA = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
     cusparseSpMatSetAttribute(descA, CUSPARSE_SPMAT_FILL_MODE,
-                               cusparse_uplo, Csize_t(sizeof(cusparse_uplo)))
+                               Ref{cusparseFillMode_t}(uplo), Csize_t(sizeof(cusparseFillMode_t)))
     cusparseSpMatSetAttribute(descA, CUSPARSE_SPMAT_DIAG_TYPE,
-                               cusparse_diag, Csize_t(sizeof(cusparse_diag)))
+                               Ref{cusparseDiagType_t}(diag), Csize_t(sizeof(cusparseDiagType_t)))
 
     # Placeholder dense matrices (cuSPARSE only reads dimensions during analysis).
-    B_tmp = CUDA.zeros(T, m, n_cols)
-    C_tmp = CUDA.zeros(T, m, n_cols)
-    descB = CuDenseMatrixDescriptor(B_tmp)
-    descC = CuDenseMatrixDescriptor(C_tmp)
-
+    descB = CuDenseMatrixDescriptor(CUDA.zeros(T, m, n_cols))
+    descC = CuDenseMatrixDescriptor(CUDA.zeros(T, m, n_cols))
     algo      = CUSPARSE_SPSM_ALG_DEFAULT
     spsm_desc = CuSparseSpSMDescriptor()
-    alpha_ref = Ref{T}(T(alpha))
+    α_ref     = Ref{T}(T(alpha))
 
-    buf_sz = Ref{Csize_t}(0)
-    cusparseSpSM_bufferSize(handle(), transa, transb, alpha_ref, descA, descB, descC,
-                             T, algo, spsm_desc, buf_sz)
-    ws = CUDA.zeros(UInt8, max(1, Int(buf_sz[])))
-
-    cusparseSpSM_analysis(handle(), transa, transb, alpha_ref, descA, descB, descC,
-                           T, algo, spsm_desc, ws)
-
+    ws = _cusparse_workspace() do buf_sz, buf
+        if buf === CUDA.CU_NULL
+            cusparseSpSM_bufferSize(handle(), transa, transb, α_ref, descA, descB, descC, T, algo, spsm_desc, buf_sz)
+        else
+            cusparseSpSM_analysis(handle(), transa, transb, α_ref, descA, descB, descC, T, algo, spsm_desc, buf)
+        end
+    end
     CUSPARSESpSMHandle{T}(descA, descB, descC, spsm_desc, ws, transa, transb, algo)
 end
 
@@ -65,12 +57,11 @@ end
 
 # ─── Execution ────────────────────────────────────────────────────────────────
 
-# Direct path
-function JLUST.sparse_sm!(::CUSPARSEBackend,
-                           u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
-                           transa::Char='N', transb::Char='N',
-                           uplo::Char='L', diag::Char='N',
-                           alpha=one(T)) where {T<:_CUSPARSE_ELTYPES, Ti}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:SpSM, F_op},
+                       u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
+                       transa::Char='N', transb::Char='N',
+                       uplo::Char='L', diag::Char='N',
+                       alpha=one(T)) where {F_op, T<:_CUSPARSE_ELTYPES, Ti}
     cusA = _to_cuspmat(u_A)
     idx  = _cusparse_index(u_A)
     CUSPARSE.sm!(transa, transb, uplo, diag, T(alpha), cusA,
@@ -78,16 +69,14 @@ function JLUST.sparse_sm!(::CUSPARSEBackend,
     return u_C
 end
 
-# Handle path — only updates dense data pointers; no descriptor rebuild.
-function JLUST.sparse_sm!(h::CUSPARSESpSMHandle{T},
-                           u_B::USTensor, u_C::USTensor;
-                           alpha=one(T)) where T
-    cusparseDnMatSetValues(h.dnmat_B, nonzeros(u_B))
-    cusparseDnMatSetValues(h.dnmat_C, nonzeros(u_C))
-    cusparseSpSM_solve(
-        handle(), h.transa, h.transb, Ref{T}(T(alpha)),
-        h.spmat_desc, h.dnmat_B, h.dnmat_C,
-        T, h.algo, h.spsm_desc)
+function JLUST.execute(h::CUSPARSESpSMHandle{T},
+                       u_B::USTensor, u_C::USTensor;
+                       alpha=one(T)) where T
+    _cusparse_set_dense!(h.dnmat_B, nonzeros(u_B))
+    _cusparse_set_dense!(h.dnmat_C, nonzeros(u_C))
+    cusparseSpSM_solve(handle(), h.transa, h.transb, Ref{T}(T(alpha)),
+                       h.spmat_desc, h.dnmat_B, h.dnmat_C,
+                       T, h.algo, h.spsm_desc)
     return u_C
 end
 

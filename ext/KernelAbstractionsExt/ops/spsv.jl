@@ -9,6 +9,6 @@
 
 JLUST.supports_backend(::EmitterBackend, ::Op{:SpSV}) = false
 
-function JLUST.sparse_sv!(::EmitterBackend, u_A::USTensor, u_b::USTensor, u_x::USTensor; kw...)
+function JLUST.execute(::EmitterBackend, ::Op{:SpSV}, u_A::USTensor, u_b::USTensor, u_x::USTensor; kw...)
     error("EmitterBackend does not support sparse_sv! — use CUSPARSEBackend() instead.")
 end

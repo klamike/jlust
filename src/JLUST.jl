@@ -43,6 +43,7 @@ export
 
     # Backend API
     AbstractUSTBackend,
+    AbstractKernelHandle,
     AbstractUSTOp, Op,
     SpVVOp, SpMVOp, SpMMOp, BatchedSpMMOp, SpGEMMOp,
     SpSVOp, SpSMOp, SDDMMOp,
@@ -75,12 +76,11 @@ export
     _coo_spmv_specialized!,
     _csr_spmv_specialized!,
 
-    # Execution (methods added by backend extensions)
+    # Execution
+    #   `execute(OpType, args...; backend, kw...)` — canonical entry point.
+    #   `execute(handle, args...; kw...)` — prepared-handle path.
+    execute,
     apply_values!,
-    sparse_mv!, sparse_mm!, sparse_gemm!,
-    sparse_vv, sparse_sv!, sparse_sm!, sparse_sddmm!,
-    sparse_to_dense, dense_to_sparse,
-    sparse_gather!, sparse_scatter!, sparse_axpby!, sparse_rot!,
     prepare, update_values!,
 
     # Custom level format constructor helper

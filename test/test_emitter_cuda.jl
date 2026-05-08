@@ -57,7 +57,7 @@ end
     u_x = dense_cuvec([1.0, 2.0, 3.0])
     u_y = dense_cuvec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend_cuda())
     @test Array(nonzeros(u_y)) ≈ [7.0, 6.0, 19.0]
 end
 
@@ -78,7 +78,7 @@ end
     u_x = dense_cuvec([1.0, 2.0, 3.0])
     u_y = dense_cuvec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend_cuda())
     @test Array(nonzeros(u_y)) ≈ [7.0, 0.0, 19.0]
 end
 
@@ -98,7 +98,7 @@ end
     u_x = dense_cuvec([1.0, 2.0, 3.0])
     u_y = dense_cuvec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend_cuda())
     @test Array(nonzeros(u_y)) ≈ [7.0, 6.0, 19.0]
 end
 
@@ -131,7 +131,7 @@ end
         C_cu, nothing,
     )
 
-    sparse_mm!(u_A, u_B, u_C; backend=EmitterBackend_cuda())
+    execute(SpMMOp, u_A, u_B, u_C; backend=EmitterBackend_cuda())
     @test Array(nonzeros(u_C)) ≈ [1.0 6.0; 6.0 3.0; 4.0 15.0]
 end
 
@@ -162,7 +162,7 @@ end
         nzval, nothing,
     )
 
-    sparse_sddmm!(u_A, u_B, u_C; backend=EmitterBackend_cuda(), beta=0.0)
+    execute(SDDMMOp, u_A, u_B, u_C; backend=EmitterBackend_cuda(), beta=0.0)
     @test Array(nonzeros(u_C)) ≈ [1.0, 1.0, 1.0, 1.0, 2.0]
 end
 
@@ -180,7 +180,7 @@ end
         nzval, nothing,
     )
 
-    u_D = sparse_to_dense(u_A; backend=EmitterBackend_cuda())
+    u_D = execute(SparseToDenseOp, u_A; backend=EmitterBackend_cuda())
     @test format(u_D) == Formats.DensedRight(2)
     @test Array(nonzeros(u_D)) ≈ [1.0 0.0 2.0; 0.0 3.0 0.0; 4.0 0.0 5.0]
 end
@@ -207,7 +207,7 @@ _fuse_addone(x::Float64) = x + 1.0
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
     u_y = dense_cuvec(zeros(Float64, 2))
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda(), input_fn=_fuse_double)
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend_cuda(), input_fn=_fuse_double)
     @test Array(nonzeros(u_y)) ≈ [14.0, 12.0]
 end
 
@@ -225,7 +225,7 @@ end
     )
     u_x = dense_cuvec([1.0, 2.0, 3.0])
     u_y = dense_cuvec(zeros(Float64, 2))
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend_cuda(), output_fn=_fuse_addone)
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend_cuda(), output_fn=_fuse_addone)
     @test Array(nonzeros(u_y)) ≈ [8.0, 7.0]
 end
 
@@ -248,12 +248,12 @@ end
                  input_fn=_fuse_double, output_fn=_fuse_addone)
     @test h isa _kaext_cuda.EmitterSpMVHandle
 
-    sparse_mv!(h, u_A, u_x, u_y)
+    execute(SpMVOp, h, u_A, u_x, u_y)
     @test Array(nonzeros(u_y)) ≈ [15.0, 13.0]
 
     # Second call reuses compiled kernel — result must be stable
     fill!(nonzeros(u_y), 0.0)
-    sparse_mv!(h, u_A, u_x, u_y)
+    execute(SpMVOp, h, u_A, u_x, u_y)
     @test Array(nonzeros(u_y)) ≈ [15.0, 13.0]
 end
 
@@ -280,7 +280,7 @@ end
     nzval  = CuArray(Float64[1.0, 2.0, 3.0])
     u_A = csr_tensor(rowptr, colval, nzval; m=2, n=3)
     x = CuArray([1.0, 2.0, 3.0]); y = CUDA.zeros(Float64, 2)
-    sparse_mv!(EmitterBackend_cuda(), u_A, x, y)
+    execute(SpMVOp, EmitterBackend_cuda(), u_A, x, y)
     @test Array(y) ≈ [7.0, 6.0]
 end
 

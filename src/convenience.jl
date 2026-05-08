@@ -1,100 +1,56 @@
 import LinearAlgebra
 
-# ─── No-backend convenience wrappers ─────────────────────────────────────────
+# ─── Generic execute dispatcher ──────────────────────────────────────────────
 #
-# Each op's no-backend wrapper consults `default_backend(u, OpTag)` to pick
-# the right backend.  Extensions override `default_backend` per (storage, op)
-# combination — e.g. CUDAExt selects CUSPARSEBackend for SpMM on CuArray-backed
-# tensors but stays on EmitterBackend for SpMV.  This is the single point of
-# truth for backend-selection policy; extensions never override these wrappers.
-
-function sparse_mv!(A::USTensor, x::USTensor, y::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(A, SpMVOp))
-    sparse_mv!(be, A, x, y; kw...)
-end
-
-function sparse_mm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(A, SpMMOp))
-    sparse_mm!(be, A, B, C; kw...)
-end
-
-function sparse_gemm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(A, SpGEMMOp))
-    sparse_gemm!(be, A, B, C; kw...)
-end
-
-function sparse_sv!(A::USTensor, b::USTensor, x::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(A, SpSVOp))
-    sparse_sv!(be, A, b, x; kw...)
-end
-
-function sparse_sm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(A, SpSMOp))
-    sparse_sm!(be, A, B, C; kw...)
-end
-
-function sparse_sddmm!(A::USTensor, B::USTensor, C::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(C, SDDMMOp))   # C is the sparse arg
-    sparse_sddmm!(be, A, B, C; kw...)
-end
-
-function sparse_to_dense(u::USTensor; backend=nothing, kw...)
-    be = something(backend, default_backend(u, SparseToDenseOp))
-    sparse_to_dense(be, u; kw...)
-end
-
-# ─── Accept AbstractMatrix / AbstractVector ─────────────────────────────────
+# `execute(OpType, args...; backend, kw...)` is the single user-facing entry.
+# It builds the op instance (capturing operand format types), resolves the
+# backend via `default_backend`, and delegates to the backend's
+# `execute(::Backend, ::Op{:Tag, ...}, args...)` method.
 #
-# Wraps raw arrays as dense USTensors (DensedRight(N) format) so callers can
-# pass plain Matrix / CuMatrix / Vector / CuVector without manual wrapping.
+# Adding a new op needs only:
+#   const NewOp = Op{:NewName}
+#   default_backend(::USTensor, ::Type{NewOp}) = ...   (optional override)
+#   execute(::Backend, ::Op{:NewName, ...}, args...) = ...   (per backend)
 
-function sparse_mm!(be::AbstractUSTBackend, A::USTensor,
-                    B::AbstractMatrix, C::AbstractMatrix; kw...)
-    sparse_mm!(be, A, ust(B), ust(C); kw...)
-end
-function sparse_mm!(A::USTensor, B::AbstractMatrix, C::AbstractMatrix; kw...)
-    sparse_mm!(A, ust(B), ust(C); kw...)
-end
-
-function sparse_mv!(be::AbstractUSTBackend, A::USTensor,
-                    x::AbstractVector, y::AbstractVector; kw...)
-    sparse_mv!(be, A, ust(x), ust(y); kw...)
-end
-function sparse_mv!(A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
-    sparse_mv!(A, ust(x), ust(y); kw...)
+@inline function execute(::Type{OT}, args::USTensor...; backend=nothing, kw...) where {OT<:Op}
+    be = something(backend, default_backend(args[1], OT))
+    execute(be, OT(format.(args)...), args...; kw...)
 end
 
-function sparse_mv!(h, A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
-    sparse_mv!(h, A, ust(x), ust(y); kw...)
+# SDDMM: A and B are dense, C is the sparse mask.  Backend selection follows
+# C's storage, not A's.  This is the only op where the "primary" tensor is
+# not the first argument.
+@inline function execute(::Type{OT}, A::USTensor, B::USTensor, C::USTensor;
+                          backend=nothing, kw...) where {OT<:Op{:SDDMM}}
+    be = something(backend, default_backend(C, OT))
+    execute(be, OT(format(A), format(B), format(C)), A, B, C; kw...)
 end
 
-# ─── LinearAlgebra compatibility for USTensor ─────────────────────────────────
+# Accept raw AbstractMatrix / AbstractVector by wrapping as dense USTensors.
+@inline execute(::Type{OT}, A::USTensor, x::AbstractVector, y::AbstractVector; kw...) where {OT<:Op} =
+    execute(OT, A, ust(x), ust(y); kw...)
+@inline execute(::Type{OT}, A::USTensor, B::AbstractMatrix, C::AbstractMatrix; kw...) where {OT<:Op} =
+    execute(OT, A, ust(B), ust(C); kw...)
+
+# Op-tag shim for handle-driven calls: `execute(SpMVOp, h, x, y; …)` routes to
+# the handle's own `execute(h, x, y; …)`.  The op tag is informational here —
+# the handle already encodes both op and operand formats — so it is dropped.
+@inline execute(::Type{<:Op}, h::AbstractKernelHandle, args...; kw...) =
+    execute(h, args...; kw...)
+
+# ─── LinearAlgebra integration ────────────────────────────────────────────────
 #
-# mul!(y, A, x) and A*x delegate to sparse_mv! with the default backend.
-# The default backend is resolved at call time via the KernelAbstractionsExt
-# method `sparse_mv!(A::USTensor, x::USTensor, y::USTensor; backend=...)`.
+# `mul!` and `*` route through execute so users get the unified API even when
+# calling through Base/LinearAlgebra interfaces.
 
-function LinearAlgebra.mul!(y::AbstractVector, A::USTensor, x::AbstractVector)
-    sparse_mv!(A, x, y)
-    return y
-end
-
-function LinearAlgebra.mul!(y::AbstractVector, A::USTensor, x::AbstractVector,
-                             alpha::Number, beta::Number)
-    sparse_mv!(A, x, y; alpha=alpha, beta=beta)
-    return y
-end
-
-function LinearAlgebra.mul!(C::AbstractMatrix, A::USTensor, B::AbstractMatrix)
-    sparse_mm!(A, ust(B), ust(C))
-    return C
-end
-
-function LinearAlgebra.mul!(C::AbstractMatrix, A::USTensor, B::AbstractMatrix,
-                             alpha::Number, beta::Number)
-    sparse_mm!(A, ust(B), ust(C); alpha=alpha, beta=beta)
-    return C
-end
+LinearAlgebra.mul!(y::AbstractVector, A::USTensor, x::AbstractVector) =
+    (execute(SpMVOp, A, ust(x), ust(y)); y)
+LinearAlgebra.mul!(y::AbstractVector, A::USTensor, x::AbstractVector, alpha::Number, beta::Number) =
+    (execute(SpMVOp, A, ust(x), ust(y); alpha=alpha, beta=beta); y)
+LinearAlgebra.mul!(C::AbstractMatrix, A::USTensor, B::AbstractMatrix) =
+    (execute(SpMMOp, A, ust(B), ust(C)); C)
+LinearAlgebra.mul!(C::AbstractMatrix, A::USTensor, B::AbstractMatrix, alpha::Number, beta::Number) =
+    (execute(SpMMOp, A, ust(B), ust(C); alpha=alpha, beta=beta); C)
 
 function Base.:*(A::USTensor, x::AbstractVector)
     y = similar(nonzeros(A), size(A, 1))

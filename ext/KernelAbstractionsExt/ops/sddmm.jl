@@ -37,30 +37,18 @@ end
 
 _emit_sddmm_body(fmt::TensorFormat, T) = _emit_sddmm_body(fmt.levels, T)
 
-# ─── @generated SDDMM kernel ─────────────────────────────────────────────────
+# ─── SDDMM kernel singleton ──────────────────────────────────────────────────
 
-@generated function _ust_sddmm_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
-    LT          = FMT.parameters[1]
-    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
-    sparse_nms  = _sparse_arg_names_for_levels(levels)
-    standard_nm = (:_A, :_B, :_alpha, :_beta, :_origin_off, :_n_outer, :_n_inner)
-    all_nms     = (sparse_nms..., standard_nm...)
-    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
-    body        = _emit_sddmm_body(levels, T)
-    quote
-        @inbounds begin
-            $(bindings...)
-            $body
-        end
-        return nothing
-    end
-end
+struct _SDDMMKern end
+_kern_standard_nms(::_SDDMMKern) =
+    (:_A, :_B, :_alpha, :_beta, :_origin_off, :_n_outer, :_n_inner)
+_kern_emit_body(::_SDDMMKern, levels, ::Type{T}) where T = _emit_sddmm_body(levels, T)
 
 # ─── sparse_sddmm! ────────────────────────────────────────────────────────────
 
-function JLUST.sparse_sddmm!(::EmitterBackend,
-                               u_A::USTensor{T}, u_B::USTensor, u_C::USTensor;
-                               alpha=one(T), beta=zero(T)) where T
+function JLUST.execute(::EmitterBackend, ::Op{:SDDMM, F},
+                       u_A::USTensor{T}, u_B::USTensor, u_C::USTensor;
+                       alpha=one(T), beta=zero(T)) where {F, T}
     fmt     = format(u_C)
     ka      = KernelAbstractions.get_backend(nonzeros(u_C))
     off     = Int32(index_origin(u_C) isa OneBased ? 1 : 0)
@@ -68,10 +56,10 @@ function JLUST.sparse_sddmm!(::EmitterBackend,
     n_inner = Int32(size(nonzeros(u_A), 2))   # cols of A = shared inner dimension
 
     sparse_bufs = _sparse_args(u_C)
-    args = (typeof(fmt), T,
+    args = (_SDDMMKern(), typeof(fmt), T,
             sparse_bufs..., nonzeros(u_A), nonzeros(u_B),
             T(alpha), T(beta), off, n_outer, n_inner)
-    _launch_kern(ka, _ust_sddmm_kern, args, Int(n_outer))
+    _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
 
     return u_C
 end

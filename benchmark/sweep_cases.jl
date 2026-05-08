@@ -122,13 +122,18 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
     t_jlust_s2 = @belapsed(begin mul!($y_bm, $BM, $x_bm); $sync() end,
                             samples=n_s2, evals=1) * 1e6
 
-    # §2: CUDA Graph
+    # §2: CUDA Graph (best-effort; some graphs fail to relaunch on certain CUDA stacks)
     t_graph_s2 = if HAS_CUDA
-        g = CUDA.capture() do; mul!(y_bm, BM, x_bm); end
-        e = CUDA.instantiate(g)
-        CUDA.launch(e); CUDA.synchronize()
-        @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
-                  samples=n_s2, evals=1) * 1e6
+        try
+            g = CUDA.capture() do; mul!(y_bm, BM, x_bm); end
+            e = CUDA.instantiate(g)
+            CUDA.launch(e); CUDA.synchronize()
+            @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
+                      samples=n_s2, evals=1) * 1e6
+        catch err
+            @warn "§2 CUDA Graph skipped" exception=(err, catch_backtrace())
+            NaN
+        end
     else
         NaN
     end
@@ -142,8 +147,8 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
         u_x_h    = ust(CUDA.CuArray(Vector{FloatType}(x_bm)))
         u_y_h    = ust(CUDA.zeros(FloatType, n_con))
         h_sp2    = prepare(CUSPARSEBackend(), SpMVOp, u_A_full)
-        sparse_mv!(h_sp2, u_x_h, u_y_h); CUDA.synchronize()
-        @belapsed(begin sparse_mv!($h_sp2, $u_x_h, $u_y_h); CUDA.synchronize() end,
+        execute(h_sp2, u_x_h, u_y_h); CUDA.synchronize()
+        @belapsed(begin execute($h_sp2, $u_x_h, $u_y_h); CUDA.synchronize() end,
                   samples=n_s2, evals=1) * 1e6
     else
         NaN
@@ -167,28 +172,47 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
     t_jlust_s3 = @belapsed(begin mul!($y_ms, $BM_ms, $x_ms); $sync() end,
                             samples=n_s3, evals=1) * 1e6
 
-    # §3: CUDA Graph
+    # §3: CUDA Graph (best-effort)
     t_graph_s3 = if HAS_CUDA
-        g = CUDA.capture() do; mul!(y_ms, BM_ms, x_ms); end
-        e = CUDA.instantiate(g)
-        CUDA.launch(e); CUDA.synchronize()
-        @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
-                  samples=n_s3, evals=1) * 1e6
+        try
+            g = CUDA.capture() do; mul!(y_ms, BM_ms, x_ms); end
+            e = CUDA.instantiate(g)
+            CUDA.launch(e); CUDA.synchronize()
+            @belapsed(begin CUDA.launch($e); CUDA.synchronize() end,
+                      samples=n_s3, evals=1) * 1e6
+        catch err
+            @warn "§3 CUDA Graph skipped" exception=(err, catch_backtrace())
+            NaN
+        end
     else
         NaN
     end
 
-    # §3: serial cuSPARSE handle reference (T calls on single-period matrix)
+    # §3: cuSPARSE handle on the full T-period block-banded CSR — apples-to-apples
+    # vs the BBM mul!.  Builds the exact banded matrix BBM_ms represents:
+    #   [D₁; (-R | +R); D₂; (-R | +R); …; D_T]   (D_t = A_cpu, off-diag = ±R coupling)
     t_cusparse_s3 = if HAS_CUDA
-        u_A_per = ust(CUDA.CUSPARSE.CuSparseMatrixCSR(FloatType.(A_cpu)))
-        u_xp    = ust(CUDA.randn(FloatType, n_var))
-        u_yp    = ust(CUDA.zeros(FloatType, n_con))
-        h_sp3   = prepare(CUSPARSEBackend(), SpMVOp, u_A_per)
-        sparse_mv!(h_sp3, u_xp, u_yp); CUDA.synchronize()
-        @belapsed(begin
-            for _ in 1:$T; sparse_mv!($h_sp3, $u_xp, $u_yp); end
-            CUDA.synchronize()
-        end, samples=10, evals=1) * 1e6
+        chunks = SparseMatrixCSC{FloatType,Int}[]
+        for t in 1:T
+            row = spzeros(FloatType, n_con, n_col_ms)
+            row[:, (t-1)*n_var+1 : t*n_var] = sparse(A_cpu)
+            push!(chunks, row)
+            if t < T
+                off = spzeros(FloatType, n_rmp, n_col_ms)
+                off[:, (t-1)*n_var+1 : t*n_var]     = -R_cpu
+                off[:, t*n_var+1     : (t+1)*n_var] =  R_cpu
+                push!(chunks, off)
+            end
+        end
+        BBM_full = vcat(chunks...)
+
+        u_A_bbm = ust(CUDA.CUSPARSE.CuSparseMatrixCSR(BBM_full))
+        u_xb    = ust(CUDA.randn(FloatType, n_col_ms))
+        u_yb    = ust(CUDA.zeros(FloatType, n_row_ms))
+        h_sp3   = prepare(CUSPARSEBackend(), SpMVOp, u_A_bbm)
+        execute(h_sp3, u_xb, u_yb); CUDA.synchronize()
+        @belapsed(begin execute($h_sp3, $u_xb, $u_yb); CUDA.synchronize() end,
+                  samples=n_s3, evals=1) * 1e6
     else
         NaN
     end
@@ -201,8 +225,8 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
     end
 
     (; n_bus, n_line, n_gen,
-       t_cusparse_s2, t_graph_s2,
-       t_cusparse_s3, t_graph_s3,
+       t_cusparse_s2, t_graph_s2, t_jlust_s2,
+       t_cusparse_s3, t_graph_s3, t_jlust_s3,
        ok)
 end
 
@@ -225,11 +249,18 @@ println("="^72)
 println("JLUST multi-case sweep   (T=24, $(FloatType), $_backend)")
 println("="^72)
 println()
-@printf("  %-18s  %6s  │  §2 single DCOPF (μs)       │  §3 per period (μs)\n",
+@printf("  %-18s  %6s  │  §2 single DCOPF (μs)                │  §3 per period (μs)\n",
         "Case", "buses")
-@printf("  %-18s  %6s  │  %8s  %8s  %7s  │  %8s  %8s  %7s  %s\n",
-        "", "", "cuSP-h", "Graph", "speedup", "cuSP-h", "Graph", "speedup", "ok")
-println("  " * "─"^70)
+@printf("  %-18s  %6s  │  %8s  %8s  %8s  %7s  │  %8s  %8s  %8s  %7s  %s\n",
+        "", "", "cuSP-h", "JLUST", "Graph", "speedup",
+                "cuSP-h", "JLUST", "Graph", "speedup", "ok")
+println("  " * "─"^88)
+
+_fmt_or_dash(t) = isnan(t) ? "      — " : @sprintf("%8.2f", t)
+function _speedup(num, den)
+    (isnan(num) || isnan(den) || den == 0) && return "    —  "
+    @sprintf("%5.2f×", num / den)
+end
 
 results = Pair{String,Any}[]
 for case in CASES
@@ -239,18 +270,27 @@ for case in CASES
     r = bench_case(case)
     push!(results, case => r)
 
-    sp2 = isnan(r.t_cusparse_s2) ? "    —  " : @sprintf("%5.2f×", r.t_cusparse_s2 / r.t_graph_s2)
-    sp3 = isnan(r.t_cusparse_s3) ? "    —  " : @sprintf("%5.2f×", r.t_cusparse_s3 / r.t_graph_s3)
-    ok  = r.ok ? "✓" : "✗"
+    sp2_jl    = _speedup(r.t_cusparse_s2, r.t_jlust_s2)
+    sp3_jl    = _speedup(r.t_cusparse_s3, r.t_jlust_s3)
+    ok        = r.ok ? "✓" : "✗"
 
-    @printf("%6d  │  %8.2f  %8.2f  %7s  │  %8.2f  %8.2f  %7s  %s\n",
+    @printf("%6d  │  %s  %s  %s  %7s  │  %s  %s  %s  %7s  %s\n",
             r.n_bus,
-            r.t_cusparse_s2, r.t_graph_s2, sp2,
-            r.t_cusparse_s3/24, r.t_graph_s3/24, sp3,
+            _fmt_or_dash(r.t_cusparse_s2),
+            _fmt_or_dash(r.t_jlust_s2),
+            _fmt_or_dash(r.t_graph_s2),
+            sp2_jl,
+            _fmt_or_dash(r.t_cusparse_s3 / 24),
+            _fmt_or_dash(r.t_jlust_s3   / 24),
+            _fmt_or_dash(r.t_graph_s3   / 24),
+            sp3_jl,
             ok)
     flush(stdout)
 end
 
-println("  " * "─"^70)
+println("  " * "─"^88)
 println()
-println("  cuSP-h = cuSPARSE prepared handle.  Graph = JLUST CUDA graph.")
+println("  cuSP-h  = cuSPARSE handle on the full T-period block-banded CSR.")
+println("  JLUST   = LinearAlgebra.mul! through JLUST (direct dispatch, no graph).")
+println("  Graph   = JLUST captured into a CUDA Graph (NaN if the stack rejects relaunch).")
+println("  speedup = cuSP-h / JLUST.")

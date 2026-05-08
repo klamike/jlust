@@ -1,7 +1,8 @@
 # ─── cuSPARSE format conversions ─────────────────────────────────────────────
 
 # sparse_to_dense: CSR, CSC, or COO → dense CuMatrix wrapped as a USTensor.
-function JLUST.sparse_to_dense(::CUSPARSEBackend, u::USTensor{T}) where {T<:_CUSPARSE_ELTYPES}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:SparseToDense, F},
+                        u::USTensor{T}) where {F, T<:_CUSPARSE_ELTYPES}
     cusA = _to_cuspmat(u)
     idx  = _cusparse_index(u)
     dense_mat = CUSPARSE.sparsetodense(cusA, idx)
@@ -10,7 +11,8 @@ end
 
 # dense_to_sparse: dense CuMatrix USTensor → sparse USTensor in fmt (CSR, CSC, or COO).
 # The input u must be a 2-D all-dense USTensor whose val field is a CuMatrix.
-function JLUST.dense_to_sparse(::CUSPARSEBackend, u::USTensor{T}, fmt::TensorFormat) where {T<:_CUSPARSE_ELTYPES}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:DenseToSparse, F},
+                        u::USTensor{T}, fmt::TensorFormat) where {F, T<:_CUSPARSE_ELTYPES}
     idx = _cusparse_index(u)
     sym = if fmt == Formats.CSR
         :csr

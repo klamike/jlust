@@ -162,50 +162,36 @@ const _COO_CHUNK = 8   # NNZ per thread; Int for type stability
     end
 end
 
-# ─── Kernel functions and launch ─────────────────────────────────────────────
+# ─── Kernel launch ───────────────────────────────────────────────────────────
 #
-# Each op's kernel is a regular `@generated` Julia function that emits its body
-# from the format type's level structure, using `KernelIntrinsics` (KI)
-# primitives directly (`KI.get_global_id().x`, `Atomix.@atomic`).  At the call
-# site, `_launch_kern` dispatches via `KI.kernel_function` — Julia specializes
-# per (FMT, T, ...) tuple type, the generated body compiles in the call site's
-# world age, and there is no global Dict cache and no `Base.invokelatest`.
+# All emitter-backed kernels share the unified `_ust_emit_kern` (defined in
+# _walker.jl); each op defines a singleton `KT` plus methods for
+# `_kern_standard_nms(::KT)` and `_kern_emit_body(::KT, levels, T)`.
+# `_launch_kern` calls `KI.kernel_function` to dispatch via Julia's method
+# table — specialization caches per (KT, FMT, T, …); no global Dict, no
+# `Base.invokelatest`.
 
-# Launch helper: call `KI.kernel_function` and dispatch the kernel.  Bypasses
-# the `KI.@kernel` macro so we can splat varargs cleanly.
 @inline function _launch_kern(ka, kfunc, args::Tuple, ndrange::Int, ws::Int=64)
-    ng        = cld(ndrange, ws)
-    kf        = KI.argconvert(ka, kfunc)
-    kargs     = map(x -> KI.argconvert(ka, x), args)
-    ktt       = Tuple{map(Core.Typeof, kargs)...}
-    kobj      = KI.kernel_function(ka, kf, ktt)
+    ng    = cld(ndrange, ws)
+    kf    = KI.argconvert(ka, kfunc)
+    kargs = map(x -> KI.argconvert(ka, x), args)
+    ktt   = Tuple{map(Core.Typeof, kargs)...}
+    kobj  = KI.kernel_function(ka, kf, ktt)
     kobj(kargs...; numworkgroups=ng, workgroupsize=ws)
 end
 
-# SpMV kernel — body emitted from FMT's level types.  `args` is the variadic
-# tail: sparse buffers, x, y, origin_off, n_outer, input_fn, output_fn, alpha, beta.
-@generated function _ust_spmv_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
-    LT          = FMT.parameters[1]
-    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
-    sparse_nms  = _sparse_arg_names_for_levels(levels)
-    standard_nm = (:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta)
-    all_nms     = (sparse_nms..., standard_nm...)
-    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
-    body        = _emit_spmv_body(levels, T)
-    quote
-        @inbounds begin
-            $(bindings...)
-            $body
-        end
-        return nothing
-    end
-end
+# SpMV kernel singleton.  Body emits via the unified `_ust_emit_kern`.
+struct _SpMVKern end
+_kern_standard_nms(::_SpMVKern) =
+    (:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta)
+_kern_emit_body(::_SpMVKern, levels, ::Type{T}) where T = _emit_spmv_body(levels, T)
 
 # ─── sparse_mv! ───────────────────────────────────────────────────────────────
 
-function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                          alpha=one(eltype(u_A)), beta=zero(eltype(u_A)),
-                          input_fn::IF=identity, output_fn::OF=identity) where {IF, OF}
+function JLUST.execute(::EmitterBackend, ::Op{:SpMV, F},
+                       u_A::USTensor, u_x::USTensor, u_y::USTensor;
+                       alpha=one(eltype(u_A)), beta=zero(eltype(u_A)),
+                       input_fn::IF=identity, output_fn::OF=identity) where {F, IF, OF}
     fmt          = format(u_A)
     T            = eltype(u_A)
     T_alpha      = T(alpha)
@@ -245,7 +231,7 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
             all_args    = (typeof(fmt), T,
                            sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
                            input_fn, output_fn, T_alpha, zero(T))
-            _launch_kern(ka, _ust_spmv_kern, all_args, Int(n_outer))
+            _launch_kern(ka, _ust_emit_kern, (_SpMVKern(), all_args...), Int(n_outer))
         end
     else
         n_outer     = Int32(_spmv_ndrange(u_A))
@@ -269,7 +255,7 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
             all_args = (typeof(fmt), T,
                         sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
                         input_fn, output_fn, T_alpha, T_beta)
-            _launch_kern(ka, _ust_spmv_kern, all_args, Int(n_outer))
+            _launch_kern(ka, _ust_emit_kern, (_SpMVKern(), all_args...), Int(n_outer))
         end
     end
 
@@ -288,7 +274,7 @@ end
 #
 # Pass identity (the default) for either to generate zero-overhead kernel paths.
 
-struct EmitterSpMVHandle{T, IF, OF, FMT}
+struct EmitterSpMVHandle{T, IF, OF, FMT} <: JLUST.AbstractKernelHandle
     n_outer   :: Int32
     off       :: Int32
     input_fn  :: IF
@@ -304,18 +290,14 @@ function JLUST.prepare(::EmitterBackend, ::Type{<:Op{:SpMV}}, u_A::USTensor{T};
     EmitterSpMVHandle{T, IF, OF, typeof(format(u_A))}(n_outer, off, input_fn, output_fn)
 end
 
-function JLUST.sparse_mv!(h::EmitterSpMVHandle, u_A::USTensor, x::AbstractVector, y::AbstractVector; kw...)
-    JLUST.sparse_mv!(h, u_A, ust(x), ust(y); kw...)
-end
-
-function JLUST.sparse_mv!(h::EmitterSpMVHandle{T, IF, OF, FMT},
-                           u_A::USTensor, u_x::USTensor, u_y::USTensor;
-                           alpha=one(T), beta=zero(T)) where {T, IF, OF, FMT}
+function JLUST.execute(h::EmitterSpMVHandle{T, IF, OF, FMT},
+                        u_A::USTensor, u_x::USTensor, u_y::USTensor;
+                        alpha=one(T), beta=zero(T)) where {T, IF, OF, FMT}
     ka          = KernelAbstractions.get_backend(nonzeros(u_A))
     sparse_bufs = _sparse_args(u_A)
-    args = (FMT, T,
+    args = (_SpMVKern(), FMT, T,
             sparse_bufs..., nonzeros(u_x), nonzeros(u_y),
             h.off, h.n_outer, h.input_fn, h.output_fn, T(alpha), T(beta))
-    _launch_kern(ka, _ust_spmv_kern, args, Int(h.n_outer))
+    _launch_kern(ka, _ust_emit_kern, args, Int(h.n_outer))
     return u_y
 end

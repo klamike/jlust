@@ -27,24 +27,22 @@ end
 
 _emit_spmm_body(fmt::TensorFormat, T) = _emit_spmm_body(fmt.levels, T)
 
-# ─── @generated SpMM kernel functions (column-first 1-D) ────────────────────
+# ─── SpMM kernel singletons (column-first / NNZ-first / tiled) ──────────────
+# All three emit through the unified `_ust_emit_kern`; only the standard arg
+# names and the body builder differ.  The 2D kernel (further down) uses a
+# different signature and stays separate.
 
-@generated function _ust_spmm_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
-    LT          = FMT.parameters[1]
-    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
-    sparse_nms  = _sparse_arg_names_for_levels(levels)
-    standard_nm = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
-    all_nms     = (sparse_nms..., standard_nm...)
-    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
-    body        = _emit_spmm_body(levels, T)
-    quote
-        @inbounds begin
-            $(bindings...)
-            $body
-        end
-        return nothing
-    end
-end
+struct _SpMMColKern end
+struct _SpMMNNZFirstKern{NCOL,ZB} end
+struct _SpMMTiledKern end
+
+_kern_standard_nms(::_SpMMColKern)        = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
+_kern_standard_nms(::_SpMMNNZFirstKern)   = (:_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta)
+_kern_standard_nms(::_SpMMTiledKern)      = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
+
+_kern_emit_body(::_SpMMColKern,                levels, ::Type{T}) where T          = _emit_spmm_body(levels, T)
+_kern_emit_body(::_SpMMNNZFirstKern{NCOL,ZB},  levels, ::Type{T}) where {NCOL,ZB,T} = _emit_spmm_body_nnzfirst(levels, T, NCOL, ZB)
+_kern_emit_body(::_SpMMTiledKern,              levels, ::Type{T}) where T          = _emit_spmm_body_tiled(levels, T, _SPMM_TILE_K)
 
 # ─── NNZ-first (tiled) SpMM emitter ─────────────────────────────────────────
 #
@@ -116,28 +114,6 @@ end
 
 _emit_spmm_body_nnzfirst(fmt::TensorFormat, T, n_col, zero_beta=false) =
     _emit_spmm_body_nnzfirst(fmt.levels, T, n_col, zero_beta)
-
-# ─── Kernel cache and launch ─────────────────────────────────────────────────
-
-# NNZ-first kernel — n_col and zero_beta are compile-time type parameters
-# (Julia specializes the @generated body per (FMT, T, NCOL, ZB) combination).
-@generated function _ust_spmm_nf_kern(::Type{FMT}, ::Type{T}, ::Val{NCOL}, ::Val{ZB},
-                                       args::Vararg{Any, M}) where {FMT<:TensorFormat, T, NCOL, ZB, M}
-    LT          = FMT.parameters[1]
-    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
-    sparse_nms  = _sparse_arg_names_for_levels(levels)
-    standard_nm = (:_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta)
-    all_nms     = (sparse_nms..., standard_nm...)
-    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
-    body        = _emit_spmm_body_nnzfirst(levels, T, NCOL, ZB)
-    quote
-        @inbounds begin
-            $(bindings...)
-            $body
-        end
-        return nothing
-    end
-end
 
 _is_csr_like_for_guard(fmt::TensorFormat) =
     length(fmt.levels) == 2 &&
@@ -222,153 +198,125 @@ end
 
 const _SPMM_TILE_K = 8   # columns per tile; governs register pressure
 
-# Inner handlers: identical structure to NNZ-first but recurse into the tiled
-# leaf.  Only non-outermost levels are defined here; the outermost level and
-# the leaf differ from the full-k NNZ-first path.
-
-function _emit_spmm_tiled_inner(levels, lvl, p_var, pc, cc, T, tile_k)
-    if lvl > length(levels)
-        return Expr(:block, [
-            :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, _tile_start + $(c - 1)])
-            for c in 1:tile_k]...)
-    end
-    _emit_spmm_tiled_lv(levels[lvl], levels, lvl, p_var, pc, cc, T, tile_k)
-end
-
-function _emit_spmm_tiled_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T, tile_k)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar = Symbol(:_i, lvl)
-    inner = _emit_spmm_tiled_inner(levels, lvl + 1, lvar, pc, cc, T, tile_k)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _x_idx   = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-        end
-    end
-end
-
-function _emit_spmm_tiled_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, tile_k)
-    ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    inner = _emit_spmm_tiled_inner(levels, lvl + 1, p_var, pc, cc, T, tile_k)
-    quote
-        _x_idx   = Int($cs[$p_var]) - Int(_origin_off) + 1
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_spmm_tiled_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, tile_k)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar  = Symbol(:_i, lvl)
-    corig = Symbol(:_corig, lvl)
-    inner = _emit_spmm_tiled_inner(levels, lvl + 1, lvar, pc, cc, T, tile_k)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        $corig = 0
-        for $lvar in (_lo + 1):_hi
-            $corig  += Int($cs[$lvar])
-            _x_idx   = $corig - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-            $corig += 1
-        end
-    end
-end
-
-# AbstractLevelFormat inner level: delegate to level_step hook (mirrors non-tiled path).
-function _emit_spmm_tiled_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T, tile_k)
-    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _emit_spmm_tiled_inner(levels, lvl + 1, p_var, pc, cc, T, tile_k)
-    quote
-        _p1 = Int($p_var) - Int(_origin_off) + 1
-        (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_spmm_tiled_lv(lv, args...)
-    error("EmitterBackend tiled SpMM: unsupported level $(typeof(lv)); convert to CSR/DCSR first")
-end
-
+# Tiled body — reuses the unified walker (`_walk_inner` / `_emit_outer`).  The
+# row/leaf shape differs from full-k NNZ-first only in: (a) tile_k accumulators
+# tracked via `_tile_start` runtime offset, (b) outer while-loop over tiles.
+# No second walker is needed — the leaf and row_body callbacks parameterize it.
 function _emit_spmm_body_tiled(levels::Tuple, ::Type{T}, tile_k::Int) where T
-    lv1 = levels[1]
-    acc_inits = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:tile_k]...)
-
-    if lv1 isa Union{DenseLevel,BatchLevel}
-        # CSR-like: thread → row; output row index is _tid
-        pc = Ref(0); cc = Ref(0)
-        inner = _emit_spmm_tiled_inner(levels, 2, :_tid, pc, cc, T, tile_k)
-        acc_writes = Expr(:block, [:(_C[_tid, _tile_start + $(c-1)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_tid, _tile_start + $(c-1)]) for c in 1:tile_k]...)
-        quote
-            _tid = KI.get_global_id().x
-            if _tid <= _n_outer
-                _tile_start = Int32(1)
-                while _tile_start <= _n_col
-                    $acc_inits
-                    $inner
-                    $acc_writes
-                    _tile_start += Int32($tile_k)
-                end
-            end
+    acc_inits   = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:tile_k]...)
+    acc_writes  = Expr(:block, [
+        :(_C[_y_idx, _tile_start + $(c-1)] =
+              _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_y_idx, _tile_start + $(c-1)])
+        for c in 1:tile_k]...)
+    leaf_unique = Expr(:block, [
+        :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, _tile_start + $(c - 1)])
+        for c in 1:tile_k]...)
+    leaf_atomic = Expr(:block, [
+        :(KernelAbstractions.@atomic _C[_y_idx, _tile_start + $(c - 1)] +=
+              _alpha * _nzval[_nnz_pos] * _B[_x_idx, _tile_start + $(c - 1)])
+        for c in 1:tile_k]...)
+    row_body_unique = inner -> quote
+        _tile_start = Int32(1)
+        while _tile_start <= _n_col
+            $acc_inits
+            $inner
+            $acc_writes
+            _tile_start += Int32($tile_k)
         end
-    elseif lv1 isa CompressedLevel && is_unique(lv1)
-        # DCSR-like: thread → fiber; crd1 → output row index _y_idx
-        # Outer CompressedLevel consumed pc=1, cc=1 → _pos1, _crd1
-        pc = Ref(1); cc = Ref(1)
-        inner = _emit_spmm_tiled_inner(levels, 2, :_tid, pc, cc, T, tile_k)
-        acc_writes = Expr(:block, [:(_C[_y_idx, _tile_start + $(c-1)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_y_idx, _tile_start + $(c-1)]) for c in 1:tile_k]...)
-        quote
-            _tid = KI.get_global_id().x
-            if _tid <= _n_outer
-                _y_idx = Int(_crd1[_tid]) - Int(_origin_off) + 1
-                _tile_start = Int32(1)
-                while _tile_start <= _n_col
-                    $acc_inits
-                    $inner
-                    $acc_writes
-                    _tile_start += Int32($tile_k)
-                end
-            end
-        end
-    else
-        error("EmitterBackend tiled SpMM: $(typeof(lv1)) cannot be the outermost level; pair with DenseLevel or use unique CompressedLevel.")
     end
+    row_body_atomic = inner -> quote
+        _tile_start = Int32(1)
+        while _tile_start <= _n_col
+            $inner
+            _tile_start += Int32($tile_k)
+        end
+    end
+    emit_kernel_body(levels;
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
 end
 
 _emit_spmm_body_tiled(fmt::TensorFormat, T, tile_k) =
     _emit_spmm_body_tiled(fmt.levels, T, tile_k)
 
-# Tiled kernel — TILE_K is a compile-time constant; runtime _n_col drives the tile loop.
-@generated function _ust_spmm_tiled_kern(::Type{FMT}, ::Type{T}, args::Vararg{Any, M}) where {FMT<:TensorFormat, T, M}
-    LT          = FMT.parameters[1]
-    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
-    sparse_nms  = _sparse_arg_names_for_levels(levels)
-    standard_nm = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
-    all_nms     = (sparse_nms..., standard_nm...)
-    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
-    body        = _emit_spmm_body_tiled(levels, T, _SPMM_TILE_K)
-    quote
-        @inbounds begin
-            $(bindings...)
-            $body
+# ─── SpMM kernel strategies ───────────────────────────────────────────────────
+#
+# Four parallelization shapes; selection is pure function of (format, n_outer,
+# n_col, nnz, ka, skip_empty_rows).  Adding a new strategy = define a singleton
+# type, a `_run_spmm!` method, and add a branch to `_spmm_strategy`.
+#
+#   ColFirst  : 1 thread/row, runtime n_col loop, 1 accumulator     (universal fallback)
+#   NNZFirst  : 1 thread/row, compile-time NCOL accumulators        (k ≤ NCOL_INLINE)
+#   Tiled     : 1 thread/row, TILE_K accs/strip, n_col/TILE_K passes (k > NCOL_INLINE, k % TILE_K = 0)
+#   2D        : 1 thread/cell, 1 accumulator, CSR-only              (saturate SMs at small n_outer)
+
+struct _SpMMColFirst end
+struct _SpMMNNZFirst end
+struct _SpMMTiled    end
+struct _SpMM2D       end
+
+function _spmm_strategy(fmt::TensorFormat, n_outer::Int, n_col::Int,
+                         nnz::Int, ka, skip_empty_rows::Bool)
+    lv1 = fmt.levels[1]
+    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
+                  length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
+    is_coo_like && return _SpMMColFirst()
+
+    if n_col <= _SPMM_NCOL_INLINE_THRESHOLD
+        # 2D wins when CSR-shaped AND (skip-empty mask requested ∨ 1D underfills SMs ∨ NNZ-dense).
+        if _is_csr_like_for_guard(fmt) && (skip_empty_rows ||
+                                           n_outer <= _spmm_2d_max_rows(ka) ||
+                                           nnz > _SPMM_2D_AVG_NNZ * n_outer)
+            return _SpMM2D()
         end
-        return nothing
+        return _SpMMNNZFirst()
     end
+    n_col % _SPMM_TILE_K == 0 && return _SpMMTiled()
+    _SpMMColFirst()
+end
+
+# Common runtime args bundle: (fmt_type, T, sparse_bufs..., B, C, off, n_outer, ...).
+@inline _spmm_common(u_A, u_B, u_C, off, n_outer) =
+    (_sparse_args(u_A)..., nonzeros(u_B), nonzeros(u_C), off, n_outer)
+
+function _run_spmm!(::_SpMM2D, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+    # 2D kernel uses a hardcoded CSR signature, so it bypasses _ust_emit_kern.
+    T = eltype(u_A)
+    args = (T, Val(n_col), Val(Z), Val(SE),
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., T_alpha, T_beta)
+    _launch_kern(ka, _ust_spmm_2d_kern, args, Int(n_outer) * n_col)
+end
+
+function _run_spmm!(::_SpMMNNZFirst, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+    T = eltype(u_A)
+    args = (_SpMMNNZFirstKern{n_col, Z}(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., T_alpha, T_beta)
+    _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
+end
+
+function _run_spmm!(::_SpMMTiled, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+    T = eltype(u_A)
+    args = (_SpMMTiledKern(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, T_beta)
+    _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
+end
+
+function _run_spmm!(::_SpMMColFirst, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+    T = eltype(u_A)
+    args = (_SpMMColKern(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, T_beta)
+    _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
 end
 
 # ─── sparse_mm! ───────────────────────────────────────────────────────────────
 
-function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::USTensor;
-                           alpha=one(eltype(u_A)), beta=zero(eltype(u_A)),
-                           skip_empty_rows::Bool=false)
+function JLUST.execute(::EmitterBackend, ::Op{:SpMM, F},
+                       u_A::USTensor, u_B::USTensor, u_C::USTensor;
+                       alpha=one(eltype(u_A)), beta=zero(eltype(u_A)),
+                       skip_empty_rows::Bool=false) where {F}
     fmt     = format(u_A)
     T       = eltype(u_A)
     T_alpha = T(alpha)
@@ -378,53 +326,16 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     n_outer = Int32(_spmv_ndrange(u_A))
     n_col   = Int(extents(u_B)[2])
 
+    # COO-like atomic-leaf path needs C pre-scaled by beta.
     lv1 = fmt.levels[1]
-    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
-                  length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
-
-    # COO-like: pre-scale C by beta; atomic += accumulates into this baseline.
-    if is_coo_like
+    if lv1 isa CompressedLevel && !is_unique(lv1) &&
+       length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
         iszero(T_beta) ? fill!(nonzeros(u_C), zero(T)) : (nonzeros(u_C) .*= T_beta)
     end
 
-    sparse_bufs = _sparse_args(u_A)
-    z           = iszero(T_beta)
-
-    if !is_coo_like && n_col <= _SPMM_NCOL_INLINE_THRESHOLD
-        # 2D kernel (one thread per output cell) for CSR-like matrices when: skip_empty_rows
-        # is set, the matrix is too small for 1D to saturate SMs, or high NNZ density means
-        # bandwidth hiding from concurrent warps outweighs 2D launch overhead.
-        # All other cases (DCSR, COO, large sparse CSR) use the 1D NNZ-first path.
-        use_2d = _is_csr_like_for_guard(fmt) && (skip_empty_rows ||
-                     Int(n_outer) <= _spmm_2d_max_rows(ka) ||
-                     length(nonzeros(u_A)) > _SPMM_2D_AVG_NNZ * Int(n_outer))
-        if use_2d
-            # 2D kernel uses fixed CSR signature (pos1, crd1, nzval, B, C, ...).
-            # The guard axis becomes a Val parameter so dispatch picks the right specialization.
-            args = (T, Val(n_col), Val(z), Val(skip_empty_rows),
-                    sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
-                    off, n_outer, T_alpha, T_beta)
-            _launch_kern(ka, _ust_spmm_2d_kern, args, Int(n_outer) * n_col)
-        else
-            args = (typeof(fmt), T, Val(n_col), Val(z),
-                    sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
-                    off, n_outer, T_alpha, T_beta)
-            _launch_kern(ka, _ust_spmm_nf_kern, args, Int(n_outer))
-        end
-    elseif !is_coo_like && n_col % _SPMM_TILE_K == 0
-        # Tiled NNZ-first: TILE_K accumulators per strip, n_col/TILE_K NNZ passes.
-        args = (typeof(fmt), T,
-                sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
-                off, n_outer, Int32(n_col), T_alpha, T_beta)
-        _launch_kern(ka, _ust_spmm_tiled_kern, args, Int(n_outer))
-    else
-        # Column-first: runtime n_col loop (fallback for COO and non-divisible k).
-        args = (typeof(fmt), T,
-                sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
-                off, n_outer, Int32(n_col), T_alpha, T_beta)
-        _launch_kern(ka, _ust_spmm_kern, args, Int(n_outer))
-    end
-
+    strat = _spmm_strategy(fmt, Int(n_outer), n_col, length(nonzeros(u_A)), ka, skip_empty_rows)
+    _run_spmm!(strat, ka, u_A, u_B, u_C, off, n_outer, n_col,
+               T_alpha, T_beta, Val(iszero(T_beta)), Val(skip_empty_rows))
     return u_C
 end
 

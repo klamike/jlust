@@ -2,6 +2,16 @@
 
 abstract type AbstractUSTBackend end
 
+# ─── Handle abstraction ───────────────────────────────────────────────────────
+#
+# A `KernelHandle` represents a *prepared* op: descriptors built, workspace
+# allocated, symbolic analysis done.  Every backend's prepared kernel state
+# subtypes `AbstractKernelHandle` so that the convenience `execute(::Type{<:Op},
+# h, args...)` shim can route through Julia dispatch without colliding with the
+# all-USTensor convenience method.
+
+abstract type AbstractKernelHandle end
+
 # ─── Capability predicates ────────────────────────────────────────────────────
 
 """

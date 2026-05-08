@@ -131,9 +131,9 @@ function dense_vec(v::AbstractVector{T}) where T
 end
 
 function bench_spmv(u_A, u_x, u_y, backend; samples=100)
-    for _ in 1:5; sparse_mv!(backend, u_A, u_x, u_y); sync(); end
+    for _ in 1:5; execute(SpMVOp, backend, u_A, u_x, u_y); sync(); end
     @belapsed(begin
-        sparse_mv!($backend, $u_A, $u_x, $u_y); $sync()
+        execute(SpMVOp, $backend, $u_A, $u_x, $u_y); $sync()
     end, samples=samples, evals=1) * 1e6
 end
 

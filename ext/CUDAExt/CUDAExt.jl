@@ -9,8 +9,7 @@ import JLUST:
     USTensor, TensorFormat, AbstractUSTBackend, Op,
     format, extents, index_origin, OneBased, ZeroBased, format_family,
     positions, coordinates,
-    sparse_mv!, sparse_mm!, sparse_gemm!, sparse_sv!, sparse_sm!, sparse_sddmm!,
-    sparse_to_dense, dense_to_sparse,
+    execute,
     prepare, update_values!,
     CUSPARSEBackend, EmitterBackend
 

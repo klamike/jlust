@@ -442,9 +442,9 @@ end
 # add-nonheads pass accumulates remaining products.  Two kernel launches with
 # a synchronise between them guarantees no race between the two passes.
 
-function JLUST.sparse_gemm!(h::EmitterSpGEMMHandle{K, T, Ti},
-                              u_A::USTensor, u_B::USTensor;
-                              alpha=one(T), beta=zero(T)) where {K, T, Ti}
+function JLUST.execute(h::EmitterSpGEMMHandle{K, T, Ti},
+                        u_A::USTensor, u_B::USTensor;
+                        alpha=one(T), beta=zero(T)) where {K, T, Ti}
     beta == zero(T) ||
         error("EmitterSpGEMMHandle sparse_gemm!: beta ≠ 0 not supported")
 
@@ -488,108 +488,19 @@ function JLUST.sparse_gemm!(h::EmitterSpGEMMHandle{K, T, Ti},
 end
 
 # ─── sparse_gemm! ─────────────────────────────────────────────────────────────
+#
+# The direct path IS prepare-then-extract-result.  `prepare` runs the full
+# pipeline (count → scatter → sort → mark heads → reduce → build) and stores
+# everything in the handle, including a valid first-call C_nzVal.  The direct
+# path returns a USTensor view onto those buffers — no second pass over the
+# data.  Re-running the numeric pipeline against new (A, B) values is what the
+# handle path does via `execute(handle, A_new, B_new)`.
 
-function JLUST.sparse_gemm!(::EmitterBackend,
-                              u_A::USTensor{T,Ti}, u_B::USTensor;
-                              transa::Char='N', transb::Char='N',
-                              alpha=one(T), beta=zero(T)) where {T, Ti}
-    (transa == 'N' && transb == 'N') ||
-        error("EmitterBackend sparse_gemm!: transposed operands not supported")
-    beta == zero(T) ||
-        error("EmitterBackend sparse_gemm!: beta ≠ 0 not supported")
-    (format(u_A) == Formats.CSR && format(u_B) == Formats.CSR) ||
-        error("EmitterBackend sparse_gemm!: only CSR×CSR supported")
-
-    A_rowPtr = positions(u_A, 2)
-    A_colInd = coordinates(u_A, 2)
-    A_nzVal  = nonzeros(u_A)
-    B_rowPtr = positions(u_B, 2)
-    B_colInd = coordinates(u_B, 2)
-    B_nzVal  = nonzeros(u_B)
-
-    m   = Int(extents(u_A)[1])
-    n   = Int(extents(u_B)[2])
-    off = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
-
-    ka = KernelAbstractions.get_backend(A_nzVal)
-
-    # ── Step 1: count products per row ─────────────────────────────────────────
-    prod_count = similar(A_rowPtr, Int64, m)
-    _emitter_spgemm_count!(ka, 256)(
-        A_rowPtr, A_colInd, B_rowPtr, prod_count, Int32(m), off;
-        ndrange = m)
-    KernelAbstractions.synchronize(ka)
-
-    # ── Step 2: total product count (GPU reduction, no scalar indexing) ──────────
-    total_products = Int(sum(prod_count))
-
-    if total_products == 0
-        C_rowPtr = fill!(similar(A_rowPtr, Ti, m + 1), Ti(off))
-        C_colInd = similar(A_colInd, Ti, 0)
-        C_nzVal  = similar(A_nzVal, T, 0)
-        orig = index_origin(u_A)
-        return csr_tensor(C_rowPtr, C_colInd, C_nzVal, (m, n); origin=orig)
-    end
-
-    # Prefix-sum prod_count → 1-based scatter positions for each row.
-    prod_offset = similar(A_rowPtr, Int64, m + 1)
-    fill!(prod_offset, Int64(0))
-    accumulate!(+, view(prod_offset, 2:m + 1), prod_count)
-    prod_offset .+= Int64(1)
-
-    # ── Step 3: scatter (key, val) pairs ───────────────────────────────────────
-    K     = (m <= 0x10000 && n <= 0x10000) ? UInt32 : Int64
-    keys  = similar(A_rowPtr, K, total_products)
-    vals  = similar(A_nzVal,  total_products)
-    _emitter_spgemm_scatter!(ka, 256)(
-        A_rowPtr, A_colInd, A_nzVal,
-        B_rowPtr, B_colInd, B_nzVal,
-        prod_offset, keys, vals, Int32(m), Int32(n), off;
-        ndrange = m)
-    KernelAbstractions.synchronize(ka)
-
-    # ── Step 4: sort by key ────────────────────────────────────────────────────
-    perm        = sortperm(keys)
-    keys_sorted = keys[perm]
-    vals_sorted = vals[perm]
-
-    alpha_T = T(alpha)
-    if alpha_T != one(T)
-        vals_sorted .*= alpha_T
-    end
-
-    # ── Step 5: mark segment heads ─────────────────────────────────────────────
-    heads = similar(A_rowPtr, Bool, total_products)
-    _emitter_spgemm_mark_heads!(ka, 256)(keys_sorted, heads, Int32(total_products);
-                                          ndrange = total_products)
-    KernelAbstractions.synchronize(ka)
-
-    # Count unique (key) segments → nnzC; then cumsum heads → output positions.
-    nnzC = Int(sum(heads))
-    head_pos = similar(A_rowPtr, Int64, total_products)
-    accumulate!(+, head_pos, heads)
-
-    # ── Step 6: scatter-reduce into C values ───────────────────────────────────
-    C_keys   = similar(A_rowPtr, K, nnzC)
-    C_nzVal  = fill!(similar(A_nzVal, nnzC), zero(T))
-    _emitter_spgemm_reduce!(ka, 256)(
-        keys_sorted, vals_sorted, heads, head_pos, C_keys, C_nzVal, Int32(total_products);
-        ndrange = total_products)
-    KernelAbstractions.synchronize(ka)
-
-    # ── Step 7: build C_rowPtr and C_colInd ───────────────────────────────────
-    row_count = fill!(similar(A_rowPtr, Ti, m), zero(Ti))
-    C_colInd  = similar(A_colInd, Ti, nnzC)
-    _emitter_spgemm_build!(ka, 256)(
-        C_keys, row_count, C_colInd, Int32(nnzC), Int32(n), off;
-        ndrange = nnzC)
-    KernelAbstractions.synchronize(ka)
-
-    C_rowPtr = similar(A_rowPtr, Ti, m + 1)
-    fill!(C_rowPtr, zero(Ti))
-    accumulate!(+, view(C_rowPtr, 2:m + 1), row_count)
-    C_rowPtr .+= Ti(off)
-
-    orig = index_origin(u_A)
-    return csr_tensor(C_rowPtr, C_colInd, C_nzVal, (m, n); origin=orig)
+function JLUST.execute(::EmitterBackend, ::Op{:SpGEMM, F},
+                       u_A::USTensor, u_B::USTensor, u_C::USTensor=u_B;
+                       transa::Char='N', transb::Char='N',
+                       alpha=one(eltype(u_A)), beta=zero(eltype(u_A))) where {F}
+    h = JLUST.prepare(EmitterBackend(), Op{:SpGEMM}, u_A, u_B;
+                      transa=transa, transb=transb, alpha=alpha, beta=beta)
+    return csr_tensor(h.C_rowPtr, h.C_colInd, h.C_nzVal, (h.m, h.n); origin=h.orig)
 end

@@ -5,7 +5,7 @@
 
 # ─── Handle ──────────────────────────────────────────────────────────────────
 
-mutable struct CUSPARSESpMMHandle{T}
+mutable struct CUSPARSESpMMHandle{T} <: JLUST.AbstractKernelHandle
     spmat_desc::CuSparseMatrixDescriptor
     dnmat_B::CuDenseMatrixDescriptor
     dnmat_C::CuDenseMatrixDescriptor
@@ -22,25 +22,22 @@ function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMM}}, u_A::USTensor{T,T
                         n_cols::Int) where {T<:_CUSPARSE_ELTYPES, Ti}
     idx   = _cusparse_index(u_A)
     m, n  = Int64.(extents(u_A))
-    spmat_desc = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
-
+    spmat = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
     k_dim = transa == 'N' ? n : m
     m_out = transa == 'N' ? m : n
     descB = CuDenseMatrixDescriptor(T, k_dim, n_cols)
     descC = CuDenseMatrixDescriptor(T, m_out, n_cols)
     algo  = CUSPARSE_SPMM_ALG_DEFAULT
+    α_ref = Ref{T}(one(T));  β_ref = Ref{T}(zero(T))
 
-    alpha_ref = Ref{T}(one(T));  beta_ref = Ref{T}(zero(T))
-    buf_sz = Ref{Csize_t}(1000)
-    cusparseSpMM_bufferSize(
-        handle(), transa, transb, alpha_ref, spmat_desc, descB, beta_ref, descC,
-        T, algo, buf_sz)
-    ws = CUDA.zeros(UInt8, max(1, Int(buf_sz[])))
-    cusparseSpMM_preprocess(
-        handle(), transa, transb, alpha_ref, spmat_desc, descB, beta_ref, descC,
-        T, algo, ws)
-
-    CUSPARSESpMMHandle{T}(spmat_desc, descB, descC, ws, transa, transb, algo)
+    ws = _cusparse_workspace() do buf_sz, buf
+        if buf === CUDA.CU_NULL
+            cusparseSpMM_bufferSize(handle(), transa, transb, α_ref, spmat, descB, β_ref, descC, T, algo, buf_sz)
+        else
+            cusparseSpMM_preprocess(handle(), transa, transb, α_ref, spmat, descB, β_ref, descC, T, algo, buf)
+        end
+    end
+    CUSPARSESpMMHandle{T}(spmat, descB, descC, ws, transa, transb, algo)
 end
 
 function JLUST.update_values!(h::CUSPARSESpMMHandle, u_A::USTensor)
@@ -50,34 +47,34 @@ end
 
 # ─── Execution ────────────────────────────────────────────────────────────────
 
-# Direct path — builds a fresh descriptor each call (no handle caching).
-function JLUST.sparse_mm!(::CUSPARSEBackend,
-                           u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
-                           transa::Char='N', transb::Char='N',
-                           alpha=one(T), beta=zero(T)) where {T<:_CUSPARSE_ELTYPES,Ti}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:SpMM, F},
+                       u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
+                       transa::Char='N', transb::Char='N',
+                       alpha=one(T), beta=zero(T)) where {F, T<:_CUSPARSE_ELTYPES, Ti}
     cusA = _to_cuspmat(u_A)
     idx  = _cusparse_index(u_A)
     CUSPARSE.mm!(transa, transb, T(alpha), cusA, nonzeros(u_B), T(beta), nonzeros(u_C), idx)
     return u_C
 end
 
-# Handle path — only updates dense data pointers; no allocation, no descriptor rebuild.
-function JLUST.sparse_mm!(h::CUSPARSESpMMHandle{T},
-                           u_B::USTensor, u_C::USTensor;
-                           alpha=one(T), beta=zero(T)) where T
-    cusparseDnMatSetValues(h.dnmat_B, nonzeros(u_B))
-    cusparseDnMatSetValues(h.dnmat_C, nonzeros(u_C))
-    cusparseSpMM(
-        handle(), h.transa, h.transb,
-        Ref{T}(alpha), h.spmat_desc, h.dnmat_B,
-        Ref{T}(beta),  h.dnmat_C,
-        T, h.algo, h.workspace)
+function JLUST.execute(h::CUSPARSESpMMHandle{T},
+                       u_B::USTensor, u_C::USTensor;
+                       alpha=one(T), beta=zero(T)) where T
+    _cusparse_set_dense!(h.dnmat_B, nonzeros(u_B))
+    _cusparse_set_dense!(h.dnmat_C, nonzeros(u_C))
+    cusparseSpMM(handle(), h.transa, h.transb,
+                 Ref{T}(alpha), h.spmat_desc, h.dnmat_B,
+                 Ref{T}(beta),  h.dnmat_C,
+                 T, h.algo, h.workspace)
     return u_C
 end
 
-# cuSPARSE rejects SubArray outputs; route to EmitterBackend (our KA kernel) instead.
-# This fires when row_bufs are views into the stacked diag_out buffer.
-function JLUST.sparse_mm!(u_A::USTensor, u_B::USTensor,
-                           u_C::USTensor{T,Ti,N,<:SubArray}; kw...) where {T,Ti,N}
-    JLUST.sparse_mm!(EmitterBackend(), u_A, u_B, u_C; kw...)
+# cuSPARSE rejects SubArray outputs; the BBM scatter path routes row_bufs that
+# are views into a stacked diag_out buffer.  Force EmitterBackend for SpMM
+# with a SubArray-backed C, regardless of the other operands' storage.
+function JLUST.execute(::Type{OT},
+                       A::USTensor, B::USTensor, C::USTensor{T,Ti,N,<:SubArray};
+                       backend=nothing, kw...) where {OT<:Op{:SpMM}, T, Ti, N}
+    be = something(backend, EmitterBackend())
+    JLUST.execute(be, OT(format(A), format(B), format(C)), A, B, C; kw...)
 end

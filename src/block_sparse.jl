@@ -250,24 +250,22 @@ end
 # Resolve `nothing` backend via default dispatch (resolved in KernelAbstractionsExt)
 # vs explicit backend via positional arg.  Avoids an if/else inside the inner loop.
 
-_bsm_mv!(::Nothing, b, x, y, β) = sparse_mv!(b, x, y; beta=β)
-_bsm_mv!(be, b, x, y, β)        = sparse_mv!(be, b, x, y; beta=β)
+# ─── BlockSpMV: execute(BlockSpMVOp, A, x, y) ───────────────────────────────
+#
+# `mul!(y, A::BlockSparseMatrix, x)` is a thin wrapper.  All block-iteration
+# logic lives inside `execute(::Type{BlockSpMVOp}, ...)` so dispatch goes
+# through the unified Op framework like every other op.
 
-_bsm_mm!(::Nothing, b, X, Y, β) = sparse_mm!(b, X, Y; beta=β)
-_bsm_mm!(be, b, X, Y, β)        = sparse_mm!(be, b, X, Y; beta=β)
-
-# ─── SpMV: mul!(y, A, x) ─────────────────────────────────────────────────────
-
-function LinearAlgebra.mul!(y::AbstractVector, A::BlockSparseMatrix, x::AbstractVector;
-                             backend::Union{AbstractUSTBackend,Nothing}=nothing)
+function execute(::Type{<:Op{:BlockSpMV}}, A::BlockSparseMatrix,
+                  x::AbstractVector, y::AbstractVector;
+                  backend::Union{AbstractUSTBackend,Nothing}=nothing)
     # Fast path: fused Julia loop for CPU-resident fusable blocks.
     if backend === nothing && _is_cpu_array(y) && _is_cpu_array(x)
         _try_fused_cpu_mul!(y, A, x) && return y
     end
 
-    # General path: one kernel per non-null block.
-    # No fill! needed: the first non-null block per row uses beta=false (ZERO_BETA),
-    # which initialises empty rows to 0.
+    # General path: one per-block SpMV.  First non-null block per row writes
+    # beta=false (zero-init), subsequent blocks use beta=true (accumulate).
     nb_r, nb_c = size(A.blocks)
     for i in 1:nb_r
         y_sl      = view(y, A._row_off[i]+1 : A._row_off[i+1])
@@ -275,23 +273,17 @@ function LinearAlgebra.mul!(y::AbstractVector, A::BlockSparseMatrix, x::Abstract
         for j in 1:nb_c
             b = A.blocks[i, j]; b === nothing && continue
             x_sl = view(x, A._col_off[j]+1 : A._col_off[j+1])
-            _bsm_mv!(backend, b, x_sl, y_sl, first_col ? false : true)
+            β = first_col ? false : true
+            execute(SpMVOp, b, ust(x_sl), ust(y_sl); backend=backend, beta=β)
             first_col = false
         end
     end
     return y
 end
 
-function Base.:*(A::BlockSparseMatrix{T}, x::AbstractVector{T}) where T
-    y = similar(x, sum(A.row_sizes))
-    LinearAlgebra.mul!(y, A, x)
-    return y
-end
-
-# ─── SpMM: mul!(Y, A, X) ─────────────────────────────────────────────────────
-
-function LinearAlgebra.mul!(Y::AbstractMatrix, A::BlockSparseMatrix, X::AbstractMatrix;
-                             backend::Union{AbstractUSTBackend,Nothing}=nothing)
+function execute(::Type{<:Op{:BlockSpMM}}, A::BlockSparseMatrix,
+                  X::AbstractMatrix, Y::AbstractMatrix;
+                  backend::Union{AbstractUSTBackend,Nothing}=nothing)
     if backend === nothing && _is_cpu_array(Y) && _is_cpu_array(X)
         _try_fused_cpu_mul_mm!(Y, A, X) && return Y
     end
@@ -303,10 +295,25 @@ function LinearAlgebra.mul!(Y::AbstractMatrix, A::BlockSparseMatrix, X::Abstract
         for j in 1:nb_c
             b = A.blocks[i, j]; b === nothing && continue
             X_sl = view(X, A._col_off[j]+1 : A._col_off[j+1], :)
-            _bsm_mm!(backend, b, X_sl, Y_sl, one(eltype(A)))
+            execute(SpMMOp, b, ust(X_sl), ust(Y_sl); backend=backend, beta=one(eltype(A)))
         end
     end
     return Y
+end
+
+# ─── LinearAlgebra integration ──────────────────────────────────────────────
+LinearAlgebra.mul!(y::AbstractVector, A::BlockSparseMatrix, x::AbstractVector;
+                    backend::Union{AbstractUSTBackend,Nothing}=nothing) =
+    execute(BlockSpMVOp, A, x, y; backend=backend)
+
+LinearAlgebra.mul!(Y::AbstractMatrix, A::BlockSparseMatrix, X::AbstractMatrix;
+                    backend::Union{AbstractUSTBackend,Nothing}=nothing) =
+    execute(BlockSpMMOp, A, X, Y; backend=backend)
+
+function Base.:*(A::BlockSparseMatrix{T}, x::AbstractVector{T}) where T
+    y = similar(x, sum(A.row_sizes))
+    LinearAlgebra.mul!(y, A, x)
+    return y
 end
 
 function Base.:*(A::BlockSparseMatrix{T}, X::AbstractMatrix{T}) where T

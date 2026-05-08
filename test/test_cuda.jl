@@ -277,7 +277,7 @@ end
     u_x  = ust(CuArray(Float32[1, 2, 3]))
     u_y  = ust(CUDA.zeros(Float32, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=CUSPARSEBackend())
+    execute(SpMVOp, u_A, u_x, u_y; backend=CUSPARSEBackend())
     @test Array(nonzeros(u_y)) ≈ Float32[7, 6, 19]
 end
 
@@ -289,13 +289,13 @@ end
     u_y  = ust(CUDA.zeros(Float32, 3))
 
     h = prepare(CUSPARSEBackend(), SpMVOp, u_A)
-    sparse_mv!(h, u_x, u_y)
+    execute(SpMVOp, h, u_x, u_y)
     @test Array(nonzeros(u_y)) ≈ Float32[7, 6, 19]
 
     # Second call reuses handle — update values and rerun
     fill!(nonzeros(u_y), 0f0)
     update_values!(h, u_A)
-    sparse_mv!(h, u_x, u_y)
+    execute(SpMVOp, h, u_x, u_y)
     @test Array(nonzeros(u_y)) ≈ Float32[7, 6, 19]
 end
 
@@ -309,7 +309,7 @@ end
     u_B  = ust(CuArray(Float32[1 0; 2 1; 0 3]))
     u_C  = ust(CUDA.zeros(Float32, 3, 2))
 
-    sparse_mm!(u_A, u_B, u_C; backend=CUSPARSEBackend())
+    execute(SpMMOp, u_A, u_B, u_C; backend=CUSPARSEBackend())
     @test Array(nonzeros(u_C)) ≈ Float32[1 6; 6 3; 4 15]
 end
 
@@ -321,12 +321,12 @@ end
     u_C  = ust(CUDA.zeros(Float32, 3, 2))
 
     h = prepare(CUSPARSEBackend(), SpMMOp, u_A; n_cols=2)
-    sparse_mm!(h, u_B, u_C)
+    execute(SpMMOp, h, u_B, u_C)
     @test Array(nonzeros(u_C)) ≈ Float32[1 6; 6 3; 4 15]
 
     fill!(nonzeros(u_C), 0f0)
     update_values!(h, u_A)
-    sparse_mm!(h, u_B, u_C)
+    execute(SpMMOp, h, u_B, u_C)
     @test Array(nonzeros(u_C)) ≈ Float32[1 6; 6 3; 4 15]
 end
 
@@ -341,7 +341,7 @@ end
     u_b  = ust(CuArray(Float32[6, 9]))
     u_x  = ust(CUDA.zeros(Float32, 2))
 
-    sparse_sv!(u_A, u_b, u_x; backend=CUSPARSEBackend(), uplo='L', diag='N')
+    execute(SpSVOp, u_A, u_b, u_x; backend=CUSPARSEBackend(), uplo='L', diag='N')
     @test Array(nonzeros(u_x)) ≈ Float32[3, 3]
 end
 
@@ -353,7 +353,7 @@ end
     u_B  = ust(CuArray(Float32[6 10; 9 12]))
     u_C  = ust(CUDA.zeros(Float32, 2, 2))
 
-    sparse_sm!(u_A, u_B, u_C; backend=CUSPARSEBackend(), uplo='L', diag='N')
+    execute(SpSMOp, u_A, u_B, u_C; backend=CUSPARSEBackend(), uplo='L', diag='N')
     @test Array(nonzeros(u_C)) ≈ Float32[3 5; 3 4]
 end
 
@@ -365,12 +365,12 @@ end
     u_x  = ust(CUDA.zeros(Float32, 2))
 
     h = prepare(CUSPARSEBackend(), SpSVOp, u_A; uplo='L', diag='N')
-    sparse_sv!(h, u_b, u_x)
+    execute(SpSVOp, h, u_b, u_x)
     @test Array(nonzeros(u_x)) ≈ Float32[3, 3]
 
     fill!(nonzeros(u_x), 0f0)
     update_values!(h, u_A)
-    sparse_sv!(h, u_b, u_x)
+    execute(SpSVOp, h, u_b, u_x)
     @test Array(nonzeros(u_x)) ≈ Float32[3, 3]
 end
 
@@ -382,12 +382,12 @@ end
     u_C  = ust(CUDA.zeros(Float32, 2, 2))
 
     h = prepare(CUSPARSEBackend(), SpSMOp, u_A; uplo='L', diag='N', n_cols=2)
-    sparse_sm!(h, u_B, u_C)
+    execute(SpSMOp, h, u_B, u_C)
     @test Array(nonzeros(u_C)) ≈ Float32[3 5; 3 4]
 
     fill!(nonzeros(u_C), 0f0)
     update_values!(h, u_A)
-    sparse_sm!(h, u_B, u_C)
+    execute(SpSMOp, h, u_B, u_C)
     @test Array(nonzeros(u_C)) ≈ Float32[3 5; 3 4]
 end
 
@@ -397,7 +397,7 @@ end
     A    = sparse([1,1,2,3,3], [1,3,2,1,3], Float32[1,2,3,4,5], 3, 3)
     Agpu = CuSparseMatrixCSR(A)
     u_A  = ust(Agpu)
-    u_D  = sparse_to_dense(CUSPARSEBackend(), u_A)
+    u_D  = execute(SparseToDenseOp, CUSPARSEBackend(), u_A)
     expected = Matrix(A)
     @test Array(nonzeros(u_D)) ≈ expected
 end
@@ -426,7 +426,7 @@ end
     u_B  = ust(B_d)
     u_C  = ust(Cgpu)
 
-    sparse_sddmm!(u_A, u_B, u_C; backend=CUSPARSEBackend())
+    execute(SDDMMOp, u_A, u_B, u_C; backend=CUSPARSEBackend())
     # expected nzval: (A*B) sampled at (1,1)=1,(1,3)=1,(2,2)=1,(3,1)=1,(3,3)=2
     @test Array(nonzeros(u_C)) ≈ Float32[1, 1, 1, 1, 2]
 end
@@ -444,8 +444,8 @@ end
     C0_sp = spzeros(Float32, 3, 3)
     u_C0  = ust(CuSparseMatrixCSR(C0_sp))
 
-    u_C  = sparse_gemm!(u_A, u_A, u_C0; backend=CUSPARSEBackend())
-    C_dense = sparse_to_dense(u_C; backend=CUSPARSEBackend())
+    u_C  = execute(SpGEMMOp, u_A, u_A, u_C0; backend=CUSPARSEBackend())
+    C_dense = execute(SparseToDenseOp, u_C; backend=CUSPARSEBackend())
     @test Array(nonzeros(C_dense)) ≈ Float32[9 0 12; 0 9 0; 24 0 33]
 end
 

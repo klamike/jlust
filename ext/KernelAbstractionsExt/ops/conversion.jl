@@ -44,7 +44,8 @@ end
 
 # ─── sparse_to_dense ──────────────────────────────────────────────────────────
 
-function JLUST.sparse_to_dense(::EmitterBackend, u::USTensor{T,I,N,VA,VI,O}) where {T,I,N,VA,VI,O}
+function JLUST.execute(::EmitterBackend, ::Op{:SparseToDense, F},
+                        u::USTensor{T,I,N,VA,VI,O}) where {F, T,I,N,VA,VI,O}
     fmt     = format(u)
     ka      = KernelAbstractions.get_backend(nonzeros(u))
     off     = Int32(O === OneBased ? 1 : 0)
@@ -66,7 +67,7 @@ end
 
 # ─── dense_to_sparse ──────────────────────────────────────────────────────────
 
-function JLUST.dense_to_sparse(::EmitterBackend, u::USTensor, fmt::TensorFormat; kw...)
+function JLUST.execute(::EmitterBackend, ::Op{:DenseToSparse}, u::USTensor, fmt::TensorFormat; kw...)
     error("EmitterBackend does not support dense_to_sparse — requires parallel prefix " *
           "sums. Use CUSPARSEBackend() or convert_format() via a COO intermediate.")
 end

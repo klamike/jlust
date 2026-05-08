@@ -207,3 +207,43 @@ function _emit_outer(::Union{SingletonLevel,RangeLevel,DeltaLevel}, _levels, _pc
     error("EmitterBackend: outermost SingletonLevel / RangeLevel / DeltaLevel is invalid; " *
           "pair with a DenseLevel or CompressedLevel.")
 end
+
+# ─── Unified @generated kernel ────────────────────────────────────────────────
+#
+# Every walker-driven kernel (SpMV, SpMM column-first / NNZ-first / tiled, SDDMM)
+# shares the same shape:
+#   1. extract sparse-arg names from the format's level types
+#   2. append op-specific standard arg names (`_x`, `_y`, `_alpha`, …)
+#   3. bind args[i] to those names inside an @inbounds block
+#   4. splice in the op-specific body Expr
+#
+# The two bits that vary per op are encoded as method dispatch on a kernel
+# singleton type `KT`:
+#
+#   `_kern_standard_nms(::KT)            → Tuple of Symbols`
+#   `_kern_emit_body(::KT, levels, ::Type{T}) → Expr`
+#
+# Adding a new emitter-driven op = define a singleton + the two methods + call
+# `_launch_kern(ka, _ust_emit_kern, (KT(), FMT, T, args...), ndrange)`.
+
+function _kern_standard_nms end
+function _kern_emit_body end
+
+@generated function _ust_emit_kern(::KT, ::Type{FMT}, ::Type{T},
+                                    args::Vararg{Any, M}) where {KT, FMT<:TensorFormat, T, M}
+    kt          = KT()
+    LT          = FMT.parameters[1]
+    levels      = ntuple(i -> LT.parameters[i](), Val(length(LT.parameters)))
+    sparse_nms  = _sparse_arg_names_for_levels(levels)
+    standard_nm = _kern_standard_nms(kt)
+    all_nms     = (sparse_nms..., standard_nm...)
+    bindings    = [Expr(:(=), nm, :(args[$i])) for (i, nm) in enumerate(all_nms)]
+    body        = _kern_emit_body(kt, levels, T)
+    quote
+        @inbounds begin
+            $(bindings...)
+            $body
+        end
+        return nothing
+    end
+end

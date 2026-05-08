@@ -97,7 +97,7 @@ end
     u_x = dense_vec([1.0, 2.0, 3.0])
     u_y = dense_vec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend())
     @test nonzeros(u_y) ≈ [7.0, 6.0, 19.0]
 end
 
@@ -118,7 +118,7 @@ end
     u_x = dense_vec([1.0, 2.0, 3.0])
     u_y = dense_vec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend())
     @test nonzeros(u_y) ≈ [7.0, 6.0, 19.0]
 end
 
@@ -152,7 +152,7 @@ end
     u_x = dense_vec([1.0, 2.0, 3.0])
     u_y = dense_vec(zeros(Float64, 3))
 
-    sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend())
+    execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend())
     @test nonzeros(u_y) ≈ [7.0, 0.0, 19.0]
 end
 
@@ -178,7 +178,7 @@ end
     # COO uses @atomic on float values.  POCL's SPIR-V target may not support
     # SPV_EXT_shader_atomic_float_add; skip rather than fail on those devices.
     try
-        sparse_mv!(u_A, u_x, u_y; backend=EmitterBackend())
+        execute(SpMVOp, u_A, u_x, u_y; backend=EmitterBackend())
         @test nonzeros(u_y) ≈ [7.0, 6.0, 19.0]
     catch e
         msg = sprint(showerror, e)
@@ -223,7 +223,7 @@ end
         C_mat, nothing,
     )
 
-    sparse_mm!(u_A, u_B, u_C; backend=EmitterBackend())
+    execute(SpMMOp, u_A, u_B, u_C; backend=EmitterBackend())
     @test nonzeros(u_C) ≈ [1.0 6.0; 6.0 3.0; 4.0 15.0]
 end
 
@@ -254,7 +254,7 @@ end
         C_mat, nothing,
     )
 
-    sparse_mm!(u_A, u_B, u_C; backend=EmitterBackend())
+    execute(SpMMOp, u_A, u_B, u_C; backend=EmitterBackend())
     # Row 2 absent → C[2,:] stays zero
     @test nonzeros(u_C) ≈ [1.0 6.0; 0.0 0.0; 4.0 15.0]
 end
@@ -281,7 +281,7 @@ end
         nzval, nothing,
     )
 
-    sparse_sddmm!(u_A, u_B, u_C; backend=EmitterBackend(), beta=0.0)
+    execute(SDDMMOp, u_A, u_B, u_C; backend=EmitterBackend(), beta=0.0)
     # (A*B) sampled at (1,1)=1,(1,3)=1,(2,2)=1,(3,1)=1,(3,3)=2
     @test nonzeros(u_C) ≈ [1.0, 1.0, 1.0, 1.0, 2.0]
 end
@@ -302,7 +302,7 @@ end
         nzval, nothing,
     )
 
-    sparse_sddmm!(u_A, u_B, u_C; backend=EmitterBackend(), beta=0.0)
+    execute(SDDMMOp, u_A, u_B, u_C; backend=EmitterBackend(), beta=0.0)
     @test nonzeros(u_C) ≈ [1.0, 1.0, 1.0, 1.0, 2.0]
 end
 
@@ -321,7 +321,7 @@ end
         nzval, nothing,
     )
 
-    u_D = sparse_to_dense(u_A; backend=EmitterBackend())
+    u_D = execute(SparseToDenseOp, u_A; backend=EmitterBackend())
     @test format(u_D) == Formats.DensedRight(2)
     @test nonzeros(u_D) ≈ [1.0 0.0 2.0; 0.0 3.0 0.0; 4.0 0.0 5.0]
 end
@@ -338,7 +338,7 @@ end
         nzval, nothing,
     )
 
-    u_D = sparse_to_dense(u_A; backend=EmitterBackend())
+    u_D = execute(SparseToDenseOp, u_A; backend=EmitterBackend())
     @test nonzeros(u_D) ≈ [1.0 0.0 2.0; 0.0 3.0 0.0; 4.0 0.0 5.0]
 end
 
@@ -362,11 +362,11 @@ end
     u_x = dense_vec([1.0, 2.0, 3.0])
 
     u_A1 = make_A(); u_y1 = dense_vec(zeros(3))
-    sparse_mv!(u_A1, u_x, u_y1; backend=EmitterBackend())
+    execute(SpMVOp, u_A1, u_x, u_y1; backend=EmitterBackend())
     @test nonzeros(u_y1) ≈ [7.0, 6.0, 19.0]
 
     u_A2 = make_A(); u_y2 = dense_vec(zeros(3))
-    sparse_mv!(u_A2, u_x, u_y2; backend=EmitterBackend())
+    execute(SpMVOp, u_A2, u_x, u_y2; backend=EmitterBackend())
     @test nonzeros(u_y2) ≈ [7.0, 6.0, 19.0]
 
     # Both u_A1 and u_A2 have identical Julia types (same FMT type param) →

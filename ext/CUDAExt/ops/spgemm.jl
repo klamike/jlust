@@ -12,7 +12,7 @@
 # CuSpGEMMDescriptor.  Phase 4 (reuse_compute) only fills in numeric values —
 # no additional workspace, no reanalysis.
 
-mutable struct CUSPARSESpGEMMHandle{T,Ti}
+mutable struct CUSPARSESpGEMMHandle{T,Ti} <: JLUST.AbstractKernelHandle
     spgemm_desc::CuSpGEMMDescriptor
     descA::CuSparseMatrixDescriptor
     descB::CuSparseMatrixDescriptor
@@ -105,8 +105,8 @@ function JLUST.update_values!(h::CUSPARSESpGEMMHandle, u_A::USTensor, u_B::USTen
 end
 
 # Handle path — numeric-only reuse; no workspace, no reanalysis.
-function JLUST.sparse_gemm!(h::CUSPARSESpGEMMHandle{T,Ti};
-                              alpha=one(T), beta=zero(T)) where {T, Ti}
+function JLUST.execute(h::CUSPARSESpGEMMHandle{T,Ti};
+                        alpha=one(T), beta=zero(T)) where {T, Ti}
     cusparseSpGEMMreuse_compute(
         handle(), h.transa, h.transb,
         Ref{T}(alpha), h.descA, h.descB,
@@ -120,10 +120,10 @@ end
 # ─── Execution ────────────────────────────────────────────────────────────────
 
 # Direct path — builds fresh descriptors and runs the full SpGEMM each call.
-function JLUST.sparse_gemm!(::CUSPARSEBackend,
-                              u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
-                              transa::Char='N', transb::Char='N',
-                              alpha=one(T), beta=zero(T)) where {T<:_CUSPARSE_ELTYPES, Ti}
+function JLUST.execute(::CUSPARSEBackend, ::Op{:SpGEMM, F},
+                       u_A::USTensor{T,Ti}, u_B::USTensor, u_C::USTensor;
+                       transa::Char='N', transb::Char='N',
+                       alpha=one(T), beta=zero(T)) where {F, T<:_CUSPARSE_ELTYPES, Ti}
     cusA = _to_cuspmat(u_A)::CuSparseMatrixCSR{T,Ti}
     cusB = _to_cuspmat(u_B)::CuSparseMatrixCSR{T,Ti}
     cusC = _to_cuspmat(u_C)::CuSparseMatrixCSR{T,Ti}

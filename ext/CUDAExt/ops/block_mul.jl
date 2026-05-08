@@ -32,7 +32,7 @@ function _bm_mul_seq!(y::CuVector, A::BlockSparseMatrix, x::CuVector, be, nb_r::
             b === nothing && continue
             x_sl = view(x, A._col_off[j]+1 : A._col_off[j+1])
             β    = first_col ? false : true
-            sparse_mv!(be, b, x_sl, y_sl; beta=β)
+            JLUST.execute(JLUST.SpMVOp, b, JLUST.ust(x_sl), JLUST.ust(y_sl); backend=be, beta=β)
             first_col = false
         end
     end
