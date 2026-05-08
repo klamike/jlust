@@ -123,6 +123,22 @@ function _emit_sddmm_lv(::DeltaLevel, levels, lvl, _, pc, cc, T)
     error("EmitterBackend SDDMM: DeltaLevel not supported. Convert C to CSR or COO first.")
 end
 
+# AbstractLevelFormat (custom inner level) → delegate to level_step hook.
+function _emit_sddmm_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T)
+    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
+    inner  = _emit_sddmm_level(levels, lvl + 1, p_var, pc, cc, T)
+    quote
+        _p1 = Int($p_var) - Int(_origin_off) + 1
+        (_col_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
+        _nnz_pos = $p_var
+        $inner
+    end
+end
+
+function _emit_sddmm_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc, T)
+    error("EmitterBackend SDDMM: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+end
+
 # ─── Kernel cache and launch ──────────────────────────────────────────────────
 
 function _get_sddmm_kernel(fmt::TensorFormat, ::Type{T}) where T

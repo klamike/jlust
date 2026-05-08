@@ -133,29 +133,21 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
         NaN
     end
 
-    # §2: cuSPARSE reference
+    # §2: cuSPARSE handle reference (prepared, pre-analyzed)
+    A_cpu = vcat(
+        hcat(Cg,                        spzeros(n_bus, n_line), -Bbus),
+        hcat(spzeros(n_line, n_gen),    negI,                    Bf))
     t_cusparse_s2 = if HAS_CUDA
-        A_full = vcat(
-            hcat(Cg,                        spzeros(n_bus, n_line), -Bbus),
-            hcat(spzeros(n_line, n_gen),    negI,                    Bf))
-        A_cu = CUDA.CUSPARSE.CuSparseMatrixCSR(A_full)
-        x_cu = CUDA.CuArray(Vector{Float64}(x_bm))
-        y_cu = CUDA.CuArray(zeros(Float64, n_con))
-        mul!(y_cu, A_cu, x_cu); CUDA.synchronize()
-        @belapsed(begin mul!($y_cu, $A_cu, $x_cu); CUDA.synchronize() end,
+        u_A_full = ust(CUDA.CUSPARSE.CuSparseMatrixCSR(FloatType.(A_cpu)))
+        u_x_h    = ust(CUDA.CuArray(Vector{FloatType}(x_bm)))
+        u_y_h    = ust(CUDA.zeros(FloatType, n_con))
+        h_sp2    = prepare(CUSPARSEBackend(), SpMVOp, u_A_full)
+        sparse_mv!(h_sp2, u_x_h, u_y_h); CUDA.synchronize()
+        @belapsed(begin sparse_mv!($h_sp2, $u_x_h, $u_y_h); CUDA.synchronize() end,
                   samples=n_s2, evals=1) * 1e6
     else
         NaN
     end
-
-    # §2: CPU CSC reference
-    A_cpu = vcat(
-        hcat(Cg,                        spzeros(n_bus, n_line), -Bbus),
-        hcat(spzeros(n_line, n_gen),    negI,                    Bf))
-    x_cpu = randn(n_var)
-    y_cpu = zeros(n_con)
-    mul!(y_cpu, A_cpu, x_cpu)
-    t_cpu_s2 = @belapsed(mul!($y_cpu, $A_cpu, $x_cpu), samples=n_s2, evals=1) * 1e6
 
     # §3: BlockBandedMatrix
     R_cpu  = sparse(1:n_gen, 1:n_gen, ones(n_gen), n_gen, n_var)
@@ -186,25 +178,20 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
         NaN
     end
 
-    # §3: serial cuSPARSE reference
+    # §3: serial cuSPARSE handle reference (T calls on single-period matrix)
     t_cusparse_s3 = if HAS_CUDA
-        A_cu2 = CUDA.CUSPARSE.CuSparseMatrixCSR(A_cpu)
-        xp_cu = CUDA.CuArray(randn(n_var))
-        yp_cu = CUDA.CuArray(zeros(n_con))
+        u_A_per = ust(CUDA.CUSPARSE.CuSparseMatrixCSR(FloatType.(A_cpu)))
+        u_xp    = ust(CUDA.randn(FloatType, n_var))
+        u_yp    = ust(CUDA.zeros(FloatType, n_con))
+        h_sp3   = prepare(CUSPARSEBackend(), SpMVOp, u_A_per)
+        sparse_mv!(h_sp3, u_xp, u_yp); CUDA.synchronize()
         @belapsed(begin
-            for _ in 1:$T; mul!($yp_cu, $A_cu2, $xp_cu); end
+            for _ in 1:$T; sparse_mv!($h_sp3, $u_xp, $u_yp); end
             CUDA.synchronize()
         end, samples=10, evals=1) * 1e6
     else
         NaN
     end
-
-    # §3: serial CPU reference
-    xp_cpu = randn(n_var)
-    yp_cpu = zeros(n_con)
-    t_cpu_s3 = @belapsed(begin
-        for _ in 1:$T; mul!($yp_cpu, $A_cpu, $xp_cpu); end
-    end, samples=5, evals=1) * 1e6
 
     # correctness check: JLUST §2 output vs sparse CPU reference
     ok = let x_ref = Vector{Float64}(x_bm),
@@ -214,8 +201,8 @@ function bench_case(case::String; T::Int=24, n_s2::Int=100, n_s3::Int=20)
     end
 
     (; n_bus, n_line, n_gen,
-       t_cpu_s2, t_cusparse_s2, t_jlust_s2, t_graph_s2,
-       t_cpu_s3, t_cusparse_s3, t_jlust_s3, t_graph_s3,
+       t_cusparse_s2, t_graph_s2,
+       t_cusparse_s3, t_graph_s3,
        ok)
 end
 
@@ -234,64 +221,36 @@ const _backend = HAS_CUDA  ? "CUDA ($(CUDA.name(CUDA.device())))" :
                  HAS_METAL ? "Metal ($(Metal.current_device().name))" :
                  "CPU"
 
-println("="^80)
+println("="^72)
 println("JLUST multi-case sweep   (T=24, $(FloatType), $_backend)")
-println("="^80)
+println("="^72)
 println()
+@printf("  %-18s  %6s  │  §2 single DCOPF (μs)       │  §3 per period (μs)\n",
+        "Case", "buses")
+@printf("  %-18s  %6s  │  %8s  %8s  %7s  │  %8s  %8s  %7s  %s\n",
+        "", "", "cuSP-h", "Graph", "speedup", "cuSP-h", "Graph", "speedup", "ok")
+println("  " * "─"^70)
 
 results = Pair{String,Any}[]
 for case in CASES
     short = replace(case, "pglib_opf_case" => "")
-    print("  $short ... ")
+    print("  $(rpad(short, 18))  ")
     flush(stdout)
     r = bench_case(case)
     push!(results, case => r)
-    println("$(r.n_bus) buses  ok=$(r.ok)")
+
+    sp2 = isnan(r.t_cusparse_s2) ? "    —  " : @sprintf("%5.2f×", r.t_cusparse_s2 / r.t_graph_s2)
+    sp3 = isnan(r.t_cusparse_s3) ? "    —  " : @sprintf("%5.2f×", r.t_cusparse_s3 / r.t_graph_s3)
+    ok  = r.ok ? "✓" : "✗"
+
+    @printf("%6d  │  %8.2f  %8.2f  %7s  │  %8.2f  %8.2f  %7s  %s\n",
+            r.n_bus,
+            r.t_cusparse_s2, r.t_graph_s2, sp2,
+            r.t_cusparse_s3/24, r.t_graph_s3/24, sp3,
+            ok)
+    flush(stdout)
 end
 
-# ── §2 table ─────────────────────────────────────────────────────────────────
-
+println("  " * "─"^70)
 println()
-println("─"^80)
-println("§2  Single DCOPF  mul!(y, BM, x)  —  time (μs), lower is better")
-println("─"^80)
-@printf("  %-18s  %6s %6s %6s  │  %8s  %8s  %8s  %8s  │  %s\n",
-        "Case", "buses", "lines", "gens",
-        "CPU-CSC", "cuSPARSE", "JLUST", "Graph", "Graph/cuSPARSE")
-println("  " * "─"^78)
-for (case, r) in results
-    short = replace(case, "pglib_opf_case" => "")
-    speedup = isnan(r.t_cusparse_s2) ? "—" :
-              @sprintf("%.2f×", r.t_cusparse_s2 / r.t_graph_s2)
-    @printf("  %-18s  %6d %6d %6d  │  %8.1f  %8.1f  %8.1f  %8.1f  │  %s\n",
-            short, r.n_bus, r.n_line, r.n_gen,
-            r.t_cpu_s2, r.t_cusparse_s2, r.t_jlust_s2, r.t_graph_s2, speedup)
-end
-println("  " * "─"^78)
-
-# ── §3 table ─────────────────────────────────────────────────────────────────
-
-println()
-println("─"^80)
-println("§3  Multi-stage T=24  —  per-period time (μs), lower is better")
-println("─"^80)
-@printf("  %-18s  %6s %6s %6s  │  %8s  %8s  %8s  %8s  │  %s\n",
-        "Case", "buses", "lines", "gens",
-        "CPU/T", "cuSP/T", "JLUST/T", "Graph/T", "Graph/cuSP")
-println("  " * "─"^78)
-for (case, r) in results
-    short = replace(case, "pglib_opf_case" => "")
-    speedup = isnan(r.t_cusparse_s3) ? "—" :
-              @sprintf("%.2f×", r.t_cusparse_s3 / r.t_graph_s3)
-    @printf("  %-18s  %6d %6d %6d  │  %8.1f  %8.2f  %8.2f  %8.2f  │  %s\n",
-            short, r.n_bus, r.n_line, r.n_gen,
-            r.t_cpu_s3/24, r.t_cusparse_s3/24, r.t_jlust_s3/24, r.t_graph_s3/24, speedup)
-end
-println("  " * "─"^78)
-
-println()
-println("Correctness (JLUST vs cuSPARSE, rel. err < 1e-6):")
-for (case, r) in results
-    short = replace(case, "pglib_opf_case" => "")
-    println("  $(short): $(r.ok ? "✓" : "✗ FAILED")")
-end
+println("  cuSP-h = cuSPARSE prepared handle.  Graph = JLUST CUDA graph.")

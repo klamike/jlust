@@ -88,7 +88,7 @@ println("Warm-up done.")
 # ─── Introspect internals ─────────────────────────────────────────────────────
 
 (; diags, off_diags, _spmm_bufs) = BM_ms
-(; row_bufs, diag_out, ramp_bufs) = _spmm_bufs
+(; row_bufs, diag_out, off_bufs) = _spmm_bufs
 nb_r, nb_c = size(diags.blocks)
 cum_off  = cumsum([0; BM_ms.n_off_rows])
 d_period = BM_ms.n_diag_rows + cum_off[end]
@@ -96,7 +96,7 @@ d_starts = JLUST._bbm_diag_starts(BM_ms.n_diag_rows, cum_off, T_ms, BM_ms.bw)
 n_cols   = BM_ms.n_cols
 X2       = reshape(x_ms, n_cols, T_ms)
 neg_R, pos_R = off_diags[1]
-ramp_buf = ramp_bufs[1]  # pre-allocated (n_rmp × (T-1))
+off_buf = off_bufs[1]  # pre-allocated (n_off × (T-1))
 
 # Recreate col_bufs locally for old-gather-path comparison only
 col_bufs = [CUDA.zeros(Float64, diags.col_sizes[j], T_ms) for j in 1:nb_c]
@@ -153,7 +153,7 @@ _run_bbm_spmm! = (X2, row_bufs, diags, nb_r, nb_c) -> begin
         first_dense = true
         for j in 1:nb_c  # pass 1: dense
             b = diags.blocks[i, j]; b === nothing && continue
-            JLUST._needs_row_guard(b) && continue
+            JLUST.needs_row_guard(b) && continue
             col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
             JLUST.sparse_mm!(b, col_view, row_bufs[i];
                              beta=first_dense ? 0.0 : 1.0)
@@ -161,7 +161,7 @@ _run_bbm_spmm! = (X2, row_bufs, diags, nb_r, nb_c) -> begin
         end
         for j in 1:nb_c  # pass 2: sparse (guarded)
             b = diags.blocks[i, j]; b === nothing && continue
-            !JLUST._needs_row_guard(b) && continue
+            !JLUST.needs_row_guard(b) && continue
             col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
             if first_dense
                 fill!(row_bufs[i], 0.0)
@@ -186,7 +186,7 @@ println("    -- pass 1 (dense, beta=0 then beta=1):")
 first_dense = true
 for j in 1:nb_c, i in 1:nb_r
     b = diags.blocks[i, j]; b === nothing && continue
-    JLUST._needs_row_guard(b) && continue
+    JLUST.needs_row_guard(b) && continue
     col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
     β = first_dense ? 0.0 : 1.0
     t_block = @belapsed(begin
@@ -201,7 +201,7 @@ end; sync()
 println("    -- pass 2 (sparse, guarded):")
 for j in 1:nb_c, i in 1:nb_r
     b = diags.blocks[i, j]; b === nothing && continue
-    !JLUST._needs_row_guard(b) && continue
+    !JLUST.needs_row_guard(b) && continue
     col_view = view(X2, diags._col_off[j]+1:diags._col_off[j+1], :)
     t_block = @belapsed(begin
         JLUST.sparse_mm!($b, $col_view, $row_bufs[$i]; beta=1.0, skip_empty_rows=true)
@@ -234,17 +234,17 @@ end, samples=N, evals=1) * 1e6
 x_lo_mat = reshape(view(x_ms, 1:(T_ms-1)*n_cols), n_cols, T_ms-1)
 x_hi_mat = reshape(view(x_ms, n_cols+1:T_ms*n_cols), n_cols, T_ms-1)
 
-t_ramp_spmm = @belapsed(begin
-    LinearAlgebra.mul!($ramp_buf, $neg_R, $x_lo_mat)
-    LinearAlgebra.mul!($ramp_buf, $pos_R, $x_hi_mat, true, true)
-    JLUST._bbm_scatter_ramp!($y_ms, $ramp_buf, $d_period,
-                              $BM_ms.n_diag_rows + $cum_off[1], $BM_ms.n_off_rows[1], $T_ms-1)
+t_off_spmm = @belapsed(begin
+    LinearAlgebra.mul!($off_buf, $neg_R, $x_lo_mat)
+    LinearAlgebra.mul!($off_buf, $pos_R, $x_hi_mat, true, true)
+    JLUST._bbm_scatter_off!($y_ms, $off_buf, $d_period,
+                             $BM_ms.n_diag_rows + $cum_off[1], $BM_ms.n_off_rows[1], $T_ms-1)
     CUDA.synchronize()
 end, samples=N, evals=1) * 1e6
-@printf("    ramp (2 SpMMs+1 scatter) : %7.1f μs\n", t_ramp_spmm)
+@printf("    off-diag (2 SpMMs+scatter): %7.1f μs\n", t_off_spmm)
 
-# Old ramp path for comparison (46 SpMVs)
-t_ramp_spv = @belapsed(begin
+# Old off-diagonal path for comparison (sequential SpMVs)
+t_off_spv = @belapsed(begin
     for t in 1:$T_ms - 1
         off_row = $d_starts[t] + $BM_ms.n_diag_rows + $cum_off[1]
         y_off   = view($y_ms, off_row:off_row+$BM_ms.n_off_rows[1]-1)
@@ -254,19 +254,18 @@ t_ramp_spv = @belapsed(begin
         LinearAlgebra.mul!(y_off, $pos_R, x_hi, true, true)
     end; CUDA.synchronize()
 end, samples=N, evals=1) * 1e6
-@printf("    ramp OLD (46 SpMVs)      : %7.1f μs  (%.2f× slower)\n",
-        t_ramp_spv, t_ramp_spv / t_ramp_spmm)
+@printf("    off-diag OLD (%d SpMVs)  : %7.1f μs  (%.2f× slower)\n",
+        2*(T_ms-1), t_off_spv, t_off_spv / t_off_spmm)
 
 println("─"^62)
-t_sum = t_spmm + t_scatter_new + t_ramp_spmm   # t_spmm includes fill!+guard; gather eliminated
-@printf("  sum(active components)    : %7.1f μs  (spmm+fill %.1f + scatter %.1f + ramp %.1f)\n",
-        t_sum, t_spmm, t_scatter_new, t_ramp_spmm)
+t_sum = t_spmm + t_scatter_new + t_off_spmm
+@printf("  sum(active components)    : %7.1f μs  (spmm %.1f + scatter %.1f + off %.1f)\n",
+        t_sum, t_spmm, t_scatter_new, t_off_spmm)
 @printf("  overhead/overlap          : %7.1f μs\n", t_full - t_sum)
 
 println("\n" * "═"^62)
-println("Optimization summary vs original (fill!+46SpMV+48scatter path):")
+println("Optimization summary vs original (fill!+SpMV+scatter path):")
 
-# Estimate original fill! cost separately
 t_fill = @belapsed(begin
     fill!($diag_out, 0.0); CUDA.synchronize()
 end, samples=N, evals=1) * 1e6
@@ -275,6 +274,6 @@ end, samples=N, evals=1) * 1e6
 @printf("  gather: %d×cpy (eliminated): saves %.1f μs\n", nb_c, t_gather)
 @printf("  scatter: %d×cpy → 1 kern  :   saves %.1f μs\n",
         T_ms*nb_r, t_scatter_old - t_scatter_new)
-@printf("  ramp: 46 SpMV → 2 SpMM+1 :   saves %.1f μs\n", t_ramp_spv - t_ramp_spmm)
+@printf("  off-diag: %d SpMV → 2 SpMM:   saves %.1f μs\n", 2*(T_ms-1), t_off_spv - t_off_spmm)
 @printf("  total estimated savings   : %.1f μs\n",
-        t_fill + t_gather + (t_scatter_old - t_scatter_new) + (t_ramp_spv - t_ramp_spmm))
+        t_fill + t_gather + (t_scatter_old - t_scatter_new) + (t_off_spv - t_off_spmm))

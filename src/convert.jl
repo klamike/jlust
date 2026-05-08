@@ -95,6 +95,15 @@ function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offs
     end
 end
 
+# AbstractLevelFormat: delegate to level_step for single-element-per-position levels.
+function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offset, lv::AbstractLevelFormat)
+    u  = d.u
+    nz = level_has_nzval(lv) ? SparseArrays.nonzeros(u) : nothing
+    col_1based, _ = level_step(lv, p + 1, nz)
+    lvls[idx] = col_1based - 1   # 0-based for composer arithmetic
+    _decompose!(d, lvls, idx + 1, p, lasta)
+end
+
 function run!(d::TensorDecomposer)
     u = d.u
     lvls = zeros(Int, length(u.format.levels))
@@ -191,7 +200,7 @@ function _segment_builder!(c::TensorComposer, idx::Int, full::Int, repeat::Int, 
     _segment_builder_level!(c, idx, full, repeat, is_insert, _get_prop(c, idx))
 end
 
-function _segment_builder_level!(c::TensorComposer, idx, full, repeat, is_insert, ::Union{DenseLevel,RangeLevel})
+function _segment_builder_level!(c::TensorComposer, idx, full, repeat, is_insert, ::Union{DenseLevel,BatchLevel,RangeLevel})
     sz = _lvl_extent(c, idx)
     @assert sz >= full
     _segment_builder!(c, idx + 1, 0, repeat * (sz - full), is_insert)
@@ -203,6 +212,11 @@ end
 
 function _segment_builder_level!(c::TensorComposer, idx, full, repeat, is_insert, ::SingletonLevel)
     # nothing — singleton emits no segment padding
+end
+
+function _segment_builder_level!(c::TensorComposer, idx, full, repeat, is_insert, lv::AbstractLevelFormat)
+    error("convert_format: cannot compose into custom level $(typeof(lv)) via COO intermediate. " *
+          "Custom AbstractLevelFormat targets are not supported by TensorComposer.")
 end
 
 function _insert_builder!(c::TensorComposer, idx::Int, lo::Int, hi::Int, is_insert::Bool)
@@ -231,7 +245,7 @@ function _insert_builder!(c::TensorComposer, idx::Int, lo::Int, hi::Int, is_inse
     _segment_builder!(c, idx, full, 1, is_insert)
 end
 
-function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, ::Union{DenseLevel,RangeLevel})
+function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, ::Union{DenseLevel,BatchLevel,RangeLevel})
     @assert crd >= full
     if crd > full
         _segment_builder!(c, idx + 1, 0, crd - full, is_insert)
@@ -240,6 +254,11 @@ end
 
 function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, ::Union{CompressedLevel,SingletonLevel})
     _append_crd!(c, idx, crd, 1, is_insert)
+end
+
+function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, lv::AbstractLevelFormat)
+    error("convert_format: cannot insert into custom level $(typeof(lv)) via COO intermediate. " *
+          "Custom AbstractLevelFormat targets are not supported by TensorComposer.")
 end
 
 function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, lv::DeltaLevel)
@@ -353,7 +372,7 @@ function convert_format(u::USTensor{T,I,N,VA,VI,O},
         elseif lv isa SingletonLevel
             final_crd[idx] = crd_bufs[idx]
         end
-        # DenseLevel and RangeLevel: no buffers
+        # DenseLevel, BatchLevel, RangeLevel: no buffers
     end
 
     # Composer always produces 0-based indices; adjust to OneBased if needed.
@@ -405,144 +424,9 @@ Base.convert(::Type{SparseMatrixCSC}, u::USTensor{T,I}) where {T,I} =
 function _lexsort_cols(A::Matrix)
     nrows, ncols = size(A)
     ncols == 0 && return Int[]
-    # sortperm on a vector of tuples
     keys = [ntuple(r -> A[r, j], nrows) for j in 1:ncols]
     sortperm(keys)
 end
 
-# Generic function stubs — methods are added by backend extensions
+# materialize stub — concrete method added by CUDAExt
 function materialize end
-
-"""
-    apply_values!(f, u::USTensor; backend) -> u
-
-Apply `f` element-wise to every stored non-zero value of `u` in-place.
-Returns `u`. Does not change the sparsity structure.
-"""
-function apply_values! end
-
-"""
-    sparse_mv!(A, x, y; backend, alpha=1, beta=0) -> y
-
-Compute `y = alpha * A * x + beta * y` where `A` is sparse and `x`, `y` are dense.
-Backend extensions add concrete methods dispatching on `backend` as a positional arg.
-"""
-function sparse_mv! end
-
-"""
-    sparse_mm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> C
-
-Compute `C = alpha * op(A) * op(B) + beta * C` where `A` is sparse, `B` and `C` are dense.
-"""
-function sparse_mm! end
-
-"""
-    sparse_vv(x, y; backend) -> Number
-
-Sparse vector dot product. `x` is sparse (COO-style), `y` is dense.
-"""
-function sparse_vv end
-
-"""
-    sparse_sv!(A, b, x; backend, uplo='L', diag='N', transa='N', alpha=1) -> x
-
-Sparse triangular solve: `A * x = alpha * b`. `b` and `x` are dense vectors.
-"""
-function sparse_sv! end
-
-"""
-    sparse_sm!(A, B, C; backend, uplo='L', diag='N', transa='N', alpha=1) -> C
-
-Sparse triangular solve with multiple RHS: solve `A * X = alpha * B`. `B`, `C` dense.
-"""
-function sparse_sm! end
-
-"""
-    sparse_sddmm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> C
-
-Sampled dense-dense matmul: `C = alpha * (op(A) * op(B)) ∘ sparsity(C) + beta * C`.
-`C` is sparse (mask); `A`, `B` are dense.
-"""
-function sparse_sddmm! end
-
-"""
-    sparse_to_dense(u; backend) -> USTensor{dense}
-
-Convert a sparse `USTensor` to a dense `USTensor`.
-"""
-function sparse_to_dense end
-
-"""
-    dense_to_sparse(u, fmt; backend) -> USTensor{sparse}
-
-Convert a dense `USTensor` to a sparse `USTensor` with format `fmt`.
-"""
-function dense_to_sparse end
-
-"""
-    sparse_gather!(y, x_dense; backend) -> y
-
-Gather: `y[idx] = x_dense[y.indices]` for a sparse vector `y`.
-"""
-function sparse_gather! end
-
-"""
-    sparse_scatter!(x_dense, y; backend) -> x_dense
-
-Scatter: `x_dense[y.indices] = y.values` for a sparse vector `y`.
-"""
-function sparse_scatter! end
-
-"""
-    sparse_axpby!(alpha, x, beta, y; backend) -> y
-
-Scale-and-add: `y = alpha * x + beta * y` where `x` is sparse, `y` is dense.
-"""
-function sparse_axpby! end
-
-"""
-    sparse_rot!(x, y, c, s; backend) -> (x, y)
-
-Apply Givens rotation to sparse `x` and dense `y`.
-"""
-function sparse_rot! end
-
-"""
-    prepare(backend, OpType, u_A; kwargs...) -> handle
-
-Pre-build a reusable execution handle for repeated `OpType` operations on sparse matrix
-`u_A`. Allocates workspace, builds backend-specific descriptors, and (where the backend
-supports it) runs format analysis so subsequent `sparse_mv!` / `sparse_mm!` calls pay
-no allocation or analysis cost.
-
-`OpType` is the operation *type* used as a dispatch tag — e.g. `SpMVOp`, `SpMMOp`,
-`SpSVOp`. Each backend extension adds one `prepare` method per supported op; adding a
-new op type never requires changing the core stub.
-
-    h = prepare(CUSPARSEBackend(), SpMVOp, u_A)          # :spmv
-    h = prepare(CUSPARSEBackend(), SpMMOp, u_A; n_cols=k) # :spmm
-
-The returned handle is backend- and op-specific (e.g. `CUSPARSESpMVHandle`).
-Pass it as the first argument to `sparse_mv!` or `sparse_mm!` instead of the backend.
-"""
-function prepare end
-
-"""
-    update_values!(handle, u_A) -> handle
-
-Update the non-zero values of a prepared handle's sparse matrix descriptor without
-rebuilding the descriptor or workspace. The sparsity structure (row pointers, column
-indices) must remain identical to what was used in `prepare`. Only the stored values
-in `nonzeros(u_A)` are pushed into the handle.
-"""
-function update_values! end
-
-"""
-    sparse_gemm!(A, B, C; backend, transa='N', transb='N', alpha=1, beta=0) -> USTensor
-
-Compute sparse-sparse matrix product. Because SpGEMM may produce a result with a
-different sparsity structure than the input `C`, the returned USTensor may not share
-buffers with `C`. For beta=0 (default) `C` is used only for sizing; for beta≠0 `C`
-must already carry the exact sparsity pattern of op(A)*op(B).
-"""
-function sparse_gemm! end

@@ -106,6 +106,24 @@ function _emit_s2d_lv(::Union{RangeLevel,DeltaLevel}, levels, lvl, _, pc, cc)
     error("EmitterBackend sparse_to_dense: RangeLevel/DeltaLevel not supported.")
 end
 
+# Custom AbstractLevelFormat (inner position): delegate to level_step hook.
+# level_step(lv, i, nz) returns (col_idx, val); col_idx is used for the dense
+# scatter target.  Only callable as an inner (non-outermost) level.
+function _emit_s2d_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc)
+    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
+    inner  = _emit_s2d_level(levels, lvl + 1, p_var, pc, cc)
+    quote
+        _p1 = Int($p_var) - Int(_origin_off) + 1
+        (_col_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
+        _nnz_pos = $p_var
+        $inner
+    end
+end
+
+function _emit_s2d_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc)
+    error("EmitterBackend sparse_to_dense: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+end
+
 # ─── Kernel cache and launch ──────────────────────────────────────────────────
 
 function _get_s2d_kernel(fmt::TensorFormat)

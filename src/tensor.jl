@@ -4,21 +4,11 @@ abstract type AbstractIndexOrigin end
 struct OneBased  <: AbstractIndexOrigin end
 struct ZeroBased <: AbstractIndexOrigin end
 
-Base.:(==)(::OneBased,  ::OneBased)  = true
-Base.:(==)(::ZeroBased, ::ZeroBased) = true
-Base.:(==)(::OneBased,  ::ZeroBased) = false
-Base.:(==)(::ZeroBased, ::OneBased)  = false
-
 # ─── Memory space ─────────────────────────────────────────────────────────────
 
 abstract type AbstractMemorySpace end
 struct CPUMemory <: AbstractMemorySpace end
 struct GPUMemory <: AbstractMemorySpace end
-
-Base.:(==)(::CPUMemory, ::CPUMemory) = true
-Base.:(==)(::GPUMemory, ::GPUMemory) = true
-Base.:(==)(::CPUMemory, ::GPUMemory) = false
-Base.:(==)(::GPUMemory, ::CPUMemory) = false
 
 # ─── Device descriptors ───────────────────────────────────────────────────────
 
@@ -163,7 +153,9 @@ function _locate(u::USTensor{T,I,N,VA,VI,O}, lvl_idx, origin_offset, level::Int,
         return _locate(u, lvl_idx, origin_offset, level + 1, next_p)
 
     else
-        error("getindex: unsupported level format $(typeof(lv))")
+        next_p = locate_level(lv, u, stored_target, origin_offset, level, p)
+        next_p === nothing && return zero(T)
+        return _locate(u, lvl_idx, origin_offset, level + 1, next_p)
     end
 end
 

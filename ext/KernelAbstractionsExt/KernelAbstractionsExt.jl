@@ -12,7 +12,8 @@ import JLUST:
     sparse_sv!, sparse_sm!, sparse_sddmm!, sparse_to_dense, dense_to_sparse,
     csr_tensor, prepare,
     EmitterBackend, level_has_nzval, level_arg_names, level_args, emit_spmv_lv,
-    _bbm_scatter_diag!, _bbm_scatter_ramp!
+    needs_row_guard,
+    _bbm_scatter_diag!, _bbm_scatter_off!
 
 _is_dense_fmt(fmt::TensorFormat) =
     all(lv isa Union{DenseLevel,BatchLevel} for (_, lv) in fmt.levels)

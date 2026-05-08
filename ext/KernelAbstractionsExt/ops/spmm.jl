@@ -137,6 +137,24 @@ function _emit_spmm_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na)
           "Use convert_format to CSR or DCSR first.")
 end
 
+# AbstractLevelFormat (custom inner level) → delegate to level_step hook.
+# Mirrors the s2d and SpMV AbstractLevelFormat fallbacks.
+# Custom outermost levels must be paired with an outer DenseLevel.
+function _emit_spmm_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T, na)
+    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
+    inner  = _emit_spmm_level(levels, lvl + 1, p_var, pc, cc, T, na)
+    quote
+        _p1 = Int($p_var) - Int(_origin_off) + 1
+        (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
+        _nnz_pos = $p_var
+        $inner
+    end
+end
+
+function _emit_spmm_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc, T, na)
+    error("EmitterBackend SpMM: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+end
+
 # ─── Kernel cache and launch ─────────────────────────────────────────────────
 
 # ─── NNZ-first (tiled) SpMM emitter ─────────────────────────────────────────
@@ -626,6 +644,18 @@ function _emit_spmm_tiled_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T
     end
 end
 
+# AbstractLevelFormat inner level: delegate to level_step hook (mirrors non-tiled path).
+function _emit_spmm_tiled_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T, tile_k)
+    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
+    inner  = _emit_spmm_tiled_inner(levels, lvl + 1, p_var, pc, cc, T, tile_k)
+    quote
+        _p1 = Int($p_var) - Int(_origin_off) + 1
+        (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
+        _nnz_pos = $p_var
+        $inner
+    end
+end
+
 function _emit_spmm_tiled_lv(lv, args...)
     error("EmitterBackend tiled SpMM: unsupported level $(typeof(lv)); convert to CSR/DCSR first")
 end
@@ -673,7 +703,7 @@ function _emit_spmm_body_tiled(fmt::TensorFormat, ::Type{T}, tile_k::Int) where 
             end
         end
     else
-        error("EmitterBackend tiled SpMM: unsupported outermost level $(typeof(lv1))")
+        error("EmitterBackend tiled SpMM: $(typeof(lv1)) cannot be the outermost level; pair with DenseLevel or use unique CompressedLevel.")
     end
 end
 
@@ -714,7 +744,8 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     n_col   = Int(extents(u_B)[2])
 
     _, lv1 = fmt.levels[1]
-    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1)
+    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
+                  length(fmt.levels) >= 2 && fmt.levels[2].second isa SingletonLevel
 
     # COO-like patterns use @atomic += and cannot scale existing C values.
     if is_coo_like
@@ -798,7 +829,7 @@ end
 #
 # Replace T*nb_r tiny copyto! calls (48 for T=24, nb_r=2) with a single kernel.
 # diag scatter: diag_out[r, t] → y[(t-1)*d_period + r]  (0-indexed t, r)
-# ramp  scatter: ramp[r, t]     → y[(t-1)*d_period + ramp_off + r]
+# off  scatter: off_buf[r, t]  → y[(t-1)*d_period + off_start + r]
 
 @kernel inbounds=true function _bbm_scatter_diag_kernel!(_y, @Const(_diag), _d_period, _n_diag)
     gid = @index(Global, Linear) - 1
@@ -807,11 +838,11 @@ end
     _y[t * _d_period + r + 1] = _diag[r + 1, t + 1]
 end
 
-@kernel inbounds=true function _bbm_scatter_ramp_kernel!(_y, @Const(_ramp), _d_period, _ramp_off, _n_ramp)
+@kernel inbounds=true function _bbm_scatter_off_kernel!(_y, @Const(_off), _d_period, _off_start, _n_off)
     gid = @index(Global, Linear) - 1
-    t   = gid ÷ _n_ramp
-    r   = gid % _n_ramp
-    _y[t * _d_period + _ramp_off + r + 1] = _ramp[r + 1, t + 1]
+    t   = gid ÷ _n_off
+    r   = gid % _n_off
+    _y[t * _d_period + _off_start + r + 1] = _off[r + 1, t + 1]
 end
 
 function JLUST._bbm_scatter_diag!(y, diag_out, d_period, n_diag, T)
@@ -820,8 +851,8 @@ function JLUST._bbm_scatter_diag!(y, diag_out, d_period, n_diag, T)
                                        ndrange=Int(n_diag) * Int(T))
 end
 
-function JLUST._bbm_scatter_ramp!(y, ramp, d_period, ramp_off, n_ramp, T_ramp)
+function JLUST._bbm_scatter_off!(y, off_buf, d_period, off_start, n_off, T_off)
     ka = KernelAbstractions.get_backend(y)
-    _bbm_scatter_ramp_kernel!(ka, 256)(y, ramp, Int(d_period), Int(ramp_off), Int(n_ramp);
-                                       ndrange=Int(n_ramp) * Int(T_ramp))
+    _bbm_scatter_off_kernel!(ka, 256)(y, off_buf, Int(d_period), Int(off_start), Int(n_off);
+                                      ndrange=Int(n_off) * Int(T_off))
 end

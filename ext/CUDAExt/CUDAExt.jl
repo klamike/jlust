@@ -180,17 +180,15 @@ function JLUST.supports_backend(::CUSPARSEBackend, op::SpVVOp)
 end
 
 # SpMV: A sparse, x and y dense vectors.
-# Generic API: CSR, CSC, COO.  Legacy bsrmv: BSR.  SELL_ALG1: SELL.
+# Generic API: CSR, CSC, COO.
 function JLUST.supports_backend(::CUSPARSEBackend, op::SpMVOp)
-    (op.A in _CUSPARSE_GENERIC_FORMATS || _is_bsr(op.A) || _is_sell(op.A)) &&
-    op.x == _dense1 && op.y == _dense1
+    op.A in _CUSPARSE_GENERIC_FORMATS && op.x == _dense1 && op.y == _dense1
 end
 
 # SpMM: A sparse, B and C dense matrices.
-# Generic API: CSR, CSC, COO.  Generic ≥12.5.1: BSR.  BLOCKED_ELL_ALG1: BlockedELL.
+# Generic API: CSR, CSC, COO.
 function JLUST.supports_backend(::CUSPARSEBackend, op::SpMMOp)
-    (op.A in _CUSPARSE_GENERIC_FORMATS || _is_bsr(op.A) || _is_bell(op.A)) &&
-    op.B == _dense2 && op.C == _dense2
+    op.A in _CUSPARSE_GENERIC_FORMATS && op.B == _dense2 && op.C == _dense2
 end
 
 # BatchedSpMM: CuSparseArrayCSR (N-D); B and C dense.
@@ -205,10 +203,9 @@ function JLUST.supports_backend(::CUSPARSEBackend, op::SpGEMMOp)
 end
 
 # SpSV: sparse triangular solve, single RHS.
-# Generic API: CSR, CSC.  Legacy bsrsv2: BSR.
+# Generic API: CSR, CSC.
 function JLUST.supports_backend(::CUSPARSEBackend, op::SpSVOp)
-    (op.A in _CUSPARSE_TRISV_FORMATS || _is_bsr(op.A)) &&
-    op.b == _dense1 && op.x == _dense1
+    op.A in _CUSPARSE_TRISV_FORMATS && op.b == _dense1 && op.x == _dense1
 end
 
 # SpSM: sparse triangular solve, multiple RHS.
@@ -217,15 +214,15 @@ function JLUST.supports_backend(::CUSPARSEBackend, op::SpSMOp)
     op.A in _CUSPARSE_TRISV_FORMATS && op.B == _dense2 && op.C == _dense2
 end
 
-# SDDMM: C (sparse mask/result) must be CSR, COO, or BSR (≥12.1.0).
+# SDDMM: C (sparse mask/result) must be CSR or COO.
 function JLUST.supports_backend(::CUSPARSEBackend, op::SDDMMOp)
     op.A == _dense2 && op.B == _dense2 &&
-    (op.C == Formats.CSR || op.C == Formats.COO || _is_bsr(op.C))
+    (op.C == Formats.CSR || op.C == Formats.COO)
 end
 
-# SparseToDense: CSR, CSC, COO (generic API); BSR (type-specific path with reinterpret).
+# SparseToDense: CSR, CSC, COO (generic API).
 function JLUST.supports_backend(::CUSPARSEBackend, op::SparseToDenseOp)
-    op.src in _CUSPARSE_GENERIC_FORMATS || _is_bsr(op.src)
+    op.src in _CUSPARSE_GENERIC_FORMATS
 end
 
 # DenseToSparse: CSR, CSC, COO only (generic cusparseDenseToSparse).

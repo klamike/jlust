@@ -12,6 +12,8 @@ include("backends.jl")
 include("interop.jl")
 include("convert.jl")
 include("convenience.jl")
+include("block_sparse.jl")
+include("block_banded.jl")
 
 export
     # Errors
@@ -49,6 +51,7 @@ export
     supports_backend, supports_convert, validate_storage,
     EmitterBackend, CUSPARSEBackend,
     level_has_nzval, level_arg_names, level_args, emit_spmv_lv, level_step,
+    locate_level, needs_row_guard,
 
     # Tensor
     AbstractUSTensor, USTensor,

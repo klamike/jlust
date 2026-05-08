@@ -3,7 +3,7 @@
 # Sampled dense-dense matrix multiply:
 #   C ← alpha * (op(A) * op(B)) ∘ sparsity(C) + beta * C
 #
-# A and B are dense; C is sparse (CSR or BSR) and acts as both mask and output.
+# A and B are dense; C is sparse (CSR or COO) and acts as both mask and output.
 
 # ─── Handle ──────────────────────────────────────────────────────────────────
 

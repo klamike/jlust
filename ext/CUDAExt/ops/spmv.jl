@@ -261,11 +261,11 @@ function JLUST._csr_spmv_specialized!(
 
     # NNZ-based floor: enough inner iterations per thread to hide latency.
     # Split at 2 so avg_nnz ∈ [2,4) maps to VS=4 rather than VS=2.
+    # Values must be powers of 2 in {2,4,8,16,32} to match the kernel dispatch below.
     vs_nnz = avg_nnz < 2.0  ? 2  :
              avg_nnz < 4.0  ? 4  :
              avg_nnz < 8.0  ? 8  :
-             avg_nnz < 16.0 ? 16 :
-             avg_nnz < 32.0 ? 24 : 32
+             avg_nnz < 16.0 ? 16 : 32
 
     # Occupancy floor: VS such that blocks/SM ≥ 6.
     # Capped at vs_nnz × 2: beyond one doubling, idle threads outweigh the

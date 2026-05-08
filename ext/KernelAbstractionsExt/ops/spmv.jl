@@ -320,7 +320,11 @@ function JLUST.sparse_mv!(::EmitterBackend, u_A::USTensor, u_x::USTensor, u_y::U
     off          = Int32(index_origin(u_A) isa OneBased ? 1 : 0)
 
     _, lv1       = fmt.levels[1]
-    is_coo_like  = lv1 isa CompressedLevel && !is_unique(lv1)
+    # COO-like: outermost non-unique Compressed (row coords) + Singleton inner (col coords).
+    # Checking the inner level prevents routing generic non-unique-Compressed-outer formats
+    # through code that assumes coordinates(A,1)=rows, coordinates(A,2)=cols.
+    is_coo_like  = lv1 isa CompressedLevel && !is_unique(lv1) &&
+                   length(fmt.levels) >= 2 && fmt.levels[2].second isa SingletonLevel
     use_identity = IF === typeof(identity) && OF === typeof(identity)
 
     # COO specialized path: only when alpha=1, beta=0 (atomic += accumulates directly;

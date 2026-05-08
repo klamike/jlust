@@ -132,6 +132,47 @@ function emit_spmv_lv(lv::AbstractLevelFormat, p_var::Symbol, input_fn_sym::Symb
     end
 end
 
+# ─── Getindex hook ────────────────────────────────────────────────────────────
+
+"""
+    locate_level(lv, u, stored_target, origin_offset, level, p) → Union{Int,Nothing}
+
+Hook for custom `AbstractLevelFormat` subtypes in `Base.getindex`.
+
+Given the current parent fiber position `p` (1-based) and the stored coordinate
+`stored_target` being sought, return the 1-based child fiber position, or `nothing`
+for a structural zero.
+
+`level` is the 1-based level index; use `positions(u, level)` / `coordinates(u, level)`
+to access format buffers.
+"""
+function locate_level end
+
+# ─── Sparse-row predicate ─────────────────────────────────────────────────────
+
+"""
+    needs_row_guard(b::AbstractUSTensor) → Bool
+
+Return `true` when `b` has a dense outer level over a sparse inner level and
+significantly fewer NNZ than rows.  When true, the EmitterBackend SpMM kernel
+uses a guarded beta=1 path that skips empty rows rather than writing zeros.
+
+The built-in method for `USTensor` checks for a 2-level `DenseLevel`/`BatchLevel`
+outer + unique `CompressedLevel` inner with nnz < n_rows.  Define additional methods
+for custom formats with the same property.
+"""
+needs_row_guard(::AbstractUSTensor) = false
+
+function needs_row_guard(b::USTensor)
+    levels = b.format.levels
+    length(levels) == 2                    || return false
+    levels[1].second isa Union{DenseLevel,BatchLevel} || return false
+    lv2 = levels[2].second
+    lv2 isa CompressedLevel                || return false
+    is_unique(lv2)                         || return false
+    length(nonzeros(b)) < extents(b)[1]
+end
+
 # ─── Storage validation ───────────────────────────────────────────────────────
 
 function validate_storage(u::USTensor, backend::AbstractUSTBackend; op = :unknown)
