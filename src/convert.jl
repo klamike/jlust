@@ -17,7 +17,7 @@ function _decompose!(d::TensorDecomposer{F}, lvls::Vector{Int}, idx::Int, p::Int
         return
     end
 
-    _, lv = fmt.levels[idx]
+    lv = fmt.levels[idx]
     origin_offset = index_origin(u) isa OneBased ? 1 : 0
     _decompose_level!(d, lvls, idx, p, lasta, origin_offset, lv)
 end
@@ -34,10 +34,10 @@ end
 function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offset, ::CompressedLevel)
     u   = d.u
     fmt = u.format
-    key, _ = fmt.levels[idx]
+    key = fmt.keys[idx]
     new_lasta = (key isa LevelExpr && (key.op == :add || key.op == :sub)) ? idx : lasta
-    pos = u.pos_buffers[idx]
-    crd = u.crd_buffers[idx]
+    pos = positions(u, idx)
+    crd = coordinates(u, idx)
     lo  = Int(pos[p + 1]) - origin_offset
     hi  = Int(pos[p + 2]) - origin_offset
     for i in lo:(hi - 1)
@@ -47,7 +47,7 @@ function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offs
 end
 
 function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offset, ::SingletonLevel)
-    crd = d.u.crd_buffers[idx]
+    crd = coordinates(d.u, idx)
     lvls[idx] = Int(crd[p + 1]) - origin_offset
     _decompose!(d, lvls, idx + 1, p, lasta)
 end
@@ -56,8 +56,8 @@ function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offs
     u   = d.u
     fmt = u.format
     @assert lasta > 0 "RangeLevel encountered without prior add/sub level"
-    add_key, _ = fmt.levels[lasta]
-    key, _     = fmt.levels[idx]
+    add_key = fmt.keys[lasta]
+    key     = fmt.keys[idx]
     isI        = (key == add_key.rhs)
     expr_other = isI ? add_key.lhs : add_key.rhs
     di  = findfirst(==(key),        fmt.dimensions)
@@ -82,8 +82,8 @@ end
 
 function _decompose_level!(d::TensorDecomposer, lvls, idx, p, lasta, origin_offset, ::DeltaLevel)
     u   = d.u
-    pos = u.pos_buffers[idx]
-    crd = u.crd_buffers[idx]
+    pos = positions(u, idx)
+    crd = coordinates(u, idx)
     lo  = Int(pos[p + 1]) - origin_offset
     hi  = Int(pos[p + 2]) - origin_offset
     corig = 0
@@ -145,15 +145,11 @@ function TensorComposer(fmt::TensorFormat, extents::NTuple, indices::Matrix{I}, 
 end
 
 function _lvl_extent(c::TensorComposer, idx::Int)
-    key, _ = c.fmt.levels[idx]
-    dim    = _find_key_dim(c.fmt.dimensions, key)
+    dim = _find_key_dim(c.fmt.dimensions, c.fmt.keys[idx])
     c.extents[dim]
 end
 
-function _get_prop(c::TensorComposer, idx::Int)
-    _, lv = c.fmt.levels[idx]
-    lv
-end
+_get_prop(c::TensorComposer, idx::Int) = c.fmt.levels[idx]
 
 function _append_pos!(c::TensorComposer, idx::Int, pos::Integer, repeat::Int, is_insert::Bool)
     if c.pos_sz[idx] == 0
@@ -262,7 +258,7 @@ function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, lv
 end
 
 function _insert_builder_level!(c::TensorComposer, idx, crd, full, is_insert, lv::DeltaLevel)
-    mDelta = (1 << lv.bits) - 1
+    mDelta = (1 << delta_bits(lv)) - 1
     delta  = Int(crd) - full
     while delta > mDelta
         _append_crd!(c, idx, mDelta, 1, is_insert)
@@ -365,7 +361,7 @@ function convert_format(u::USTensor{T,I,N,VA,VI,O},
     # Filter empty buffers according to format level types.
     final_pos = Dict{Int,Vector{Iout}}()
     final_crd = Dict{Int,Vector{Iout}}()
-    for (idx, (_, lv)) in enumerate(fmt.levels)
+    for (idx, lv) in enumerate(fmt.levels)
         if lv isa CompressedLevel || lv isa DeltaLevel
             final_pos[idx] = pos_bufs[idx]
             final_crd[idx] = crd_bufs[idx]

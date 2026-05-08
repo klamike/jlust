@@ -9,34 +9,38 @@ struct BatchLevel     <: AbstractLevelFormat end
 struct SingletonLevel <: AbstractLevelFormat end
 struct RangeLevel     <: AbstractLevelFormat end
 
-struct CompressedLevel <: AbstractLevelFormat
-    unique::Bool
-    ordered::Bool
-    CompressedLevel(; unique::Bool=true, ordered::Bool=true) = new(unique, ordered)
-end
+# Parametric on Unique/Ordered Bools so format-level structure (e.g. CSR vs COO) is
+# captured in the type system — kernel dispatch finds the right method without a
+# value-level branch on level fields.
+struct CompressedLevel{Unique,Ordered} <: AbstractLevelFormat end
+CompressedLevel(; unique::Bool=true, ordered::Bool=true) = CompressedLevel{unique,ordered}()
 
-struct DeltaLevel <: AbstractLevelFormat
-    bits::Int
-    function DeltaLevel(bits::Int)
-        bits > 0 || throw(InvalidTensorFormat("DeltaLevel bits must be positive, got $bits"))
-        new(bits)
-    end
+# Parametric on bit width.  All instances of DeltaLevel{B} are singletons.
+struct DeltaLevel{Bits} <: AbstractLevelFormat
+    DeltaLevel{Bits}() where {Bits} = (Bits isa Int && Bits > 0) ? new{Bits}() :
+        throw(InvalidTensorFormat("DeltaLevel bits must be a positive Int, got $Bits"))
 end
+DeltaLevel(bits::Int) = DeltaLevel{bits}()
+
+# Bit-width accessor for runtime use (Composer / display).
+delta_bits(::DeltaLevel{B}) where {B} = B
 
 Base.hash(::DenseLevel,     h::UInt) = hash(:DenseLevel,     h)
 Base.hash(::BatchLevel,     h::UInt) = hash(:BatchLevel,     h)
 Base.hash(::SingletonLevel, h::UInt) = hash(:SingletonLevel, h)
 Base.hash(::RangeLevel,     h::UInt) = hash(:RangeLevel,     h)
-Base.hash(l::CompressedLevel, h::UInt) = hash(l.unique, hash(l.ordered, hash(:CompressedLevel, h)))
-Base.hash(l::DeltaLevel,      h::UInt) = hash(l.bits,                   hash(:DeltaLevel,      h))
+Base.hash(::CompressedLevel{U,O}, h::UInt) where {U,O} =
+    hash(U, hash(O, hash(:CompressedLevel, h)))
+Base.hash(::DeltaLevel{B},        h::UInt) where {B}   =
+    hash(B, hash(:DeltaLevel, h))
 
 # ─── Level format predicates ──────────────────────────────────────────────────
 
 is_ordered(::AbstractLevelFormat) = true
-is_ordered(l::CompressedLevel)    = l.ordered
+is_ordered(::CompressedLevel{U,O}) where {U,O} = O
 
 is_unique(::AbstractLevelFormat) = true
-is_unique(l::CompressedLevel)    = l.unique
+is_unique(::CompressedLevel{U,O}) where {U,O} = U
 
 # ─── Dimension ────────────────────────────────────────────────────────────────
 
@@ -85,22 +89,35 @@ dims(names::Symbol...) = Dimension[Dimension(n) for n in names]
 const _LevelKey  = Union{Dimension,LevelExpr}
 const _LevelPair = Pair{_LevelKey, AbstractLevelFormat}
 
-struct TensorFormat
-    dimensions::Vector{Dimension}
-    levels::Vector{_LevelPair}
-    name::Symbol
-    family::Symbol      # format family tag; equals name for non-parametric formats
-    is_identity::Bool
-    is_ordered::Bool
-    is_unique::Bool
+# Level structure (the tuple type of level instances) is encoded in the type
+# parameter so kernel emitters can dispatch on it directly — no value-level
+# format equality, no global Dict cache, no invokelatest.
+#
+# `keys` (the level expressions) and `levels` (the level instances) used to be
+# coupled as a Vector of Pairs.  They are now stored separately: keys remain a
+# runtime Vector for dim2lvl/lvl2dim metadata; levels is a typed tuple whose
+# type captures the format's structure for dispatch.
+struct TensorFormat{LevelTypes <: Tuple}
+    dimensions  :: Vector{Dimension}
+    keys        :: Vector{_LevelKey}     # parallel to `levels`
+    levels      :: LevelTypes            # tuple of level instances
+    name        :: Symbol
+    family      :: Symbol                # format family tag; equals name for non-parametric formats
+    is_identity :: Bool
+    is_ordered  :: Bool
+    is_unique   :: Bool
 end
 
+# Two TensorFormats are equal when their dimensions, keys, and level types match.
+# The level instances themselves are singletons (parametric on their distinguishing
+# fields), so equality reduces to type equality on `levels`.
 Base.:(==)(a::TensorFormat, b::TensorFormat) =
-    a.dimensions == b.dimensions && a.levels == b.levels
+    a.dimensions == b.dimensions && a.keys == b.keys && typeof(a.levels) === typeof(b.levels)
 
 function Base.hash(f::TensorFormat, h::UInt)
     for d in f.dimensions; h = hash(d, h); end
-    for (k, v) in f.levels;  h = hash(k, hash(v, h)); end
+    for k in f.keys;       h = hash(k, h); end
+    for v in f.levels;     h = hash(v, h); end
     h
 end
 
@@ -126,31 +143,28 @@ function _evaluate(key::LevelExpr, dims, dim_indices, as_size)
     end
 end
 
-function _find_range_level(levels, expr1, expr2)
-    for (rl, p) in enumerate(levels)
-        k, v = p.first, p.second
+function _find_range_level(keys, levels, expr1, expr2)
+    for rl in eachindex(keys)
+        k = keys[rl]
+        v = levels[rl]
         if v isa RangeLevel && (k == expr1 || k == expr2)
             return rl, k
         end
     end
-    error("Cannot find range level for $expr1 or $expr2")
+    error("_find_range_level: cannot find range level for $expr1 or $expr2")
 end
 
-function _invert!(key::Dimension, dims, _levels, dim_indices, lvl_indices, idx)
-    dim_indices[_dim_pos(key, dims)] = lvl_indices[idx]
-end
-
-function _invert!(key::LevelExpr, dims, levels, dim_indices, lvl_indices, idx)
+function _invert!(key::LevelExpr, dims, keys, levels, dim_indices, lvl_indices, idx)
     expr1, expr2 = key.lhs, key.rhs
     if key.op == :add
-        rl, re = _find_range_level(levels, expr1, expr2)
+        rl, re = _find_range_level(keys, levels, expr1, expr2)
         if re == expr2
             dim_indices[_dim_pos(expr1, dims)] = lvl_indices[idx] - lvl_indices[rl]
         else
             dim_indices[_dim_pos(expr2, dims)] = lvl_indices[idx] - lvl_indices[rl]
         end
     elseif key.op == :sub
-        rl, re = _find_range_level(levels, expr1, expr2)
+        rl, re = _find_range_level(keys, levels, expr1, expr2)
         if re == expr2
             dim_indices[_dim_pos(expr1, dims)] = lvl_indices[rl] + lvl_indices[idx]
         else
@@ -163,9 +177,15 @@ function _invert!(key::LevelExpr, dims, levels, dim_indices, lvl_indices, idx)
     end
 end
 
+_invert!(key::Dimension, dims, keys, levels, dim_indices, lvl_indices, idx) =
+    (dim_indices[_dim_pos(key, dims)] = lvl_indices[idx])
+
 # ─── Semantic validation ──────────────────────────────────────────────────────
 
-function _semantically_validate(dimensions::Vector{Dimension}, levels::Vector{_LevelPair})
+function _semantically_validate(dimensions::Vector{Dimension},
+                                 keys::Vector{_LevelKey}, levels::Tuple)
+    length(keys) == length(levels) ||
+        throw(InvalidTensorFormat("keys and levels have mismatched lengths"))
     all_dims = Set(dimensions)
     length(all_dims) == length(dimensions) ||
         throw(InvalidTensorFormat(
@@ -176,8 +196,9 @@ function _semantically_validate(dimensions::Vector{Dimension}, levels::Vector{_L
     block_dims = Dict{Dimension, Int}()                    # 0 = consumed
     batch      = 0
 
-    for (idx, p) in enumerate(levels)
-        k, v = p.first, p.second
+    for idx in eachindex(keys)
+        k = keys[idx]
+        v = levels[idx]
 
         # ── validate level key ──
         if k isa Dimension
@@ -283,31 +304,34 @@ end
 
 function TensorFormat(
     dimensions,
-    levels::AbstractVector;
-    name::Symbol   = Symbol(repr(levels)),
+    level_pairs::AbstractVector;
+    name::Symbol   = Symbol(repr(level_pairs)),
     family::Symbol = name,
 )
     dims_vec  = convert(Vector{Dimension}, collect(dimensions))
-    lvls_vec  = Vector{_LevelPair}(collect(levels))
+    pairs_vec = Vector{_LevelPair}(collect(level_pairs))
+    keys_vec  = _LevelKey[p.first for p in pairs_vec]
+    levels    = Tuple(p.second for p in pairs_vec)
 
-    _semantically_validate(dims_vec, lvls_vec)
+    _semantically_validate(dims_vec, keys_vec, levels)
 
     n = length(dims_vec)
-    m = length(lvls_vec)
+    m = length(keys_vec)
 
     identity = (n == m) && all(
-        begin k = lvls_vec[i].first; k isa Dimension && _dim_pos(k, dims_vec) == i end
+        begin k = keys_vec[i]; k isa Dimension && _dim_pos(k, dims_vec) == i end
         for i in 1:m
     )
-    ordered = all(is_ordered(p.second) for p in lvls_vec)
-    unique  = isempty(lvls_vec) || any(is_unique(p.second) for p in lvls_vec)
+    ordered = all(is_ordered(lv) for lv in levels)
+    unique  = isempty(levels) || any(is_unique(lv) for lv in levels)
 
-    TensorFormat(dims_vec, lvls_vec, name, family, identity, ordered, unique)
+    LT = typeof(levels)
+    TensorFormat{LT}(dims_vec, keys_vec, levels, name, family, identity, ordered, unique)
 end
 
 # Scalar (zero-dimensional) convenience
 function TensorFormat(::Tuple{}, ::Tuple{}; name::Symbol=:Scalar)
-    TensorFormat(Dimension[], _LevelPair[], name, name, true, true, true)
+    TensorFormat{Tuple{}}(Dimension[], _LevelKey[], (), name, name, true, true, true)
 end
 
 """
@@ -322,17 +346,18 @@ format_family(fmt::TensorFormat) = fmt.family
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-Base.length(fmt::TensorFormat)   = length(fmt.levels)
+Base.length(fmt::TensorFormat)   = length(fmt.keys)
 Base.ndims(fmt::TensorFormat)    = length(fmt.dimensions)
 
 function dim2lvl(fmt::TensorFormat, dim_indices; as_size::Bool=false)
-    [_evaluate(p.first, fmt.dimensions, dim_indices, as_size) for p in fmt.levels]
+    [_evaluate(k, fmt.dimensions, dim_indices, as_size) for k in fmt.keys]
 end
 
 function lvl2dim(fmt::TensorFormat, lvl_indices)
     dim_indices = zeros(Int, length(fmt.dimensions))
-    for (idx, p) in enumerate(fmt.levels)
-        _invert!(p.first, fmt.dimensions, fmt.levels, dim_indices, lvl_indices, idx)
+    for idx in eachindex(fmt.keys)
+        _invert!(fmt.keys[idx], fmt.dimensions, fmt.keys, fmt.levels,
+                 dim_indices, lvl_indices, idx)
     end
     dim_indices
 end
@@ -343,13 +368,13 @@ Base.show(io::IO, ::DenseLevel)      = print(io, "DenseLevel")
 Base.show(io::IO, ::BatchLevel)      = print(io, "BatchLevel")
 Base.show(io::IO, ::SingletonLevel)  = print(io, "SingletonLevel")
 Base.show(io::IO, ::RangeLevel)      = print(io, "RangeLevel")
-Base.show(io::IO, l::DeltaLevel)     = print(io, "DeltaLevel($(l.bits))")
-function Base.show(io::IO, l::CompressedLevel)
-    if l.unique && l.ordered
+Base.show(io::IO, ::DeltaLevel{B}) where {B} = print(io, "DeltaLevel($B)")
+function Base.show(io::IO, ::CompressedLevel{U,O}) where {U,O}
+    if U && O
         print(io, "CompressedLevel")
-    elseif !l.unique && l.ordered
+    elseif !U && O
         print(io, "CompressedLevel(nonunique)")
-    elseif !l.unique && !l.ordered
+    elseif !U && !O
         print(io, "CompressedLevel(nonunique, unordered)")
     else
         print(io, "CompressedLevel(unordered)")
@@ -358,8 +383,8 @@ end
 
 function Base.show(io::IO, fmt::TensorFormat)
     dims_str = join(fmt.dimensions, ", ")
-    lvls_str = join(["$(p.first): $(p.second)" for p in fmt.levels], ", ")
-    print(io, "[", dims_str, "] -> (", lvls_str, ")")
+    parts    = ["$(fmt.keys[i]): $(fmt.levels[i])" for i in eachindex(fmt.keys)]
+    print(io, "[", dims_str, "] -> (", join(parts, ", "), ")")
 end
 
 # ─── @tensor_format macro ─────────────────────────────────────────────────────

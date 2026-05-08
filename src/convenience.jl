@@ -87,5 +87,9 @@ function make_tensor(fmt::TensorFormat, nzval::VA;
                                                    I<:Integer,
                                                    O<:AbstractIndexOrigin}
     VI = typeof(similar(nzval, I, 0))
-    USTensor{T, I, 2, VA, VI, O}((m, n), fmt, Dict{Int,VI}(), Dict{Int,VI}(), nzval, nothing)
+    NL = length(fmt.levels)
+    USTensor{T, I, 2, VA, VI, O}((m, n), fmt,
+        ntuple(_ -> nothing, NL),
+        ntuple(_ -> nothing, NL),
+        nzval, nothing)
 end

@@ -75,6 +75,20 @@ NVIDIA cuSPARSE vendor backend. Methods added by CUDAExt when CUDA.jl is loaded.
 """
 struct CUSPARSEBackend <: AbstractUSTBackend end
 
+"""
+    default_backend(u::USTensor, ::Type{<:AbstractUSTOp}) -> AbstractUSTBackend
+
+Backend selected by no-backend convenience wrappers when the user does not
+specify one. Extensions add methods to specialize on element type, storage,
+or operation. Core default: `EmitterBackend` (works on CPU and GPU via KA).
+
+Encoding the policy here — rather than via wrapper-override order across
+extensions — means there is exactly one method per (USTensor type, Op) pair
+and the choice can dispatch on storage (e.g. CuArray-backed → CUSPARSEBackend
+for SpMM, but stay on EmitterBackend for SpMV).
+"""
+default_backend(::USTensor, ::Type{<:AbstractUSTOp}) = EmitterBackend()
+
 # ─── Custom level format hooks ────────────────────────────────────────────────
 #
 # Extend these four functions for custom AbstractLevelFormat subtypes to plug
@@ -165,11 +179,11 @@ needs_row_guard(::AbstractUSTensor) = false
 
 function needs_row_guard(b::USTensor)
     levels = b.format.levels
-    length(levels) == 2                    || return false
-    levels[1].second isa Union{DenseLevel,BatchLevel} || return false
-    lv2 = levels[2].second
-    lv2 isa CompressedLevel                || return false
-    is_unique(lv2)                         || return false
+    length(levels) == 2                                   || return false
+    levels[1] isa Union{DenseLevel,BatchLevel}            || return false
+    lv2 = levels[2]
+    lv2 isa CompressedLevel                                || return false
+    is_unique(lv2)                                         || return false
     length(nonzeros(b)) < extents(b)[1]
 end
 

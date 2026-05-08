@@ -175,11 +175,11 @@ end
     # Level properties
     @tensor_format MacroCOL (i, j) -> (i : compressed(nonunique, unordered), j : singleton)
     col = Formats.COOd(2)  # same structure but named COO — just check the level
-    @test MacroCOL.levels[1].second == CompressedLevel(unique=false, ordered=false)
+    @test MacroCOL.levels[1] == CompressedLevel(unique=false, ordered=false)
 
     # Delta
     @tensor_format MacroDelta (i, j) -> (i : dense, j : delta(8))
-    @test MacroDelta.levels[2].second == DeltaLevel(8)
+    @test MacroDelta.levels[2] == DeltaLevel(8)
 end
 
 @testset "named format builders" begin
@@ -187,7 +187,7 @@ end
     @test length(Formats.BSRRight((2, 4)).levels) == 4
 
     @test Formats.DELTA(3).name == :Delta3
-    @test Formats.DELTA(3).levels[2].second == DeltaLevel(3)
+    @test Formats.DELTA(3).levels[2] == DeltaLevel(3)
 
     @test Formats.CSFd(3).name == :CSF3
     @test length(Formats.CSFd(3).levels) == 3

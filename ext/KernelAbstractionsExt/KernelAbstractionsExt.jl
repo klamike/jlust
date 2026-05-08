@@ -16,7 +16,7 @@ import JLUST:
     _bbm_scatter_diag!, _bbm_scatter_off!
 
 _is_dense_fmt(fmt::TensorFormat) =
-    all(lv isa Union{DenseLevel,BatchLevel} for (_, lv) in fmt.levels)
+    all(lv isa Union{DenseLevel,BatchLevel} for lv in fmt.levels)
 
 _is_emittable(fmt::TensorFormat) = !_is_dense_fmt(fmt)
 
@@ -67,6 +67,7 @@ end
 
 # ─── SpMV / SpMM / SpGEMM / SpSV / SpSM / SDDMM ─────────────────────────────
 
+include("ops/_walker.jl")
 include("ops/spmv.jl")
 include("ops/spmm.jl")
 include("ops/spgemm.jl")

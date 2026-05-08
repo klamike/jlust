@@ -1,158 +1,28 @@
 # ─── SpMM body emitter ────────────────────────────────────────────────────────
 #
-# Emits a 1-D @kernel for sparse_mm!: each thread handles one outer fiber (row
-# for CSR, fiber for DCSR, NNZ for COO) and sequentially loops over the n_col
-# columns of B.  Accumulation pattern mirrors SpMV; leaf writes B[x_idx, col]
-# instead of x[x_idx], and final write goes to C[y_idx, col].
+# Column-first 1-D kernel: each thread handles one outer fiber (row for CSR,
+# fiber for DCSR, NNZ for COO) and sequentially loops over n_col columns of B.
+# Builds via the unified level walker in _walker.jl.
 
 function _emit_spmm_body(fmt::TensorFormat, ::Type{T}) where T
-    pc = Ref(0); cc = Ref(0)
-    _, lv1 = fmt.levels[1]
-    na = lv1 isa CompressedLevel && !is_unique(lv1)
-    _emit_spmm_level(fmt.levels, 1, nothing, pc, cc, T, na)
-end
-
-function _emit_spmm_level(levels, lvl, p_var, pc, cc, T, needs_atomic)
-    if lvl > length(levels)
-        return needs_atomic ?
-            :(KernelAbstractions.@atomic _C[_y_idx, _col] += _alpha * _nzval[_nnz_pos] * _B[_x_idx, _col]) :
-            :(_acc += _nzval[_nnz_pos] * _B[_x_idx, _col])
-    end
-    _, lv = levels[lvl]
-    _emit_spmm_lv(lv, levels, lvl, p_var, pc, cc, T, needs_atomic)
-end
-
-# DenseLevel / BatchLevel (outermost) → thread = row; sequential col loop
-function _emit_spmm_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc, T, _)
-    inner = _emit_spmm_level(levels, lvl + 1, :_tid, pc, cc, T, false)
-    quote
-        _tid = @index(Global, Linear)
-        if _tid <= _n_outer
-            for _col in 1:_n_col
-                _acc = $(zero(T))
-                $inner
-                _C[_tid, _col] = _alpha * _acc + _beta * _C[_tid, _col]
-            end
+    leaf_unique = :(_acc += _nzval[_nnz_pos] * _B[_x_idx, _col])
+    leaf_atomic = :(KernelAbstractions.@atomic _C[_y_idx, _col] +=
+                        _alpha * _nzval[_nnz_pos] * _B[_x_idx, _col])
+    row_body_unique = inner -> quote
+        for _col in 1:_n_col
+            _acc = $(zero(T))
+            $inner
+            _C[_y_idx, _col] = _alpha * _acc + _beta * _C[_y_idx, _col]
         end
     end
-end
-
-# DenseLevel / BatchLevel (non-outermost) → dense loop
-function _emit_spmm_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc, T, na)
-    sz  = Symbol(:_sz, lvl)
-    lv2 = Symbol(:_i, lvl)
-    inner = _emit_spmm_level(levels, lvl + 1, lv2, pc, cc, T, na)
-    quote
-        for $lv2 in 1:$sz
+    # Non-unique outer (COO-like): pre-scaled-by-beta C accumulated via atomic leaf.
+    row_body_atomic = inner -> quote
+        for _col in 1:_n_col
             $inner
         end
     end
-end
-
-# CompressedLevel (outermost)
-#   unique   → fiber-parallel (DCSR-like): one thread per non-empty row
-#   non-unique → NNZ-parallel (COO-like): atomic C update per NNZ × col
-function _emit_spmm_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T, _)
-    pc[] += 1; ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    if is_unique(lv)
-        inner = _emit_spmm_level(levels, lvl + 1, :_tid, pc, cc, T, false)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                for _col in 1:_n_col
-                    _acc = $(zero(T))
-                    $inner
-                    _C[_y_idx, _col] = _alpha * _acc + _beta * _C[_y_idx, _col]
-                end
-            end
-        end
-    else
-        inner = _emit_spmm_level(levels, lvl + 1, :_tid, pc, cc, T, true)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                for _col in 1:_n_col
-                    $inner
-                end
-            end
-        end
-    end
-end
-
-# CompressedLevel (non-outermost) → inner fiber loop; same as SpMV
-function _emit_spmm_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar = Symbol(:_i, lvl)
-    inner = _emit_spmm_level(levels, lvl + 1, lvar, pc, cc, T, na)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _x_idx   = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-        end
-    end
-end
-
-# SingletonLevel → one coordinate per position (COO column index)
-function _emit_spmm_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
-    ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    inner = _emit_spmm_level(levels, lvl + 1, p_var, pc, cc, T, na)
-    quote
-        _x_idx   = Int($cs[$p_var]) - Int(_origin_off) + 1
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-# DeltaLevel (non-outermost) → accumulated delta decode + inner loop
-function _emit_spmm_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar  = Symbol(:_i, lvl)
-    corig = Symbol(:_corig, lvl)
-    inner = _emit_spmm_level(levels, lvl + 1, lvar, pc, cc, T, na)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        $corig = 0
-        for $lvar in (_lo + 1):_hi
-            $corig  += Int($cs[$lvar])
-            _x_idx   = $corig - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-            $corig += 1
-        end
-    end
-end
-
-function _emit_spmm_lv(::RangeLevel, levels, lvl, p_var, pc, cc, T, na)
-    error("EmitterBackend SpMM: RangeLevel (DIA-style) kernels not supported. " *
-          "Use convert_format to CSR or DCSR first.")
-end
-
-# AbstractLevelFormat (custom inner level) → delegate to level_step hook.
-# Mirrors the s2d and SpMV AbstractLevelFormat fallbacks.
-# Custom outermost levels must be paired with an outer DenseLevel.
-function _emit_spmm_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T, na)
-    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _emit_spmm_level(levels, lvl + 1, p_var, pc, cc, T, na)
-    quote
-        _p1 = Int($p_var) - Int(_origin_off) + 1
-        (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_spmm_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc, T, na)
-    error("EmitterBackend SpMM: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+    emit_kernel_body(fmt;
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
 end
 
 # ─── Kernel cache and launch ─────────────────────────────────────────────────
@@ -202,132 +72,33 @@ function _spmm_2d_max_rows(ka)
 end
 
 function _emit_spmm_body_nnzfirst(fmt::TensorFormat, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
-    pc = Ref(0); cc = Ref(0)
-    _, lv1 = fmt.levels[1]
-    na = lv1 isa CompressedLevel && !is_unique(lv1)
-    _emit_spmm_level_nf(fmt.levels, 1, nothing, pc, cc, T, na, n_col, zero_beta)
-end
-
-function _emit_spmm_level_nf(levels, lvl, p_var, pc, cc, T, needs_atomic, n_col, zero_beta=false)
-    if lvl > length(levels)
-        # Leaf: accumulate nzval * B[x_idx, col] for all output columns.
-        col_updates = Expr(:block, [
-            needs_atomic ?
-                :(KernelAbstractions.@atomic _C[_y_idx, $(c)] += _alpha * _nzval[_nnz_pos] * _B[_x_idx, $(c)]) :
-                :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, $(c)])
-            for c in 1:n_col]...)
-        return col_updates
-    end
-    _, lv = levels[lvl]
-    _emit_spmm_lv_nf(lv, levels, lvl, p_var, pc, cc, T, needs_atomic, n_col, zero_beta)
-end
-
-function _emit_spmm_lv_nf(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc, T, _na, n_col, zero_beta=false)
-    inner      = _emit_spmm_level_nf(levels, lvl + 1, :_tid, pc, cc, T, false, n_col)
+    # k accumulators (one per output column), accumulated in registers, written together.
+    leaf_unique = Expr(:block, [
+        :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, $(c)])
+        for c in 1:n_col]...)
+    leaf_atomic = Expr(:block, [
+        :(KernelAbstractions.@atomic _C[_y_idx, $(c)] += _alpha * _nzval[_nnz_pos] * _B[_x_idx, $(c)])
+        for c in 1:n_col]...)
     acc_inits  = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:n_col]...)
-    acc_writes = if zero_beta
-        Expr(:block, [:(_C[_tid, $(c)] = _alpha * $(Symbol(:_acc_, c))) for c in 1:n_col]...)
-    else
-        Expr(:block, [:(_C[_tid, $(c)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_tid, $(c)]) for c in 1:n_col]...)
-    end
-    quote
-        _tid = @index(Global, Linear)
-        if _tid <= _n_outer
-            $acc_inits
-            $inner
-            $acc_writes
-        end
-    end
-end
-
-function _emit_spmm_lv_nf(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T, _na, n_col, zero_beta=false)
-    pc[] += 1; ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    if is_unique(lv)
-        inner      = _emit_spmm_level_nf(levels, lvl + 1, :_tid, pc, cc, T, false, n_col)
-        acc_inits  = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:n_col]...)
-        acc_writes = if zero_beta
-            Expr(:block, [:(_C[_y_idx, $(c)] = _alpha * $(Symbol(:_acc_, c))) for c in 1:n_col]...)
-        else
-            Expr(:block, [:(_C[_y_idx, $(c)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_y_idx, $(c)]) for c in 1:n_col]...)
-        end
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                $acc_inits
-                $inner
-                $acc_writes
-            end
-        end
-    else
-        inner = _emit_spmm_level_nf(levels, lvl + 1, :_tid, pc, cc, T, true, n_col)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                $inner
-            end
-        end
-    end
-end
-
-function _emit_spmm_lv_nf(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T, na, n_col, zero_beta=false)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar = Symbol(:_i, lvl)
-    inner = _emit_spmm_level_nf(levels, lvl + 1, lvar, pc, cc, T, na, n_col)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _x_idx   = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-        end
-    end
-end
-
-function _emit_spmm_lv_nf(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T, na, n_col, zero_beta=false)
-    ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    inner = _emit_spmm_level_nf(levels, lvl + 1, p_var, pc, cc, T, na, n_col)
-    quote
-        _x_idx   = Int($cs[$p_var]) - Int(_origin_off) + 1
-        _nnz_pos = $p_var
+    acc_writes = zero_beta ?
+        Expr(:block, [:(_C[_y_idx, $(c)] = _alpha * $(Symbol(:_acc_, c)))
+                      for c in 1:n_col]...) :
+        Expr(:block, [:(_C[_y_idx, $(c)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_y_idx, $(c)])
+                      for c in 1:n_col]...)
+    row_body_unique = inner -> quote
+        $acc_inits
         $inner
+        $acc_writes
     end
-end
-
-function _emit_spmm_lv_nf(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, T, na, n_col, zero_beta=false)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar  = Symbol(:_i, lvl)
-    corig = Symbol(:_corig, lvl)
-    inner = _emit_spmm_level_nf(levels, lvl + 1, lvar, pc, cc, T, na, n_col)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        $corig = 0
-        for $lvar in (_lo + 1):_hi
-            $corig  += Int($cs[$lvar])
-            _x_idx   = $corig - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-            $corig += 1
-        end
-    end
-end
-
-# Fallback for unsupported levels in NNZ-first path: use column-first emitter.
-function _emit_spmm_lv_nf(lv, levels, lvl, p_var, pc, cc, T, na, n_col, zero_beta=false)
-    _emit_spmm_lv(lv, levels, lvl, p_var, pc, cc, T, na)
+    row_body_atomic = inner -> inner
+    emit_kernel_body(fmt;
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
 end
 
 # ─── Kernel cache and launch ─────────────────────────────────────────────────
 
 function _get_spmm_kernel(fmt::TensorFormat, ::Type{T}) where T
-    key = (fmt, T, :spmm)
+    key = (fmt.name, T, :spmm)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
     body      = _emit_spmm_body(fmt, T)
@@ -346,12 +117,14 @@ function _get_spmm_kernel(fmt::TensorFormat, ::Type{T}) where T
     return kern
 end
 
-# NNZ-first kernel with n_col baked in: cached per (fmt, T, :spmm_nf, n_col).
-function _get_spmm_nf_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_nf, n_col)
+# NNZ-first kernel with n_col baked in.
+# zero_beta=true emits C = alpha*acc (no C read); false emits C = alpha*acc + beta*C.
+# _beta is always in the signature so sparse_mm! uses a uniform arg list regardless of beta.
+function _get_spmm_nf_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
+    key = (fmt.name, T, :spmm_nf, n_col, zero_beta)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
-    body      = _emit_spmm_body_nnzfirst(fmt, T, n_col)
+    body      = _emit_spmm_body_nnzfirst(fmt, T, n_col, zero_beta)
     buf_names = _sparse_arg_names(fmt)
     arg_names = vcat(buf_names, [:_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta])
     fname     = gensym(:ust_spmm_nf)
@@ -367,114 +140,11 @@ function _get_spmm_nf_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
     return kern
 end
 
-# Beta=0 NNZ-first kernel: no C read in write path (C = alpha * acc only).
-# Cached per (fmt, T, :spmm_nf0, n_col). No _beta argument.
-function _get_spmm_nf_beta0_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_nf0, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-
-    body      = _emit_spmm_body_nnzfirst(fmt, T, n_col, true)  # zero_beta=true
-    buf_names = _sparse_arg_names(fmt)
-    arg_names = vcat(buf_names, [:_B, :_C, :_origin_off, :_n_outer, :_alpha])  # no _beta
-
-    fname = gensym(:ust_spmm_nf0)
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
-            $body
-        end
-        $fname
-    end
-
-    _emitter_cache[key] = kern
-    return kern
-end
-
-# ─── Guarded NNZ-first kernels (CSR only) ────────────────────────────────────
-#
-# For CSR matrices where NNZ << n_rows (e.g. Cg in DCOPF: 375 NNZ in 30k rows),
-# normal kernels waste bandwidth on empty rows (writing zeros or reading C for no-ops).
-# Guarded variants skip the work entirely for empty rows.
-#
-# Two variants:
-#   guarded beta=0 (spmm_nf0g): C[tid,:] = alpha*acc  — for sparse blocks with no prior write
-#   guarded beta=1 (spmm_nfg):  C[tid,:] += alpha*acc  — for sparse accumulation onto
-#                                                          a C already initialized by a dense block
-#
-# In _bbm_apply_diags! two-pass ordering:
-#   Pass 1: dense blocks → beta=0/1, writes all rows (including zeros for their empty rows)
-#   Pass 2: sparse blocks → guarded beta=1, adds contribution only for non-empty sparse rows;
-#           rows empty in the sparse block retain the dense block's correctly-zeroed value.
-#
-# Hardcoded for standard 2-level CSR: _sparse_arg_names = [:_pos1, :_crd1, :_nzval].
-# Activated via sparse_mm!(...; skip_empty_rows=true).
-
 _is_csr_like_for_guard(fmt::TensorFormat) =
     length(fmt.levels) == 2 &&
-    fmt.levels[1].second isa Union{DenseLevel,BatchLevel} &&
-    fmt.levels[2].second isa CompressedLevel &&
-    is_unique(fmt.levels[2].second)
-
-function _emit_spmm_body_csr_guarded(::Type{T}, n_col::Int, zero_beta::Bool) where T
-    acc_inits  = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:n_col]...)
-    leaf       = Expr(:block, [:($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, $(c)]) for c in 1:n_col]...)
-    acc_writes = if zero_beta
-        Expr(:block, [:(_C[_tid, $(c)] = _alpha * $(Symbol(:_acc_, c))) for c in 1:n_col]...)
-    else
-        Expr(:block, [:(_C[_tid, $(c)] = _alpha * $(Symbol(:_acc_, c)) + _beta * _C[_tid, $(c)]) for c in 1:n_col]...)
-    end
-    quote
-        _tid = @index(Global, Linear)
-        if _tid <= _n_outer
-            _lo = Int(_pos1[_tid])     - Int(_origin_off)
-            _hi = Int(_pos1[_tid + 1]) - Int(_origin_off)
-            if _lo < _hi
-                $acc_inits
-                for _i2 in (_lo + 1):_hi
-                    _x_idx   = Int(_crd1[_i2]) - Int(_origin_off) + 1
-                    _nnz_pos = _i2
-                    $leaf
-                end
-                $acc_writes
-            end
-        end
-    end
-end
-
-function _get_spmm_nf_beta0_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_nf0g, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-
-    body      = _emit_spmm_body_csr_guarded(T, n_col, true)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha]
-    fname     = gensym(:ust_spmm_nf0g)
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
-            $body
-        end
-        $fname
-    end
-    _emitter_cache[key] = kern
-    return kern
-end
-
-# Guarded beta=1 kernel: accumulates sparse contribution only for non-empty rows.
-# Used in pass 2 of _bbm_apply_diags! when a dense block already initialized C.
-function _get_spmm_nf_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_nfg, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-
-    body      = _emit_spmm_body_csr_guarded(T, n_col, false)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta]
-    fname     = gensym(:ust_spmm_nfg)
-    kern = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...))
-            $body
-        end
-        $fname
-    end
-    _emitter_cache[key] = kern
-    return kern
-end
+    fmt.levels[1] isa Union{DenseLevel,BatchLevel} &&
+    fmt.levels[2] isa CompressedLevel &&
+    is_unique(fmt.levels[2])
 
 # ─── 2D NNZ-first SpMM (one thread per (row, col) pair) ─────────────────────
 #
@@ -524,21 +194,10 @@ function _emit_spmm_2d_body_csr(::Type{T}, n_col::Int, zero_beta::Bool, guard::B
     end
 end
 
-function _get_spmm_2d_beta0_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d0, n_col)
+function _get_spmm_2d_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
+    key = (fmt.name, T, :spmm_2d, n_col, zero_beta)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, true, false)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha]
-    fname     = gensym(:ust_spmm_2d0)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
-function _get_spmm_2d_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, false, false)
+    body      = _emit_spmm_2d_body_csr(T, n_col, zero_beta, false)
     arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta]
     fname     = gensym(:ust_spmm_2d)
     _emitter_cache[key] = @eval begin
@@ -546,21 +205,10 @@ function _get_spmm_2d_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
     end
 end
 
-function _get_spmm_2d_beta0_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2d0g, n_col)
+function _get_spmm_2d_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
+    key = (fmt.name, T, :spmm_2dg, n_col, zero_beta)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, true, true)
-    arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha]
-    fname     = gensym(:ust_spmm_2d0g)
-    _emitter_cache[key] = @eval begin
-        @kernel inbounds=true function $fname($(arg_names...)); $body; end; $fname
-    end
-end
-
-function _get_spmm_2d_guarded_kernel(fmt::TensorFormat, ::Type{T}, n_col::Int) where T
-    key = (fmt, T, :spmm_2dg, n_col)
-    haskey(_emitter_cache, key) && return _emitter_cache[key]
-    body      = _emit_spmm_2d_body_csr(T, n_col, false, true)
+    body      = _emit_spmm_2d_body_csr(T, n_col, zero_beta, true)
     arg_names = [:_pos1, :_crd1, :_nzval, :_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta]
     fname     = gensym(:ust_spmm_2dg)
     _emitter_cache[key] = @eval begin
@@ -662,7 +310,7 @@ end
 
 function _emit_spmm_body_tiled(fmt::TensorFormat, ::Type{T}, tile_k::Int) where T
     levels = fmt.levels
-    _, lv1 = levels[1]
+    lv1 = levels[1]
 
     acc_inits = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:tile_k]...)
 
@@ -710,7 +358,7 @@ end
 # Tiled kernel: cached per (fmt, T, :spmm_tiled).  Uses runtime _n_col for the
 # tile loop bound; TILE_K accumulators are compile-time constants.
 function _get_spmm_tiled_kernel(fmt::TensorFormat, ::Type{T}) where T
-    key = (fmt, T, :spmm_tiled)
+    key = (fmt.name, T, :spmm_tiled)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
     body      = _emit_spmm_body_tiled(fmt, T, _SPMM_TILE_K)
@@ -743,9 +391,9 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     n_outer = Int32(_spmv_ndrange(u_A))
     n_col   = Int(extents(u_B)[2])
 
-    _, lv1 = fmt.levels[1]
+    lv1 = fmt.levels[1]
     is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
-                  length(fmt.levels) >= 2 && fmt.levels[2].second isa SingletonLevel
+                  length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
 
     # COO-like: pre-scale C by beta; atomic += accumulates into this baseline.
     if is_coo_like
@@ -753,71 +401,38 @@ function JLUST.sparse_mm!(::EmitterBackend, u_A::USTensor, u_B::USTensor, u_C::U
     end
 
     sparse_bufs = _sparse_args(u_A)
+    z           = iszero(T_beta)
 
     if !is_coo_like && n_col <= _SPMM_NCOL_INLINE_THRESHOLD
-        # NNZ-first, n_col baked in as a compile-time constant.
-        # CSR-like formats use the 2D kernel (ndrange = n_rows × n_col) for better SM
-        # occupancy: 24× more thread blocks → 48 warps/SM vs 2–6 for the 1D path.
-        # Non-CSR formats (DCSR, COO) fall back to the 1D path.
-        if _is_csr_like_for_guard(fmt)
-            # 2D when: (a) guarded path (sparse rows → threads for empty rows are cheap),
-            # (b) small matrix (1D has < 6 warps/SM so latency isn't hidden), or
-            # (c) dense-row matrix (avg NNZ/row > threshold so many B-loads benefit from hiding).
-            # 1D is better for large, low-NNZ matrices (e.g. identity): ILP in one thread
-            # pipelines all 24 B-reads efficiently; 2D overhead > occupancy benefit there.
-            _use_2d = skip_empty_rows ||
-                      Int(n_outer) <= _spmm_2d_max_rows(ka) ||
-                      length(nonzeros(u_A)) > _SPMM_2D_AVG_NNZ * Int(n_outer)
-            if _use_2d
-                if iszero(T_beta)
-                    kern = skip_empty_rows ?
-                        _get_spmm_2d_beta0_guarded_kernel(fmt, T, n_col) :
-                        _get_spmm_2d_beta0_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
-                else
-                    kern = skip_empty_rows ?
-                        _get_spmm_2d_guarded_kernel(fmt, T, n_col) :
-                        _get_spmm_2d_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
-                end
-                kernel_obj = Base.invokelatest(kern, ka, 64)
-                Base.invokelatest(kernel_obj, all_args...; ndrange = Int(n_outer) * n_col)
-            else
-                # 1D NNZ-first for large low-density CSR (identity-like)
-                if iszero(T_beta)
-                    kern = _get_spmm_nf_beta0_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
-                else
-                    kern = _get_spmm_nf_kernel(fmt, T, n_col)
-                    all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
-                end
-                kernel_obj = Base.invokelatest(kern, ka, 64)
-                Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
-            end
-        else
-            # 1D NNZ-first for non-CSR (DCSR, COO, etc.)
-            if iszero(T_beta)
-                kern = _get_spmm_nf_beta0_kernel(fmt, T, n_col)
-                all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha)
-            else
-                kern = _get_spmm_nf_kernel(fmt, T, n_col)
-                all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, T_alpha, T_beta)
-            end
+        # 2D kernel (one thread per output cell) for CSR-like matrices when: skip_empty_rows
+        # is set, the matrix is too small for 1D to saturate SMs, or high NNZ density means
+        # bandwidth hiding from concurrent warps outweighs 2D launch overhead.
+        # All other cases (DCSR, COO, large sparse CSR) use the 1D NNZ-first path.
+        use_2d = _is_csr_like_for_guard(fmt) && (skip_empty_rows ||
+                     Int(n_outer) <= _spmm_2d_max_rows(ka) ||
+                     length(nonzeros(u_A)) > _SPMM_2D_AVG_NNZ * Int(n_outer))
+        if use_2d
+            kern = skip_empty_rows ?
+                _get_spmm_2d_guarded_kernel(fmt, T, n_col, z) :
+                _get_spmm_2d_kernel(fmt, T, n_col, z)
             kernel_obj = Base.invokelatest(kern, ka, 64)
-            Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+            Base.invokelatest(kernel_obj, sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
+                              off, n_outer, T_alpha, T_beta; ndrange = Int(n_outer) * n_col)
+        else
+            kernel_obj = Base.invokelatest(_get_spmm_nf_kernel(fmt, T, n_col, z), ka, 64)
+            Base.invokelatest(kernel_obj, sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
+                              off, n_outer, T_alpha, T_beta; ndrange = Int(n_outer))
         end
     elseif !is_coo_like && n_col % _SPMM_TILE_K == 0
         # Tiled NNZ-first: TILE_K accumulators per strip, n_col/TILE_K NNZ passes.
-        kern = _get_spmm_tiled_kernel(fmt, T)
-        all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, Int32(n_col), T_alpha, T_beta)
-        kernel_obj = Base.invokelatest(kern, ka, 64)
-        Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+        kernel_obj = Base.invokelatest(_get_spmm_tiled_kernel(fmt, T), ka, 64)
+        Base.invokelatest(kernel_obj, sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
+                          off, n_outer, Int32(n_col), T_alpha, T_beta; ndrange = Int(n_outer))
     else
         # Column-first: runtime n_col loop (fallback for COO and non-divisible k).
-        kern = _get_spmm_kernel(fmt, T)
-        all_args = (sparse_bufs..., nonzeros(u_B), nonzeros(u_C), off, n_outer, Int32(n_col), T_alpha, T_beta)
-        kernel_obj = Base.invokelatest(kern, ka, 64)
-        Base.invokelatest(kernel_obj, all_args...; ndrange=Int(n_outer))
+        kernel_obj = Base.invokelatest(_get_spmm_kernel(fmt, T), ka, 64)
+        Base.invokelatest(kernel_obj, sparse_bufs..., nonzeros(u_B), nonzeros(u_C),
+                          off, n_outer, Int32(n_col), T_alpha, T_beta; ndrange = Int(n_outer))
     end
 
     return u_C

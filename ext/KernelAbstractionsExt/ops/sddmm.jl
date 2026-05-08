@@ -14,135 +14,31 @@ function JLUST.supports_backend(::EmitterBackend, op::SDDMMOp)
 end
 
 # ─── Body emitter ─────────────────────────────────────────────────────────────
+#
+# Built via the unified level walker.  The walker binds `_y_idx` (output row)
+# and `_x_idx` (output column from the inner level); the leaf computes the
+# k-loop dot product against dense A and B and writes back to nzval.
+# No row-level init/write is needed — the leaf handles its own scratch.
 
 function _emit_sddmm_body(fmt::TensorFormat, ::Type{T}) where T
-    pc = Ref(0); cc = Ref(0)
-    _emit_sddmm_level(fmt.levels, 1, nothing, pc, cc, T)
-end
-
-function _emit_sddmm_level(levels, lvl, p_var, pc, cc, T)
-    if lvl > length(levels)
-        return quote
-            _dot = $(zero(T))
-            for _k in 1:_n_inner
-                _dot += _A[_row_idx, _k] * _B[_k, _col_idx]
-            end
-            _nzval[_nnz_pos] = _alpha * _dot + _beta * _nzval[_nnz_pos]
+    leaf = quote
+        _dot = $(zero(T))
+        for _k in 1:_n_inner
+            _dot += _A[_y_idx, _k] * _B[_k, _x_idx]
         end
+        _nzval[_nnz_pos] = _alpha * _dot + _beta * _nzval[_nnz_pos]
     end
-    _, lv = levels[lvl]
-    _emit_sddmm_lv(lv, levels, lvl, p_var, pc, cc, T)
-end
-
-# DenseLevel (outermost) → thread = row
-function _emit_sddmm_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc, T)
-    inner = _emit_sddmm_level(levels, lvl + 1, :_tid, pc, cc, T)
-    quote
-        _tid = @index(Global, Linear)
-        if _tid <= _n_outer
-            _row_idx = _tid
-            $inner
-        end
-    end
-end
-
-# DenseLevel (non-outermost) → dense inner loop (uncommon for SDDMM)
-function _emit_sddmm_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc, T)
-    sz   = Symbol(:_sz, lvl)
-    lv2  = Symbol(:_i, lvl)
-    inner = _emit_sddmm_level(levels, lvl + 1, lv2, pc, cc, T)
-    quote
-        for $lv2 in 1:$sz
-            $inner
-        end
-    end
-end
-
-# CompressedLevel (outermost)
-#   unique   → fiber-parallel (DCSR-like): one thread per non-empty row
-#   non-unique → NNZ-parallel (COO-like): one thread per NNZ
-function _emit_sddmm_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc, T)
-    pc[] += 1; ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    if is_unique(lv)
-        inner = _emit_sddmm_level(levels, lvl + 1, :_tid, pc, cc, T)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                $inner
-            end
-        end
-    else
-        inner = _emit_sddmm_level(levels, lvl + 1, :_tid, pc, cc, T)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                _nnz_pos = _tid
-                $inner
-            end
-        end
-    end
-end
-
-# CompressedLevel (non-outermost) → inner fiber loop (column scan for CSR)
-function _emit_sddmm_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, T)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar = Symbol(:_i, lvl)
-    inner = _emit_sddmm_level(levels, lvl + 1, lvar, pc, cc, T)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _col_idx = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-        end
-    end
-end
-
-# SingletonLevel → one coordinate per position (COO col index)
-function _emit_sddmm_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, T)
-    ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    inner = _emit_sddmm_level(levels, lvl + 1, p_var, pc, cc, T)
-    quote
-        _col_idx = Int($cs[$p_var]) - Int(_origin_off) + 1
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_sddmm_lv(::RangeLevel, levels, lvl, _, pc, cc, T)
-    error("EmitterBackend SDDMM: RangeLevel not supported. Convert C to CSR or COO first.")
-end
-
-function _emit_sddmm_lv(::DeltaLevel, levels, lvl, _, pc, cc, T)
-    error("EmitterBackend SDDMM: DeltaLevel not supported. Convert C to CSR or COO first.")
-end
-
-# AbstractLevelFormat (custom inner level) → delegate to level_step hook.
-function _emit_sddmm_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, T)
-    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _emit_sddmm_level(levels, lvl + 1, p_var, pc, cc, T)
-    quote
-        _p1 = Int($p_var) - Int(_origin_off) + 1
-        (_col_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_sddmm_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc, T)
-    error("EmitterBackend SDDMM: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+    # No row contention: each NNZ has a unique nzval position, so atomic == non-atomic.
+    row_body = inner -> inner
+    emit_kernel_body(fmt;
+                     row_body_unique = row_body, row_body_atomic = row_body,
+                     leaf_unique = leaf, leaf_atomic = leaf)
 end
 
 # ─── Kernel cache and launch ──────────────────────────────────────────────────
 
 function _get_sddmm_kernel(fmt::TensorFormat, ::Type{T}) where T
-    key = (fmt, T, :sddmm)
+    key = (fmt.name, T, :sddmm)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
     body      = _emit_sddmm_body(fmt, T)

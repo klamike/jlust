@@ -4,50 +4,42 @@
 
 function ust(A::SparseMatrixCSC{T,I}) where {T,I}
     n, m = size(A)
-    # CSC: levels are (j: dense, i: compressed)
-    # pos[2] = colptr, crd[2] = rowval — level 2 is the compressed j-over-i level
-    pos = Dict{Int,Vector{I}}(2 => A.colptr)
-    crd = Dict{Int,Vector{I}}(2 => A.rowval)
-    USTensor{T,I,2,Vector{T},Vector{I},OneBased}(
+    VI = Vector{I}
+    USTensor{T,I,2,Vector{T},VI,OneBased,2}(
         (n, m),
         Formats.CSC,
-        pos,
-        crd,
+        _bufs_at(Val(2), VI, 2, A.colptr),
+        _bufs_at(Val(2), VI, 2, A.rowval),
         A.nzval,
-        A,   # owner keeps A alive
+        A,
     )
 end
 
 # ─── SparseVector zero-copy view ─────────────────────────────────────────────
 
 function ust(A::SparseVector{T,I}) where {T,I}
-    pos = Dict{Int,Vector{I}}()
-    crd = Dict{Int,Vector{I}}(1 => A.nzind)
-    USTensor{T,I,1,Vector{T},Vector{I},OneBased}(
+    VI = Vector{I}
+    USTensor{T,I,1,Vector{T},VI,OneBased,1}(
         (length(A),),
         Formats.SparseVector,
-        pos,
-        crd,
+        _no_bufs(Val(1), VI),
+        _bufs_at(Val(1), VI, 1, A.nzind),
         A.nzval,
         A,
     )
 end
 
 # ─── Dense AbstractArray zero-copy view ───────────────────────────────────────
-#
-# Shared empty dicts used as the positions/coordinates placeholders for dense
-# tensors.  DensedRight levels have no pos/crd buffers; these dicts are never
-# accessed or mutated, so sharing them across all ust(::AbstractArray) calls is
-# safe and avoids 2 Dict allocations per wrapping (8 per BlockSparseMatrix mul!).
-const _DENSE_POS = Dict{Int,Vector{Int}}()
-const _DENSE_CRD = Dict{Int,Vector{Int}}()
+# DensedRight has N levels (all DenseLevel), all pos/crd entries are nothing.
+# _no_bufs returns a stack-allocated NTuple, so no per-wrapping heap allocation.
 
 function ust(A::AbstractArray{T,N}) where {T,N}
-    USTensor{T,Int,N,typeof(A),Vector{Int},OneBased}(
+    VI = Vector{Int}
+    USTensor{T,Int,N,typeof(A),VI,OneBased,N}(
         size(A),
         Formats.DensedRight(N),
-        _DENSE_POS,
-        _DENSE_CRD,
+        _no_bufs(Val(N), VI),
+        _no_bufs(Val(N), VI),
         A,
         A,
     )
@@ -68,9 +60,10 @@ function csr_tensor(rowptr::VI, colind::VI, nzval::VA,
                                                   VA <: AbstractArray{T},
                                                   VI <: AbstractArray{I},
                                                   O  <: AbstractIndexOrigin}
-    pos = Dict{Int,VI}(2 => rowptr)
-    crd = Dict{Int,VI}(2 => colind)
-    USTensor{T,I,2,VA,VI,O}(dims, Formats.CSR, pos, crd, nzval, nothing)
+    USTensor{T,I,2,VA,VI,O,2}(dims, Formats.CSR,
+        _bufs_at(Val(2), VI, 2, rowptr),
+        _bufs_at(Val(2), VI, 2, colind),
+        nzval, nothing)
 end
 
 function csr_tensor(rowptr::VI, colind::VI, nzval::VA;
@@ -111,9 +104,10 @@ function csc_tensor(colptr::VI, rowind::VI, nzval::VA,
                                                   VA <: AbstractArray{T},
                                                   VI <: AbstractArray{I},
                                                   O  <: AbstractIndexOrigin}
-    pos = Dict{Int,VI}(2 => colptr)
-    crd = Dict{Int,VI}(2 => rowind)
-    USTensor{T,I,2,VA,VI,O}(dims, Formats.CSC, pos, crd, nzval, nothing)
+    USTensor{T,I,2,VA,VI,O,2}(dims, Formats.CSC,
+        _bufs_at(Val(2), VI, 2, colptr),
+        _bufs_at(Val(2), VI, 2, rowind),
+        nzval, nothing)
 end
 
 function csc_tensor(colptr::VI, rowind::VI, nzval::VA;
@@ -140,9 +134,10 @@ function coo_tensor(rows::VI, cols::VI, nzval::VA,
                                                VI <: AbstractArray{I},
                                                O  <: AbstractIndexOrigin}
     _ = sorted  # consumed by user; not stored (no canonical ordering guarantee)
-    pos = Dict{Int,VI}()
-    crd = Dict{Int,VI}(1 => rows, 2 => cols)
-    USTensor{T,I,2,VA,VI,O}(dims, Formats.COO, pos, crd, nzval, nothing)
+    USTensor{T,I,2,VA,VI,O,2}(dims, Formats.COO,
+        _no_bufs(Val(2), VI),
+        (rows, cols),
+        nzval, nothing)
 end
 
 function coo_tensor(rows::VI, cols::VI, nzval::VA;
@@ -193,7 +188,8 @@ function dcsr_tensor(outer_crd::VI, inner_pos::VI, inner_crd::VI, nzval::VA;
                                                    VA <: AbstractArray{T},
                                                    VI <: AbstractArray{I},
                                                    O  <: AbstractIndexOrigin}
-    pos = Dict{Int,VI}(2 => inner_pos)
-    crd = Dict{Int,VI}(1 => outer_crd, 2 => inner_crd)
-    USTensor{T,I,2,VA,VI,O}((m, n), Formats.DCSR, pos, crd, nzval, nothing)
+    USTensor{T,I,2,VA,VI,O,2}((m, n), Formats.DCSR,
+        _bufs_at(Val(2), VI, 2, inner_pos),
+        (outer_crd, inner_crd),
+        nzval, nothing)
 end

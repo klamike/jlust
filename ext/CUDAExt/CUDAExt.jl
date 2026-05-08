@@ -48,34 +48,36 @@ JLUST.memory_space(::Type{<:CuArray}) = GPUMemory()
 # ─── Dense GPU array adapter ──────────────────────────────────────────────────
 
 function JLUST.ust(A::CuArray{T,N}) where {T,N}
-    fmt = Formats.DensedRight(N)
-    # No pos/crd buffers for an all-dense tensor; VI=CuArray{Int32,1} by convention
-    pos = Dict{Int,CuArray{Int32,1}}()
-    crd = Dict{Int,CuArray{Int32,1}}()
-    USTensor{T,Int32,N,CuArray{T,N},CuArray{Int32,1},OneBased}(
-        size(A), fmt, pos, crd, A, A,
+    VI = CuArray{Int32,1}
+    USTensor{T,Int32,N,CuArray{T,N},VI,OneBased,N}(
+        size(A), Formats.DensedRight(N),
+        JLUST._no_bufs(Val(N), VI),
+        JLUST._no_bufs(Val(N), VI),
+        A, A,
     )
 end
 
 # ─── CuSparseMatrixCSR adapter ────────────────────────────────────────────────
 
 function JLUST.ust(A::CuSparseMatrixCSR{T,Ti}) where {T,Ti}
-    # rowPtr is OneBased (length = nrows+1); colVal is OneBased (length = nnz)
-    pos = Dict{Int,CuVector{Ti}}(2 => A.rowPtr)
-    crd = Dict{Int,CuVector{Ti}}(2 => A.colVal)
-    USTensor{T,Ti,2,CuVector{T},CuVector{Ti},OneBased}(
-        size(A), Formats.CSR, pos, crd, nonzeros(A), A,
+    VI = CuVector{Ti}
+    USTensor{T,Ti,2,CuVector{T},VI,OneBased,2}(
+        size(A), Formats.CSR,
+        JLUST._bufs_at(Val(2), VI, 2, A.rowPtr),
+        JLUST._bufs_at(Val(2), VI, 2, A.colVal),
+        nonzeros(A), A,
     )
 end
 
 # ─── CuSparseMatrixCSC adapter ────────────────────────────────────────────────
 
 function JLUST.ust(A::CuSparseMatrixCSC{T,Ti}) where {T,Ti}
-    # colPtr is OneBased (length = ncols+1); rowVal is OneBased (length = nnz)
-    pos = Dict{Int,CuVector{Ti}}(2 => A.colPtr)
-    crd = Dict{Int,CuVector{Ti}}(2 => rowvals(A))
-    USTensor{T,Ti,2,CuVector{T},CuVector{Ti},OneBased}(
-        size(A), Formats.CSC, pos, crd, nonzeros(A), A,
+    VI = CuVector{Ti}
+    USTensor{T,Ti,2,CuVector{T},VI,OneBased,2}(
+        size(A), Formats.CSC,
+        JLUST._bufs_at(Val(2), VI, 2, A.colPtr),
+        JLUST._bufs_at(Val(2), VI, 2, rowvals(A)),
+        nonzeros(A), A,
     )
 end
 
@@ -85,13 +87,13 @@ function JLUST.ust(A::CuSparseMatrixBSR{T,Ti}) where {T,Ti}
     bsz = (Int(A.blockDim), Int(A.blockDim))
     # dir = 'R': row-major blocks → BSRRight; 'C': col-major → BSRLeft
     fmt = A.dir == 'R' ? Formats.BSRRight(bsz) : Formats.BSRLeft(bsz)
-    # rowPtr: block-level, 1-based, length = nrows/blockDim + 1
-    # colVal: block-level, 1-based, length = nnzb
-    # nzVal:  flat, length = nnzb * blockDim^2
-    pos = Dict{Int,CuVector{Ti}}(2 => A.rowPtr)
-    crd = Dict{Int,CuVector{Ti}}(2 => A.colVal)
-    USTensor{T,Ti,2,CuVector{T},CuVector{Ti},OneBased}(
-        size(A), fmt, pos, crd, nonzeros(A), A,
+    # BSR has 4 levels: i÷b, j÷b, i%b, j%b — pos/crd live at level 2.
+    VI = CuVector{Ti}
+    USTensor{T,Ti,2,CuVector{T},VI,OneBased,4}(
+        size(A), fmt,
+        JLUST._bufs_at(Val(4), VI, 2, A.rowPtr),
+        JLUST._bufs_at(Val(4), VI, 2, A.colVal),
+        nonzeros(A), A,
     )
 end
 
@@ -100,33 +102,38 @@ end
 function JLUST.ust(A::CuSparseMatrixCOO{T,Ti}) where {T,Ti}
     # rowInd and colInd are OneBased.  COO level 1 (compressed nonunique) has no
     # synthetic pos buffer here — same convention as coo_tensor().
-    pos = Dict{Int,CuVector{Ti}}()
-    crd = Dict{Int,CuVector{Ti}}(1 => A.rowInd, 2 => A.colInd)
-    USTensor{T,Ti,2,CuVector{T},CuVector{Ti},OneBased}(
-        size(A), Formats.COO, pos, crd, nonzeros(A), A,
+    VI = CuVector{Ti}
+    USTensor{T,Ti,2,CuVector{T},VI,OneBased,2}(
+        size(A), Formats.COO,
+        JLUST._no_bufs(Val(2), VI),
+        (A.rowInd, A.colInd),
+        nonzeros(A), A,
     )
 end
 
 # ─── Adapt.adapt_structure ────────────────────────────────────────────────────
 
-function Adapt.adapt_structure(adaptor, u::USTensor{T,I,N,VA,VI,O}) where {T,I,N,VA,VI,O}
+function Adapt.adapt_structure(adaptor, u::USTensor{T,I,N,VA,VI,O,NL}) where {T,I,N,VA,VI,O,NL}
     new_val = Adapt.adapt(adaptor, u.val)
     VA2 = typeof(new_val)
 
-    # Determine VI2 by adapting a reference index buffer (if any exist)
-    ref_buf = if !isempty(u.pos_buffers)
-        first(values(u.pos_buffers))
-    elseif !isempty(u.crd_buffers)
-        first(values(u.crd_buffers))
-    else
-        nothing
+    # Determine VI2 by adapting the first non-nothing buffer encountered.
+    ref_buf = nothing
+    for b in u.pos_buffers
+        b !== nothing && (ref_buf = b; break)
     end
-
+    if ref_buf === nothing
+        for b in u.crd_buffers
+            b !== nothing && (ref_buf = b; break)
+        end
+    end
     VI2 = ref_buf === nothing ? VI : typeof(Adapt.adapt(adaptor, ref_buf))
-    new_pos = Dict{Int,VI2}(k => Adapt.adapt(adaptor, v) for (k, v) in u.pos_buffers)
-    new_crd = Dict{Int,VI2}(k => Adapt.adapt(adaptor, v) for (k, v) in u.crd_buffers)
 
-    USTensor{T,I,N,VA2,VI2,O}(u.extents, u.format, new_pos, new_crd, new_val, nothing)
+    _adapt(b) = b === nothing ? nothing : Adapt.adapt(adaptor, b)::VI2
+    new_pos = map(_adapt, u.pos_buffers)::NTuple{NL, Union{Nothing, VI2}}
+    new_crd = map(_adapt, u.crd_buffers)::NTuple{NL, Union{Nothing, VI2}}
+
+    USTensor{T,I,N,VA2,VI2,O,NL}(u.extents, u.format, new_pos, new_crd, new_val, nothing)
 end
 
 # ─── materialize ─────────────────────────────────────────────────────────────
@@ -147,10 +154,11 @@ end
 
 # Reconstruct with shifted index buffers and a new origin type parameter.
 # Dispatches on the concrete u_dev type so VI2 is statically known.
-function _shift_origin(u::USTensor{T,I,N,VA,VI,O}, shift::I, ::Type{O2}) where {T,I,N,VA,VI,O,O2}
-    new_pos = Dict{Int,VI}(k => v .+ shift for (k, v) in u.pos_buffers)
-    new_crd = Dict{Int,VI}(k => v .+ shift for (k, v) in u.crd_buffers)
-    USTensor{T,I,N,VA,VI,O2}(u.extents, u.format, new_pos, new_crd, u.val, nothing)
+function _shift_origin(u::USTensor{T,I,N,VA,VI,O,NL}, shift::I, ::Type{O2}) where {T,I,N,VA,VI,O,O2,NL}
+    _shifted(b) = b === nothing ? nothing : b .+ shift
+    new_pos = map(_shifted, u.pos_buffers)::NTuple{NL, Union{Nothing, VI}}
+    new_crd = map(_shifted, u.crd_buffers)::NTuple{NL, Union{Nothing, VI}}
+    USTensor{T,I,N,VA,VI,O2,NL}(u.extents, u.format, new_pos, new_crd, u.val, nothing)
 end
 
 _adaptor(::CPUDevice)  = Array

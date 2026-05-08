@@ -9,122 +9,22 @@ end
 
 # ─── sparse_to_dense body emitter ─────────────────────────────────────────────
 #
-# Traversal mirrors the SpMV emitter. At the leaf, instead of accumulating into
-# y, we scatter _nzval[_nnz_pos] into _dense[_row_idx, _col_idx].
+# Built via the unified level walker.  The walker binds `_y_idx` (row) and
+# `_x_idx` (col); the leaf scatters `_nzval[_nnz_pos]` into the dense matrix.
+# Each NNZ writes to a distinct (row, col), so atomic == non-atomic.
 
 function _emit_s2d_body(fmt::TensorFormat)
-    pc = Ref(0); cc = Ref(0)
-    _emit_s2d_level(fmt.levels, 1, nothing, pc, cc)
-end
-
-function _emit_s2d_level(levels, lvl, p_var, pc, cc)
-    if lvl > length(levels)
-        return :(_dense[_row_idx, _col_idx] = _nzval[_nnz_pos])
-    end
-    _, lv = levels[lvl]
-    _emit_s2d_lv(lv, levels, lvl, p_var, pc, cc)
-end
-
-function _emit_s2d_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, ::Nothing, pc, cc)
-    inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
-    quote
-        _tid = @index(Global, Linear)
-        if _tid <= _n_outer
-            _row_idx = _tid
-            $inner
-        end
-    end
-end
-
-function _emit_s2d_lv(::Union{DenseLevel,BatchLevel}, levels, lvl, p_var::Symbol, pc, cc)
-    sz   = Symbol(:_sz, lvl)
-    lv2  = Symbol(:_i, lvl)
-    inner = _emit_s2d_level(levels, lvl + 1, lv2, pc, cc)
-    quote
-        for $lv2 in 1:$sz
-            $inner
-        end
-    end
-end
-
-function _emit_s2d_lv(lv::CompressedLevel, levels, lvl, ::Nothing, pc, cc)
-    pc[] += 1; ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    if is_unique(lv)
-        inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                $inner
-            end
-        end
-    else
-        inner = _emit_s2d_level(levels, lvl + 1, :_tid, pc, cc)
-        quote
-            _tid = @index(Global, Linear)
-            if _tid <= _n_outer
-                _row_idx = Int($cs[_tid]) - Int(_origin_off) + 1
-                _nnz_pos = _tid
-                $inner
-            end
-        end
-    end
-end
-
-function _emit_s2d_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc)
-    pi = pc[] += 1; ci = cc[] += 1
-    ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
-    lvar = Symbol(:_i, lvl)
-    inner = _emit_s2d_level(levels, lvl + 1, lvar, pc, cc)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _col_idx = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
-        end
-    end
-end
-
-function _emit_s2d_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc)
-    ci = cc[] += 1
-    cs = Symbol(:_crd, ci)
-    inner = _emit_s2d_level(levels, lvl + 1, p_var, pc, cc)
-    quote
-        _col_idx = Int($cs[$p_var]) - Int(_origin_off) + 1
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_s2d_lv(::Union{RangeLevel,DeltaLevel}, levels, lvl, _, pc, cc)
-    error("EmitterBackend sparse_to_dense: RangeLevel/DeltaLevel not supported.")
-end
-
-# Custom AbstractLevelFormat (inner position): delegate to level_step hook.
-# level_step(lv, i, nz) returns (col_idx, val); col_idx is used for the dense
-# scatter target.  Only callable as an inner (non-outermost) level.
-function _emit_s2d_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc)
-    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _emit_s2d_level(levels, lvl + 1, p_var, pc, cc)
-    quote
-        _p1 = Int($p_var) - Int(_origin_off) + 1
-        (_col_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
-        _nnz_pos = $p_var
-        $inner
-    end
-end
-
-function _emit_s2d_lv(lv::AbstractLevelFormat, levels, lvl, ::Nothing, pc, cc)
-    error("EmitterBackend sparse_to_dense: $(typeof(lv)) cannot be the outermost level; pair with DenseLevel.")
+    leaf = :(_dense[_y_idx, _x_idx] = _nzval[_nnz_pos])
+    row_body = inner -> inner
+    emit_kernel_body(fmt;
+                     row_body_unique = row_body, row_body_atomic = row_body,
+                     leaf_unique = leaf, leaf_atomic = leaf)
 end
 
 # ─── Kernel cache and launch ──────────────────────────────────────────────────
 
 function _get_s2d_kernel(fmt::TensorFormat)
-    key = (fmt, Any, :s2d)
+    key = (fmt.name, Any, :s2d)
     haskey(_emitter_cache, key) && return _emitter_cache[key]
 
     body      = _emit_s2d_body(fmt)

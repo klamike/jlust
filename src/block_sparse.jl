@@ -25,7 +25,7 @@ _is_cpu_array(::AbstractArray) = false
 # constructor expects.
 
 struct BlockSparseMatrix{T}
-    blocks    :: Matrix{Any}   # nb_rows × nb_cols; entries: USTensor or Nothing
+    blocks    :: Matrix{Union{Nothing, AbstractUSTensor}}
     row_sizes :: Vector{Int}   # matrix rows per block row
     col_sizes :: Vector{Int}   # matrix cols per block col
     _row_off  :: Vector{Int}   # cumulative row offsets (length nb_rows+1)
@@ -70,8 +70,10 @@ function BlockSparseMatrix(blocks::Matrix)
         error("BlockSparseMatrix: block col(s) $(findall(==(0), col_sizes)) are entirely nothing")
     ref_T === nothing && error("BlockSparseMatrix: all blocks are nothing")
 
-    BlockSparseMatrix{ref_T}(Matrix{Any}(blocks), row_sizes, col_sizes,
-                              cumsum([0; row_sizes]), cumsum([0; col_sizes]))
+    BlockSparseMatrix{ref_T}(
+        Matrix{Union{Nothing, AbstractUSTensor}}(blocks),
+        row_sizes, col_sizes,
+        cumsum([0; row_sizes]), cumsum([0; col_sizes]))
 end
 
 Base.size(A::BlockSparseMatrix)         = (sum(A.row_sizes), sum(A.col_sizes))
@@ -122,8 +124,8 @@ _is_cpu_fusable_level(::CompressedLevel) = true
 function _is_cpu_fusable(b::AbstractUSTensor)
     length(b.format.levels) == 2 || return false
     _is_cpu_array(nonzeros(b))   || return false
-    outer_lv = b.format.levels[1][2]
-    inner_lv = b.format.levels[2][2]
+    outer_lv = b.format.levels[1]
+    inner_lv = b.format.levels[2]
     (outer_lv isa DenseLevel && _is_cpu_fusable_level(inner_lv)) ||
     (outer_lv isa CompressedLevel && inner_lv isa CompressedLevel)
 end
@@ -141,9 +143,9 @@ function _cpu_level_accumulate!(lv::AbstractLevelFormat, b, y, x, y_lo, x_lo, m)
 end
 
 function _cpu_block_accumulate!(b::AbstractUSTensor, y, x, y_lo, x_lo, m)
-    outer_lv = b.format.levels[1][2]
+    outer_lv = b.format.levels[1]
     if outer_lv isa DenseLevel
-        _cpu_level_accumulate!(b.format.levels[2][2], b, y, x, y_lo, x_lo, m)
+        _cpu_level_accumulate!(b.format.levels[2], b, y, x, y_lo, x_lo, m)
     else  # CompressedLevel outer (DCSR)
         _cpu_dcsr_accumulate!(y, coordinates(b, 1), positions(b, 2), coordinates(b, 2),
                               nonzeros(b), x, y_lo, x_lo)
@@ -211,9 +213,9 @@ function _cpu_level_accumulate_mm!(lv::AbstractLevelFormat, b, Y, X, y_lo, x_lo,
 end
 
 function _cpu_block_accumulate_mm!(b::AbstractUSTensor, Y, X, y_lo, x_lo, m)
-    outer_lv = b.format.levels[1][2]
+    outer_lv = b.format.levels[1]
     if outer_lv isa DenseLevel
-        inner_lv = b.format.levels[2][2]
+        inner_lv = b.format.levels[2]
         if inner_lv isa CompressedLevel
             _cpu_csr_accumulate_mm!(Y, positions(b, 2), coordinates(b, 2), nonzeros(b),
                                      X, y_lo, x_lo, m)
