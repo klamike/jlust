@@ -2,6 +2,58 @@
 
 abstract type AbstractUSTBackend end
 
+# ─── Backend traits ───────────────────────────────────────────────────────────
+#
+# Format-agnostic capability flags consulted by the emitter walker.  An
+# extension declares "my backend supports X" by overriding the trait for its
+# concrete backend type — applies to every USTensor format the walker handles,
+# without per-format specialization.
+#
+# `_supports_ldg(ka)` — does this backend's device kernels have a separate
+# read-only data cache (CUDA's LDG)?  When true the walker wraps x in
+# `Base.Experimental.Const`, so x[col] reads use the read-only path on
+# backends that have it.  Default false; overridden by CUDAExt.
+
+@inline _supports_ldg(::Any) = false
+
+# `_default_workgroup_size(ka)` — block / work-group size the walker uses by
+# default for emitter-driven kernel launches.  The right value is hardware-
+# dependent (NVIDIA SMs prefer 256-thread blocks; OpenCL / POCL devices vary).
+# Backends override for their specific hardware; default is 64 (a safe value
+# that maps to 2 warps on NVIDIA, 1 wavefront on AMD).
+
+@inline _default_workgroup_size(::Any) = 64
+
+# `_supports_warp_vector(ka)` — does this backend's device kernels support
+# warp-level shuffle reductions (CUDA's shfl_*_sync, AMD's __shfl_*)?  When
+# true the walker can emit "warp-vector" SpMV kernels: VS threads cooperate
+# on each row's inner loop, then warp-shuffle-reduce into a single accumulator
+# before lane 0 writes y[row].  Format-agnostic: applies to any (Dense outer,
+# Compressed-unique inner) structure the walker emits, not just CSR.
+# Default false.
+
+@inline _supports_warp_vector(::Any) = false
+
+# `_warp_reduce_sum_down(val, mask, ::Val{VS})` — warp-level sum reduction
+# across VS consecutive lanes within a warp.  Emitted by the walker when
+# `vs > 1`.  Each backend with `_supports_warp_vector === true` MUST provide
+# a method using its native shuffle intrinsic (shfl_down_sync on CUDA).
+# Declared here so the walker can reference it without coupling to a backend.
+
+function _warp_reduce_sum_down end
+
+# `_warp_seg_reduce_sum_down(val, row, mask) -> (val_after, is_head)` —
+# segmented warp-level sum reduction.  Each lane holds a (value, row-key)
+# pair; after this call, the first lane of each contiguous same-row run
+# holds the sum across that run, and `is_head=true` for those lanes only.
+# Emitted by the walker when the outermost level is non-unique-sorted
+# Compressed (COO-style row list) and the backend supports warp shuffles.
+# Backends with `_supports_warp_vector === true` MUST provide a method
+# (CUDA uses log2(32) shfl_down_sync rounds + a single shfl_up_sync for
+# segment-head detection).
+
+function _warp_seg_reduce_sum_down end
+
 # ─── Handle abstraction ───────────────────────────────────────────────────────
 #
 # A `KernelHandle` represents a *prepared* op: descriptors built, workspace
@@ -52,20 +104,13 @@ dispatch. The base implementation checks format-agnostic invariants; extensions
 call `invoke` to run the base check before adding their own.
 """
 # ─── Extension hooks ──────────────────────────────────────────────────────────
-
-# Default: not specialized.  CUDAExt overrides with CuVector dispatch to run
-# the warp-level segmented-reduce COO kernel; returns true if handled.
-function _coo_spmv_specialized!(row_crd, col_crd, nzval, x, y, off, n_nnz)
-    return false
-end
-
-# Default: not specialized.  CUDAExt overrides with CuVector dispatch to run
-# a vector (multi-thread-per-row) CSR kernel; returns true if handled.
-# beta: scale factor for y accumulation (y ← A*x + beta*y).
-# Val{ZERO_BETA}: true eliminates the y-read on the GPU when beta=0.
-function _csr_spmv_specialized!(pos, crd, nzval, x, y, off, n_outer, beta)
-    return false
-end
+#
+# (`_csr_spmv_specialized!` and `_coo_spmv_specialized!` were both retired —
+# their functionality moved into the generic walker, gated by the
+# `_supports_warp_vector(ka)` + `_warp_reduce_sum_down` /
+# `_warp_seg_reduce_sum_down` traits so that every (Dense/Batch outer +
+# Compressed-unique inner) and every (Compressed-non-unique outer) format on
+# CUDA gets the warp-shuffle treatment, not just CSR / COO.)
 
 # ─── Concrete backend types ───────────────────────────────────────────────────
 #

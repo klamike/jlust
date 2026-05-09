@@ -40,9 +40,9 @@ const KI = KernelAbstractions.KernelIntrinsics
 
 # ── Inner-level walker ────────────────────────────────────────────────────────
 
-function _walk_inner(levels, lvl, p_var, pc, cc, leaf)
+function _walk_inner(levels, lvl, p_var, pc, cc, leaf, vs::Int=1)
     lvl > length(levels) && return leaf
-    _walk_inner_lv(levels[lvl], levels, lvl, p_var, pc, cc, leaf)
+    _walk_inner_lv(levels[lvl], levels, lvl, p_var, pc, cc, leaf, vs)
 end
 
 # Inner Dense / Batch — dense loop.  When the level type carries a static size
@@ -51,9 +51,10 @@ end
 # (DenseLevel{nothing}, e.g. an outer-but-not-outermost Dense), a runtime
 # `_sz<lvl>` kernel argument is referenced — the kernel signature must bind it.
 function _walk_inner_lv(lv::Union{DenseLevel{Sz},BatchLevel{Sz}},
-                        levels, lvl, p_var::Symbol, pc, cc, leaf) where {Sz}
+                        levels, lvl, p_var::Symbol, pc, cc, leaf,
+                        vs::Int=1) where {Sz}
     lvar  = Symbol(:_i, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf)
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
     if Sz === nothing
         sz = Symbol(:_sz, lvl)
         quote
@@ -70,39 +71,65 @@ function _walk_inner_lv(lv::Union{DenseLevel{Sz},BatchLevel{Sz}},
     end
 end
 
-function _walk_inner_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, leaf)
+# Inner CompressedLevel — variable-length inner loop, optionally strided by VS
+# threads working on the same parent (warp-vector mode).  In scalar mode (vs=1)
+# `_vec_lane` is bound to 0 by the outer walker, so the strided form reduces
+# to the sequential form `for k in lo+1:hi` — same code as before.
+#
+# Arithmetic stays in the native types of pos/crd/origin_off (typically Int32
+# on GPU buffers): `pos[r] - origin_off` does *not* upcast to Int.  Forcing
+# Int upcasts compiled to 64-bit GPU arithmetic and was a 20%+ perf hit in the
+# inner loop versus equivalent hand-rolled Int32 kernels.
+function _walk_inner_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
+                        vs::Int=1)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar = Symbol(:_i, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf)
-    quote
-        _lo = Int($ps[$p_var])     - Int(_origin_off)
-        _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
-        for $lvar in (_lo + 1):_hi
-            _x_idx   = Int($cs[$lvar]) - Int(_origin_off) + 1
-            _nnz_pos = $lvar
-            $inner
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
+    if vs == 1
+        quote
+            _lo = $ps[$p_var]      - _origin_off
+            _hi = $ps[$p_var + 1]  - _origin_off
+            for $lvar in (_lo + Int32(1)):_hi
+                _x_idx   = $cs[$lvar] - _origin_off + Int32(1)
+                _nnz_pos = $lvar
+                $inner
+            end
+        end
+    else
+        quote
+            _lo = $ps[$p_var]      - _origin_off
+            _hi = $ps[$p_var + 1]  - _origin_off
+            $lvar = _lo + _vec_lane + Int32(1)
+            while $lvar <= _hi
+                _x_idx   = $cs[$lvar] - _origin_off + Int32(1)
+                _nnz_pos = $lvar
+                $inner
+                $lvar += Int32($vs)
+            end
         end
     end
 end
 
-function _walk_inner_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, leaf)
+function _walk_inner_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
+                        vs::Int=1)
     ci = cc[] += 1
     cs = Symbol(:_crd, ci)
-    inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf)
+    inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
     quote
-        _x_idx   = Int($cs[$p_var]) - Int(_origin_off) + 1
+        _x_idx   = $cs[$p_var] - _origin_off + Int32(1)
         _nnz_pos = $p_var
         $inner
     end
 end
 
-function _walk_inner_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, leaf)
+function _walk_inner_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
+                        vs::Int=1)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar  = Symbol(:_i, lvl)
     corig = Symbol(:_corig, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf)
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
     quote
         _lo = Int($ps[$p_var])     - Int(_origin_off)
         _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
@@ -117,7 +144,8 @@ function _walk_inner_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, leaf)
     end
 end
 
-function _walk_inner_lv(::RangeLevel, levels, lvl, p_var, pc, cc, leaf)
+function _walk_inner_lv(::RangeLevel, levels, lvl, p_var, pc, cc, leaf,
+                        vs::Int=1)
     error("EmitterBackend: RangeLevel (DIA-style) inner kernels not supported. " *
           "Use convert_format to CSR or DCSR first.")
 end
@@ -125,9 +153,10 @@ end
 # Custom AbstractLevelFormat: use the public JLUST.emit_spmv_lv hook.
 # The hook receives `_x_idx` via the `_inner_coord` form expected by user code.
 # We splice in a transformation step that aliases _x_idx and supplies _nnz_pos.
-function _walk_inner_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, leaf)
+function _walk_inner_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, leaf,
+                        vs::Int=1)
     nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf)
+    inner  = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
     quote
         _p1 = Int($p_var) - Int(_origin_off) + 1
         (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
@@ -145,25 +174,54 @@ end
 
 function emit_kernel_body(levels::Tuple;
                           row_body_unique, row_body_atomic,
-                          leaf_unique,     leaf_atomic)
+                          leaf_unique,     leaf_atomic,
+                          vs::Int=1, seg::Bool=false)
     pc = Ref(0); cc = Ref(0)
     isempty(levels) && error("emit_kernel_body: no levels")
     _emit_outer(levels[1], levels, pc, cc,
-                row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
+                row_body_unique, row_body_atomic, leaf_unique, leaf_atomic, vs, seg)
 end
 
 emit_kernel_body(fmt::TensorFormat; kw...) = emit_kernel_body(fmt.levels; kw...)
 
-# Outer Dense / Batch — thread = row directly.
+# Outer Dense / Batch.  Thread → row directly when `vs == 1`; otherwise VS
+# threads cooperate per row.  In vector mode (`vs > 1`) the outer also binds
+# `_vec_lane` and `_group_mask`, which the inner CompressedLevel walker reads
+# to stride its loop and which the row body uses for the warp-reduce.
+#
+# When `vs == 1` the bindings still exist (`_vec_lane = 0`, `_group_mask = 0`)
+# so the inner walker code is identical regardless of mode — Julia constant-
+# folds them away in the scalar path.
 function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
-                     row_body_unique, _row_body_atomic, leaf_unique, _leaf_atomic)
-    inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_unique)
+                     row_body_unique, _row_body_atomic, leaf_unique, _leaf_atomic,
+                     vs::Int=1, _seg::Bool=false)
+    inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, vs)
     body  = row_body_unique(inner)
-    quote
-        _tid = KI.get_global_id().x
-        if _tid <= _n_outer
-            _y_idx = _tid
-            $body
+    if vs == 1
+        quote
+            _tid       = KI.get_global_id().x
+            _row_id    = _tid
+            _vec_lane  = Int32(0)
+            _group_mask = UInt32(0)
+            if _row_id <= _n_outer
+                _y_idx = _row_id
+                $body
+            end
+        end
+    else
+        quote
+            _tid       = KI.get_global_id().x
+            _row_id    = (_tid - Int32(1)) ÷ Int32($vs) + Int32(1)
+            _vec_lane  = (_tid - Int32(1)) % Int32($vs)
+            # Warp-shuffle group mask: VS consecutive 1-bits, shifted by group.
+            _lane_in_warp  = (KI.get_local_id().x - Int32(1)) % Int32(32)
+            _group_in_warp = _lane_in_warp ÷ Int32($vs)
+            _group_bits    = (UInt32(1) << UInt32($vs)) - UInt32(1)
+            _group_mask    = _group_bits << (UInt32(_group_in_warp) * UInt32($vs))
+            if _row_id <= _n_outer
+                _y_idx = _row_id
+                $body
+            end
         end
     end
 end
@@ -171,28 +229,66 @@ end
 # Outer CompressedLevel — fiber-parallel (unique) or NNZ-parallel (non-unique).
 # Outer Compressed has no parent-fiber pos buffer (no pos slot), so pc stays
 # unincremented — matches _level_arg_names which emits crd only at the outer level.
+# The vector mode (vs>1) doesn't apply to outer-Compressed structures (DCSR
+# etc.) — VS makes sense only when the *inner* level has variable-length
+# iteration that VS threads can stride across.  We accept `vs` for signature
+# uniformity but ignore it here.
 function _emit_outer(lv::CompressedLevel, levels, pc, cc,
-                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic,
+                     vs::Int=1, seg::Bool=false)
     ci = cc[] += 1
     cs = Symbol(:_crd, ci)
     if is_unique(lv)
-        inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_unique)
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, 1)
         body  = row_body_unique(inner)
         quote
-            _tid = KI.get_global_id().x
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
+            _tid       = KI.get_global_id().x
+            _row_id    = _tid
+            _vec_lane  = Int32(0)
+            _group_mask = UInt32(0)
+            if _row_id <= _n_outer
+                _y_idx = Int($cs[_row_id]) - Int(_origin_off) + 1
                 $body
             end
         end
+    elseif seg
+        # Segmented warp-reduce mode (sorted COO + warp-shuffle backend).
+        # Every lane in the warp must reach the warp-reduce primitive — out-of-
+        # range threads contribute (val=0, row=-1) so they're skipped at the
+        # head check.  The walker writes the partial inner result into _my_val
+        # via the `leaf_atomic` body (rewritten by `_emit_spmv_body` to
+        # `_my_val += α·nzval·input_fn(x)` when seg=true).
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1)
+        body  = row_body_atomic(inner)   # `inner -> inner` for seg
+        quote
+            _tid        = KI.get_global_id().x
+            _row_id     = _tid
+            _vec_lane   = Int32(0)
+            _group_mask = UInt32(0)
+            _MASK       = UInt32(0xffffffff)
+            _my_row     = Int32(-1)
+            _my_val     = zero(eltype(_y))
+            if _row_id <= _n_outer
+                _y_idx  = Int($cs[_row_id]) - Int(_origin_off) + 1
+                _my_row = Int32(_y_idx) - Int32(1)
+                $body
+            end
+            (_my_val, _is_head) = JLUST._warp_seg_reduce_sum_down(_my_val, _my_row, _MASK)
+            if _is_head & (_my_row >= Int32(0))
+                KernelAbstractions.@atomic _y[_my_row + Int32(1)] += _my_val
+            end
+        end
     else
-        # Non-unique: thread = NNZ of the single outer fiber; leaf must be order-independent.
-        inner = _walk_inner(levels, 2, :_tid, pc, cc, leaf_atomic)
+        # Non-unique fallback: thread = NNZ; leaf is the atomic-add y-write.
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1)
         body  = row_body_atomic(inner)
         quote
-            _tid = KI.get_global_id().x
-            if _tid <= _n_outer
-                _y_idx = Int($cs[_tid]) - Int(_origin_off) + 1
+            _tid       = KI.get_global_id().x
+            _row_id    = _tid
+            _vec_lane  = Int32(0)
+            _group_mask = UInt32(0)
+            if _row_id <= _n_outer
+                _y_idx = Int($cs[_row_id]) - Int(_origin_off) + 1
                 $body
             end
         end

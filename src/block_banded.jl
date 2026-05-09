@@ -70,6 +70,7 @@ Base.size(M::BlockBandedMatrix, d::Int) = size(M)[d]
 
 _bbm_eltype(A::AbstractMatrix) = eltype(A)
 _bbm_eltype(A::AbstractVector) = eltype(first(A))
+_bbm_eltype(::BlockSparseMatrix{T}) where T = T
 Base.eltype(M::BlockBandedMatrix) = _bbm_eltype(M.diags)
 
 # ── BBMSpMV: execute(BBMSpMVOp, M, x, y) ─────────────────────────────────────

@@ -28,6 +28,17 @@ const Scalar = TensorFormat((), (); name=:Scalar)
 @tensor_format CROW (i, j) -> (i : compressed, j : dense)
 @tensor_format CCOL (i, j) -> (j : compressed, i : dense)
 
+# ─── Selector / row-singleton formats ────────────────────────────────────────
+#
+# Each row has *exactly one* nonzero at a varying column.  The natural format is
+# (DenseLevel, SingletonLevel): no rowptr, no per-row branch — the emitter
+# walker generates a single-load-per-row kernel with no indirection beyond the
+# column lookup.  Useful for incidence matrices, identity-shaped selectors
+# (gen-to-bus, ramp coupling), permutation-style sparse maps, etc.
+
+@tensor_format SelectorRow (i, j) -> (i : dense, j : singleton)   # 1 nnz per row
+@tensor_format SelectorCol (i, j) -> (j : dense, i : singleton)   # 1 nnz per col
+
 # ─── Diagonal formats ─────────────────────────────────────────────────────────
 
 @tensor_format DIAI    (i, j) -> ((j - i) : compressed, i : range)

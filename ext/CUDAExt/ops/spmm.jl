@@ -19,7 +19,8 @@ export CUSPARSESpMMHandle
 
 function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMM}}, u_A::USTensor{T,Ti};
                         transa::Char='N', transb::Char='N',
-                        n_cols::Int) where {T<:_CUSPARSE_ELTYPES, Ti}
+                        n_cols::Int,
+                        algo::cusparseSpMMAlg_t=CUSPARSE_SPMM_ALG_DEFAULT) where {T<:_CUSPARSE_ELTYPES, Ti}
     idx   = _cusparse_index(u_A)
     m, n  = Int64.(extents(u_A))
     spmat = CuSparseMatrixDescriptor(_to_cuspmat(u_A), idx)
@@ -27,7 +28,6 @@ function JLUST.prepare(::CUSPARSEBackend, ::Type{<:Op{:SpMM}}, u_A::USTensor{T,T
     m_out = transa == 'N' ? m : n
     descB = CuDenseMatrixDescriptor(T, k_dim, n_cols)
     descC = CuDenseMatrixDescriptor(T, m_out, n_cols)
-    algo  = CUSPARSE_SPMM_ALG_DEFAULT
     α_ref = Ref{T}(one(T));  β_ref = Ref{T}(zero(T))
 
     ws = _cusparse_workspace() do buf_sz, buf

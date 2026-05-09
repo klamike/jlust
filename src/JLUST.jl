@@ -62,6 +62,7 @@ export
 
     # Interop / constructors
     ust, csr_tensor, csc_tensor, coo_tensor, dcsr_tensor,
+    selector_tensor, diagonal_tensor,
 
     # Convert
     convert_format, convert_index_type, convert_value_type,
@@ -71,10 +72,6 @@ export
     # Handle types (exported from backend extensions)
     # CUSPARSESpMVHandle, CUSPARSESpMMHandle, CUSPARSESpSVHandle, CUSPARSESpSMHandle,
     # CUSPARSESDDMMHandle, CUSPARSESpGEMMHandle  (exported from CUDAExt)
-
-    # Hooks for backend-specialized SpMV; overridden by CUDAExt for GPU kernels
-    _coo_spmv_specialized!,
-    _csr_spmv_specialized!,
 
     # Execution
     #   `execute(OpType, args...; backend, kw...)` — canonical entry point.

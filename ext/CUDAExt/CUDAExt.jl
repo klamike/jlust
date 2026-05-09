@@ -43,6 +43,66 @@ import CUDA.CUSPARSE:
 
 JLUST.memory_space(::Type{<:CuArray}) = GPUMemory()
 
+# ─── Backend traits (opt into emitter optimisations) ────────────────────────
+#
+# CUDA's PTX has the LDG (load-via-read-only-cache) instruction; the emitter
+# walker wraps x in `Const` when this is true, so x[col] reads use the
+# read-only data cache.  Format-agnostic — applies to every USTensor format
+# the walker emits, not just CSR/COO.
+
+@inline JLUST._supports_ldg(::CUDABackend) = true
+
+# 256 = 8 warps/block — sweet spot on Ampere/Hopper/Ada SMs (4 schedulers × 2
+# warps).  Walker-emitted scalar kernels were running at the conservative 64
+# default, leaving threads on the table for medium-large matrices.
+@inline JLUST._default_workgroup_size(::CUDABackend) = 256
+
+# Warp-shuffle reductions: NVIDIA SMs do these in a single PTX instruction
+# (shfl_down_sync).  The walker emits stride-VS inner loops + reduce when
+# `_supports_warp_vector(ka) === true` and the format admits warp-vector mode.
+@inline JLUST._supports_warp_vector(::CUDABackend) = true
+
+# log2(VS)-step warp-shuffle sum reduction across VS lanes.  VS must be a
+# power of two ≤ 32 — the @generated body emits exactly log2(VS) shfl_down
+# instructions, all hoisted to compile time.
+@generated function JLUST._warp_reduce_sum_down(val, mask::UInt32, ::Val{VS}) where VS
+    @assert VS isa Integer && VS > 0 && (VS & (VS - 1)) == 0 && VS <= 32 "VS must be a power of 2 ≤ 32"
+    body = Expr(:block)
+    δ = 1
+    while δ < VS
+        push!(body.args, :(val += CUDA.shfl_down_sync(mask, val, Int32($δ))))
+        δ <<= 1
+    end
+    push!(body.args, :(return val))
+    body
+end
+
+# Segmented warp-level sum reduction (5-step shfl_down across the full warp,
+# guarded by row-key match) + segment-head detection via one shfl_up.  Each
+# of the 32 lanes holds (val, row); after this call the leftmost lane of each
+# contiguous same-row run holds the run's sum and is_head=true.  Used by the
+# walker for sorted-COO SpMV: 1 thread per NNZ, atomic add only at heads.
+#
+# IMPORTANT: CUDA's `shfl_down_sync` returns the caller's own value when the
+# source lane is out of range (lane + δ >= 32).  Without an explicit `lane +
+# δ < 32` guard, a lane at the warp tail would see `peer_row == orig_row`
+# trivially and double-count itself — a bug the previous hand-written CUDA
+# COO kernel also had but never tripped on the limited test inputs.
+@inline function JLUST._warp_seg_reduce_sum_down(val::T, row::Int32, mask::UInt32) where T
+    orig_row = row
+    lane     = (threadIdx().x - Int32(1)) % Int32(32)
+    for δ in (Int32(1), Int32(2), Int32(4), Int32(8), Int32(16))
+        peer_val = CUDA.shfl_down_sync(mask, val, δ)
+        peer_row = CUDA.shfl_down_sync(mask, orig_row, δ)
+        if (lane + δ < Int32(32)) & (peer_row == orig_row) & (orig_row >= Int32(0))
+            val += peer_val
+        end
+    end
+    prev_row = CUDA.shfl_up_sync(mask, orig_row, UInt32(1))
+    is_head  = (lane == Int32(0)) | (prev_row != orig_row)
+    return (val, is_head)
+end
+
 # ─── Dense GPU array adapter ──────────────────────────────────────────────────
 
 function JLUST.ust(A::CuArray{T,N}) where {T,N}

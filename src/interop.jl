@@ -93,6 +93,65 @@ function csr_tensor(A::SparseMatrixCSC{T}; device=identity) where T
 end
 
 """
+    selector_tensor(cols, vals, dims; origin=OneBased())
+    selector_tensor(cols, vals; m, n, origin=OneBased())
+
+Build a `(DenseLevel, SingletonLevel)` USTensor — *exactly one* nonzero per row
+at the column given by `cols[r]` with value `vals[r]`.  No rowptr is stored.
+
+The generic emitter walker generates a single-load-per-row SpMV kernel for this
+format with no pos indirection — equivalent to a hand-written selector kernel,
+just produced automatically from the level structure.
+
+Useful for: gen-to-bus incidence (1 generator → 1 bus), ramp coupling matrices
+(R = sparse(1:n_gen, 1:n_gen, …)), permutation maps, scatter operators.
+
+Distinct from `(Dense, Compressed)` CSR, which stores a rowptr to allow rows
+with 0 or many nnz; the selector format trades that flexibility for a faster
+kernel and 4n_rows fewer index bytes.
+"""
+function selector_tensor(cols::VI, vals::VA, dims::Tuple{Int,Int};
+                          origin::O=OneBased()) where {T, I,
+                                                        VA <: AbstractArray{T},
+                                                        VI <: AbstractArray{I},
+                                                        O  <: AbstractIndexOrigin}
+    m, n = dims
+    length(cols) == m ||
+        error("selector_tensor: length(cols)=$(length(cols)) ≠ n_rows=$m")
+    length(vals) == m ||
+        error("selector_tensor: length(vals)=$(length(vals)) ≠ n_rows=$m")
+    USTensor{T,I,2,VA,VI,O,2}(dims, Formats.SelectorRow,
+        _no_bufs(Val(2), VI),
+        _bufs_at(Val(2), VI, 2, cols),
+        vals, nothing)
+end
+
+function selector_tensor(cols::VI, vals::VA;
+                          m::Int, n::Int,
+                          origin::O=OneBased()) where {T, I,
+                                                        VA <: AbstractArray{T},
+                                                        VI <: AbstractArray{I},
+                                                        O  <: AbstractIndexOrigin}
+    selector_tensor(cols, vals, (m, n); origin=origin)
+end
+
+"""
+    diagonal_tensor(d::AbstractVector; n_cols=length(d), device=identity)
+
+Build a diagonal USTensor — special case of `selector_tensor` with
+`cols = 1:length(d)`.  When `n_cols > length(d)` the trailing columns are
+implicitly zero (the matrix is `length(d) × n_cols`).
+"""
+function diagonal_tensor(d::AbstractVector{T};
+                          n_cols::Int=length(d),
+                          device=identity) where T
+    m  = length(d)
+    cols = device(Int32.(1:m))
+    vals = device(T.(d))
+    selector_tensor(cols, vals; m=m, n=n_cols)
+end
+
+"""
     csc_tensor(colptr, rowind, nzval, dims; origin=OneBased())
     csc_tensor(colptr, rowind, nzval; m, n, origin=OneBased())
 
