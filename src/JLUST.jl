@@ -25,6 +25,7 @@ export
     AbstractLevelFormat,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
     ShiftedDiagLevel, diag_shift, diag_val,
+    PeriodicLevel, period_count, period_cols,
     is_ordered, is_unique,
 
     # Format DSL
@@ -63,7 +64,7 @@ export
 
     # Interop / constructors
     ust, csr_tensor, csc_tensor, coo_tensor, dcsr_tensor,
-    selector_tensor, diagonal_tensor, shifted_diag_tensor,
+    selector_tensor, diagonal_tensor, shifted_diag_tensor, periodic_csr_tensor,
 
     # Convert
     convert_format, convert_index_type, convert_value_type,

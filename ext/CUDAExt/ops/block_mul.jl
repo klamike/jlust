@@ -562,36 +562,30 @@ end
     JLUST.execute(JLUST.SpMVOp, c.asm, JLUST.ust(x), JLUST.ust(y);
                   backend=JLUST.EmitterBackend())
 
-# ─── BBM-periodic SpMV: backend-agnostic kernels live in KAExt ──────────────
+# ─── BBM-periodic SpMV: walker-emitted, format-generic ──────────────────────
 #
-# The two structurally-aware kernels (generic periodic + selector off-diag
-# fast path) used to be CUDA-only @cuda functions in this file.  They moved
-# to KernelAbstractionsExt as `@kernel` bodies so every KA-targetable backend
-# (CUDA, ROCm, CPU, POCL, oneAPI) runs the same code.  CUDA's read-only data
-# cache (LDG) is opted into via the `_supports_ldg(ka)` trait — backends
-# without it fall through to a regular global load, no kernel duplication.
-#
-# Launch entry points: `JLUST._bbm_periodic_spmv_launch!` /
-# `JLUST._bbm_periodic_selector_launch!` (declared in src/backends.jl,
-# implemented in ext/KernelAbstractionsExt/ops/block_periodic.jl).
+# The structurally-aware periodic kernel is now walker-emitted via
+# `_bbm_periodic_emit_kern` in KernelAbstractionsExt — one fused kernel that
+# composes three sub-walks (diag, off-neg, off-pos) from each block's
+# `TensorFormat`, with let-bound buffer-name overrides per sub-walk.  Any
+# block format the standard inner walker handles (CSR, DCSR-shape,
+# ShiftedDiag, custom user `level_step`) drops in unchanged — including the
+# constant-scaled-identity off-diag pattern that used to need a dedicated
+# selector kernel (now expressed as `(Dense, ShiftedDiag)` in the off-diag
+# pair).  CUDA's LDG opt-in still gates on `_supports_ldg(ka)`.
 
-# Periodic compiled view — only created when the BBM matches the supported
-# shape (bw=1, BSM diag, single Tuple off-diag pair).  Holds direct refs to
-# the source block CSRs (no T-fold replication) plus the BSM's already-extracted
-# selector patches (carried straight through from `bsm_compiled.patches`).
-mutable struct _CompiledBBMPeriodic{T,Ti,P<:Tuple}
-    bsm_compiled :: _CompiledBSM{T,Ti,P}     # diag's compiled CSR + extracted patches
-    # Off-diag CSR storage (only populated when not in selector mode):
-    n_pos        :: CuVector{Int32}          # off-diag neg CSR rowptr
-    n_crd        :: CuVector{Int32}
-    n_nzval      :: CuVector{T}
-    p_pos        :: CuVector{Int32}          # off-diag pos CSR rowptr
-    p_crd        :: CuVector{Int32}
-    p_nzval      :: CuVector{T}
-    # Off-diag selector mode: both off-diag matrices are scaled identities.
-    selector     :: Bool
-    neg_val      :: T
-    pos_val      :: T
+# Periodic compiled view: stores the per-block USTensors (with their format
+# types) plus the BSM's extracted selector patches.  The kernel is fully
+# format-generic — we just hand the kernel the buffer args + format types
+# and the walker emits a kernel specialised for that exact (Diag, Neg, Pos)
+# triple.  Selector-encoded CSR off-diag blocks are auto-converted to
+# `(Dense, ShiftedDiag)` USTensors at compile time so the same generic path
+# handles both shapes.
+mutable struct _CompiledBBMPeriodic{T,Ti,P<:Tuple,Diag<:USTensor,Neg<:USTensor,Pos<:USTensor}
+    bsm_compiled :: _CompiledBSM{T,Ti,P}      # diag's compiled CSR + extracted patches
+    diag_ust     :: Diag                      # CSR USTensor wrapping the assembled CSR (== bsm_compiled.asm)
+    neg_ust      :: Neg                       # off-diag neg as a USTensor (CSR or ShiftedDiag)
+    pos_ust      :: Pos                       # off-diag pos as a USTensor (CSR or ShiftedDiag)
     n_diag       :: Int32
     n_off        :: Int32
     n_cols       :: Int32
@@ -612,14 +606,25 @@ const _bbm_periodic_cache = IdDict{BlockBandedMatrix, _CompiledBBMPeriodic}()
     od[1] isa AbstractUSTensor && od[2] isa AbstractUSTensor
 end
 
-# Pull the compiled BSM's CSR buffers + off-diag CSR buffers into a periodic
-# launcher.  No full BBM materialization.  Selector blocks inside the BSM diag
-# are already extracted as `bsm_c.patches` by `_compile_bsm`; the periodic
-# kernel walks them alongside the per-period CSR walk.  If both off-diagonal
-# matrices are constant-value selectors, the kernel uses the closed-form
-# selector access pattern for off-diag rows and skips uploading their CSR.
+# Convert a CSR-encoded constant-value selector tensor to a (Dense, ShiftedDiag)
+# USTensor of the same dimensions.  No buffers — both shift (= 0 for the
+# detected pattern) and val live in the format type, so the walker emits the
+# closed-form leaf with no indirect loads.
+function _selector_to_shifted_diag(u::AbstractUSTensor{T}) where T
+    is_sel, val = _selector_value(u)
+    is_sel || return u
+    nrows = Int(extents(u)[1]); ncols = Int(extents(u)[2])
+    JLUST.shifted_diag_tensor(T, nrows, ncols; shift = 0, val = val,
+                                device = CuArray)
+end
+
+# Pull the compiled BSM's CSR buffers + off-diag block USTensors into a
+# periodic launcher.  No full BBM materialization.  Selector blocks inside
+# the BSM diag are already extracted as `bsm_c.patches` by `_compile_bsm`;
+# selector-encoded CSR off-diag blocks are auto-converted to ShiftedDiag
+# USTensors so the same generic walker handles them — no special kernel.
 function _compile_bbm_periodic(M::BlockBandedMatrix{D,O}) where {D,O}
-    bsm = M.diags::BlockSparseMatrix
+    bsm   = M.diags::BlockSparseMatrix
     bsm_c = _ensure_compiled_bsm(bsm)
     Pty   = typeof(bsm_c.patches)
 
@@ -630,28 +635,12 @@ function _compile_bbm_periodic(M::BlockBandedMatrix{D,O}) where {D,O}
     n_cols = Int32(M.n_cols)
     n_total_rows = Int32(M.T * M.n_diag_rows + (M.T - 1) * M.n_off_rows[1])
 
-    n_is_sel, n_v = _selector_value(neg)
-    p_is_sel, p_v = _selector_value(pos)
-    if n_is_sel && p_is_sel
-        empty_iv = CuVector{Int32}(undef, 0)
-        empty_v  = CuVector{Tel}(undef, 0)
-        return _CompiledBBMPeriodic{Tel,Int32,Pty}(
-            bsm_c,
-            empty_iv, empty_iv, empty_v,
-            empty_iv, empty_iv, empty_v,
-            true, Tel(n_v), Tel(p_v),
-            n_diag, n_off, n_cols, n_total_rows,
-            Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
-            UInt(0), UInt(0), nothing)
-    end
+    diag_ust = bsm_c.asm
+    neg_ust  = _selector_to_shifted_diag(neg)
+    pos_ust  = _selector_to_shifted_diag(pos)
 
-    n_pos, n_crd, n_nz = positions(neg, 2), coordinates(neg, 2), nonzeros(neg)
-    p_pos, p_crd, p_nz = positions(pos, 2), coordinates(pos, 2), nonzeros(pos)
-    _CompiledBBMPeriodic{Tel,Int32,Pty}(
-        bsm_c,
-        CuVector{Int32}(n_pos), CuVector{Int32}(n_crd), CuVector{Tel}(n_nz),
-        CuVector{Int32}(p_pos), CuVector{Int32}(p_crd), CuVector{Tel}(p_nz),
-        false, zero(Tel), zero(Tel),
+    _CompiledBBMPeriodic{Tel,Int32,Pty,typeof(diag_ust),typeof(neg_ust),typeof(pos_ust)}(
+        bsm_c, diag_ust, neg_ust, pos_ust,
         n_diag, n_off, n_cols, n_total_rows,
         Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
         UInt(0), UInt(0), nothing)
@@ -660,32 +649,29 @@ end
 @inline _ensure_periodic_bbm(M::BlockBandedMatrix) =
     get!(() -> _compile_bbm_periodic(M), _bbm_periodic_cache, M)
 
+# Extract the same buffer tuple the standard SpMV walker passes for a tensor.
+# Reuses KAExt's `_sparse_args(u)` (returns a Vector{AbstractArray}) — wrap
+# in a Tuple so the @generated kernel sees a stable type.
+@inline function _periodic_block_bufs(u::AbstractUSTensor)
+    kaext = Base.get_extension(JLUST, :KernelAbstractionsExt)
+    Tuple(kaext._sparse_args(u))
+end
+
 @inline function _bbm_periodic_launch!(c::_CompiledBBMPeriodic, x::CuVector, y::CuVector,
                                          beta::Real=zero(eltype(y)))
-    bsm_asm = c.bsm_compiled.asm
-    d_pos = positions(bsm_asm, 2)
-    d_crd = coordinates(bsm_asm, 2)
-    d_nz  = nonzeros(bsm_asm)
-    ka    = CUDABackend()
-    patches = c.bsm_compiled.patches   # NTuple{N, SelectorPatch{T}} from BSM compile
-    if c.selector
-        JLUST._bbm_periodic_selector_launch!(ka,
-            d_pos, d_crd, d_nz,
-            y, x,
-            c.n_diag, c.n_off, c.n_cols, c.n_total_rows,
-            eltype(y)(c.neg_val), eltype(y)(c.pos_val),
-            patches,
-            iszero(beta), eltype(y)(beta))
-    else
-        JLUST._bbm_periodic_spmv_launch!(ka,
-            d_pos, d_crd, d_nz,
-            c.n_pos, c.n_crd, c.n_nzval,
-            c.p_pos, c.p_crd, c.p_nzval,
-            y, x,
-            c.n_diag, c.n_off, c.n_cols, c.n_total_rows,
-            patches,
-            iszero(beta), eltype(y)(beta))
-    end
+    ka      = CUDABackend()
+    Tel     = eltype(y)
+    diag_bufs = _periodic_block_bufs(c.diag_ust)
+    neg_bufs  = _periodic_block_bufs(c.neg_ust)
+    pos_bufs  = _periodic_block_bufs(c.pos_ust)
+    JLUST._bbm_periodic_spmv_launch!(ka,
+        diag_bufs, neg_bufs, pos_bufs,
+        format(c.diag_ust), format(c.neg_ust), format(c.pos_ust),
+        y, x,
+        c.n_diag, c.n_off, c.n_cols, c.n_total_rows,
+        c.bsm_compiled.patches,
+        iszero(beta), Tel(beta);
+        alpha = one(Tel), input_fn = identity, origin_off = Int32(1))
     return y
 end
 

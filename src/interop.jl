@@ -180,6 +180,38 @@ function shifted_diag_tensor(::Type{T}, n_rows::Integer, n_cols::Integer;
 end
 
 """
+    periodic_csr_tensor(block::USTensor, T_per::Int) -> USTensor
+
+Wrap a CSR-formatted block in a `(PeriodicLevel{T_per, n_cols}, Dense{block_rows},
+Compressed)` USTensor that represents a T-fold block-diagonal replica of `block`
+along both dims.  The block's pos / crd / nzval are *shared* — no replication —
+and the walker reconstructs each period's per-row contribution by adjusting
+the column offset at thread granularity.
+
+The resulting tensor is a regular USTensor: standard SpMV / mul! / `*` work
+through the same emitter pipeline, and the walker handles the periodic shape
+generically.  Equivalent to `kron(I(T_per), block)` but in O(one-block) space.
+
+The block format must be CSR (`(Dense, Compressed)`).  For periodic
+replication of other block formats, use `periodic_tensor` (general path).
+"""
+function periodic_csr_tensor(block::USTensor{T,I,2,VA,VI,O,2}, T_per::Integer) where {T,I,VA,VI,O}
+    fmt_old = format(block)
+    fmt_old == Formats.CSR ||
+        error("periodic_csr_tensor: block must be CSR-formatted (got $fmt_old)")
+    block_rows = Int(extents(block)[1])
+    block_cols = Int(extents(block)[2])
+    fmt        = Formats.PeriodicCSR(Int(T_per), block_rows, block_cols)
+    new_extents = (Int(T_per) * block_rows, Int(T_per) * block_cols)
+    pos_buf = positions(block, 2)
+    crd_buf = coordinates(block, 2)
+    new_pos = _bufs_at(Val(3), VI, 3, pos_buf)
+    new_crd = _bufs_at(Val(3), VI, 3, crd_buf)
+    USTensor{T,I,2,VA,VI,O,3,typeof(fmt),typeof(block)}(
+        new_extents, fmt, new_pos, new_crd, block.val, block)
+end
+
+"""
     csc_tensor(colptr, rowind, nzval, dims; origin=OneBased())
     csc_tensor(colptr, rowind, nzval; m, n, origin=OneBased())
 

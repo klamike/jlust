@@ -270,8 +270,8 @@ for case in CASES
     r = bench_case(case)
     push!(results, case => r)
 
-    sp2_jl    = _speedup(r.t_cusparse_s2, r.t_jlust_s2)
-    sp3_jl    = _speedup(r.t_cusparse_s3, r.t_jlust_s3)
+    sp2_jl    = _speedup(r.t_cusparse_s2, r.t_graph_s2)
+    sp3_jl    = _speedup(r.t_cusparse_s3, r.t_graph_s3)
     ok        = r.ok ? "✓" : "✗"
 
     @printf("%6d  │  %s  %s  %s  %7s  │  %s  %s  %s  %7s  %s\n",
@@ -293,4 +293,4 @@ println()
 println("  cuSP-h  = cuSPARSE handle on the full T-period block-banded CSR.")
 println("  JLUST   = LinearAlgebra.mul! through JLUST (direct dispatch, no graph).")
 println("  Graph   = JLUST captured into a CUDA Graph (NaN if the stack rejects relaunch).")
-println("  speedup = cuSP-h / JLUST.")
+println("  speedup = cuSP-h / Graph (NaN when graph capture is unavailable).")

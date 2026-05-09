@@ -63,8 +63,11 @@ function _warp_seg_reduce_sum_down end
 # `mul!` in CUDAExt and (eventually) any other backend's BBM glue.
 
 function _bbm_periodic_spmv_launch! end
-function _bbm_periodic_selector_launch! end
 function _bsm_with_patches_spmv_launch! end
+# (`_bbm_periodic_selector_launch!` was retired — selector off-diag is now a
+# regular `(Dense, ShiftedDiag)`-formatted USTensor in the off-diag pair, and
+# the periodic walker handles it via the standard nzval-less custom-level
+# leaf path.  No separate kernel needed.)
 
 # Block-level "selector patch": describes a (Dense, ShiftedDiag)-shaped block
 # embedded in a BlockSparseMatrix or BlockBandedMatrix.  For BSM rows in
@@ -204,6 +207,12 @@ level_args(::AbstractLevelFormat, u::AbstractUSTensor, lvl::Int) = AbstractArray
 # walker as compile-time literals).  Empty arg lists — no per-level buffers.
 @inline level_has_nzval(::ShiftedDiagLevel) = false
 @inline level_step(::ShiftedDiagLevel{S, V}, i::Int, ::Nothing) where {S, V} = (i + S, V)
+
+# PeriodicLevel: pure structure, no per-level buffers.  T_per and n_cols are
+# both type params so the walker emits them as kernel literals.  `level_args`
+# returns nothing (no buffer to upload); the walker dispatches on the type.
+# nzval/pos/crd live one level deeper (in the inner block's levels).
+@inline level_has_nzval(::PeriodicLevel) = true   # passes through to inner block
 
 """
     level_step(lv, i::Int, nz) → (col::Int, val)

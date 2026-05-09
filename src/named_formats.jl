@@ -2,7 +2,7 @@ module Formats
 
 using ..JLUST: Dimension, LevelExpr, dims, TensorFormat, @tensor_format,
                DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
-               ShiftedDiagLevel,
+               ShiftedDiagLevel, PeriodicLevel,
                dim2lvl, lvl2dim, InvalidTensorFormat
 
 # ─── Scalar ───────────────────────────────────────────────────────────────────
@@ -57,6 +57,32 @@ function ShiftedDiag(::Type{T}=Float64; shift::Integer=0, val=one(T)) where T
         [i => DenseLevel(), j => ShiftedDiagLevel(; shift=shift, val=T(val))];
         name   = Symbol("ShiftedDiag(shift=$(Int(shift)),val=$(T(val)))"),
         family = :ShiftedDiag,
+    )
+end
+
+# ─── Periodic block-replicated formats ────────────────────────────────────────
+#
+# T-fold replication of an inner block format along the leading dim, with the
+# column index shifted by `(period_t - 1) * n_cols` per period.  Stored with
+# only one copy of the inner block's buffers — the walker reconstructs each
+# period's contribution by adjusting `_period_col_off` per thread.  Equivalent
+# to a block-diagonal of T identical blocks but in O(one block) memory.
+#
+# The level structure splits the leading dim into (block-index, in-block-row)
+# via LevelExpr keys: `i ÷ block_rows` for the period index (PeriodicLevel)
+# and `i % block_rows` for the within-block row (DenseLevel).  The walker
+# fuses these two levels at codegen — one thread per output row across all T
+# blocks, no per-block iteration loop.
+
+function PeriodicCSR(T_per::Int, block_rows::Int, n_cols::Int)
+    i, j = dims(:i, :j)
+    TensorFormat(
+        [i, j],
+        [i ÷ block_rows => PeriodicLevel{T_per, n_cols}(),
+         i % block_rows => DenseLevel(block_rows),
+         j              => CompressedLevel()];
+        name   = Symbol("PeriodicCSR(T=$T_per,br=$block_rows,nc=$n_cols)"),
+        family = :PeriodicCSR,
     )
 end
 

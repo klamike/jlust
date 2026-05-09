@@ -73,6 +73,39 @@ Base.hash(::DeltaLevel{B},        h::UInt) where {B}   =
 Base.hash(::ShiftedDiagLevel{S, V}, h::UInt) where {S, V} =
     hash(S, hash(V, hash(:ShiftedDiagLevel, h)))
 
+# Periodic outer: the outermost level walks the *block index* of a dimension
+# whose total extent is `T_per * inner`.  The level itself stores no buffers —
+# it just expresses the T-fold replication structure to the walker, which
+# emits a thread-mapping that recovers (period_t, in_period_row) and binds a
+# per-period column offset `_period_col_off = (period_t - 1) * n_cols`.  Inner
+# walkers add `_period_col_off` to the column they index in x, so a single
+# block's pos / crd / nzval are reused across all T periods (no replication).
+#
+# Both `T_per` (replication count) and `n_cols` (per-period column extent of
+# the inner block) live in the type system so the walker bakes them in as
+# kernel literals.  `n_cols` is a property of the inner block, not the
+# PeriodicLevel itself, but it's carried here so the level fully describes the
+# offset arithmetic without needing to introspect the next level's tensor.
+#
+# Used as the outermost level of a (PeriodicLevel, ...inner block levels...)
+# tensor — the inner levels are unchanged.  Equivalent to a block-diagonal
+# matrix with T identical blocks, but stored in O(one block) space.
+struct PeriodicLevel{T_per, n_cols} <: AbstractLevelFormat
+    function PeriodicLevel{T_per, n_cols}() where {T_per, n_cols}
+        T_per isa Integer && T_per > 0 || throw(InvalidTensorFormat(
+            "PeriodicLevel T_per must be a positive Integer, got $T_per::$(typeof(T_per))"))
+        n_cols isa Integer && n_cols > 0 || throw(InvalidTensorFormat(
+            "PeriodicLevel n_cols must be a positive Integer, got $n_cols::$(typeof(n_cols))"))
+        new{T_per, n_cols}()
+    end
+end
+PeriodicLevel(T_per::Integer, n_cols::Integer) = PeriodicLevel{Int(T_per), Int(n_cols)}()
+period_count(::PeriodicLevel{T_per, n_cols}) where {T_per, n_cols} = T_per
+period_cols(::PeriodicLevel{T_per, n_cols})  where {T_per, n_cols} = n_cols
+
+Base.hash(::PeriodicLevel{T, N}, h::UInt) where {T, N} =
+    hash(T, hash(N, hash(:PeriodicLevel, h)))
+
 # ─── Level format predicates ──────────────────────────────────────────────────
 
 is_ordered(::AbstractLevelFormat) = true

@@ -40,6 +40,8 @@ _level_arg_names(::SingletonLevel, pc::Ref, cc::Ref; outermost::Bool=false) =
 _level_has_nzval(lv::AbstractLevelFormat) = JLUST.level_has_nzval(lv)
 _level_has_nzval(::Union{DenseLevel,BatchLevel,CompressedLevel,SingletonLevel,DeltaLevel,RangeLevel}) = true
 _level_has_nzval(::ShiftedDiagLevel) = false
+# Periodic outer is pure structure: contributes no buffers, defers nzval to inner.
+_level_has_nzval(::PeriodicLevel) = true
 
 _level_args(lv::AbstractLevelFormat, u::USTensor, lvl::Int; outermost::Bool=false) =
     JLUST.level_args(lv, u, lvl)
@@ -79,13 +81,16 @@ function _sparse_args(u::USTensor)
 end
 
 # Compute thread count (ndrange) for SpMV based on outermost format level.
-# DenseLevel: one thread per dense fiber along whichever dim level 1 walks
-# (rows for CSR, cols for CSC).  CompressedLevel: one thread per outer fiber.
-# For non-unique Compressed (COO-like): one thread per NNZ (length of crd, not pos).
+# DenseLevel / BatchLevel: one thread per dense fiber along whichever dim
+# level 1 walks (rows for CSR, cols for CSC).
+# PeriodicLevel: one thread per output row across all T periods — total rows
+# along the dim level 1's key resolves to.
+# CompressedLevel (unique): one thread per outer fiber.
+# CompressedLevel (non-unique, COO-like): one thread per NNZ (length of crd).
 function _spmv_ndrange(u_A::USTensor)
     fmt = format(u_A)
     lv1 = fmt.levels[1]
-    if lv1 isa Union{DenseLevel,BatchLevel}
+    if lv1 isa Union{DenseLevel,BatchLevel,PeriodicLevel}
         extents(u_A)[JLUST._lvl_dim(fmt, 1)]
     else
         length(coordinates(u_A, 1))   # fibers for unique, NNZ for non-unique

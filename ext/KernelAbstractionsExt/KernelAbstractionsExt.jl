@@ -6,7 +6,7 @@ import JLUST:
     supports_backend, format, extents, index_origin, OneBased,
     positions, coordinates, nonzeros, has_positions, has_coordinates,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
-    ShiftedDiagLevel,
+    ShiftedDiagLevel, PeriodicLevel,
     AbstractLevelFormat, is_unique, is_ordered, format_family, Formats,
     apply_values!, execute,
     csr_tensor, prepare,
