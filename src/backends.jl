@@ -143,6 +143,24 @@ call `invoke` to run the base check before adding their own.
 # `_warp_seg_reduce_sum_down` traits so that every (Dense/Batch outer +
 # Compressed-unique inner) and every (Compressed-non-unique outer) format on
 # CUDA gets the warp-shuffle treatment, not just CSR / COO.)
+#
+# `_csr_spmv_merge!` is a hand-rolled NNZ-partitioned (merge-based) CSR SpMV
+# strategy that beats the walker's row-parallel warp-vector kernel for
+# matrices with low average NNZ-per-row (e.g., graph workloads where most
+# rows have 0–1 NNZ but a few have hundreds).  The walker's row-parallel
+# strategy wastes threads on the empty/short rows; merge-based assigns each
+# warp a fixed-size NNZ chunk regardless of row count and uses segmented
+# warp-reduce + atomic-add at row boundaries.  Returns `true` when executed,
+# `false` to fall back to the walker (default for non-CUDA backends).
+"""
+    _csr_spmv_merge!(rowptr, colind, nzval, x, y, origin_off, n_rows, n_nnz, alpha) -> Bool
+
+Hand-rolled NNZ-partitioned SpMV for CSR.  Used when the row-degree
+distribution is too irregular for the walker's row-parallel kernel (low mean,
+high variance).  Caller pre-scales y by beta; this routine accumulates
+α·A·x atomically.
+"""
+_csr_spmv_merge!(rowptr, colind, nzval, x, y, origin_off, n_rows, n_nnz, alpha) = false
 
 # ─── Concrete backend types ───────────────────────────────────────────────────
 #

@@ -448,6 +448,43 @@ function JLUST.execute(::EmitterBackend, ::Op{:SpMV, F},
         end
     else
         n_outer     = Int32(_spmv_ndrange(u_A))
+        total_nnz   = length(nonzeros(u_A))
+        # Try the merge-based CSR SpMV path when the row-degree distribution
+        # makes the walker's row-parallel kernel inefficient — concretely,
+        # graph-shaped matrices where most rows have 0–1 NNZ.  The walker
+        # wastes threads on the empties; merge-based assigns each warp a
+        # fixed-size NNZ chunk (regardless of row count) and uses segmented
+        # warp-reduce + atomic-add at row boundaries.
+        #
+        # Threshold `avg_nnz < 2`: empirically, this catches only extreme
+        # graph-like matrices (e.g., SNAP/email-EuAll: avg 1.58, with 15%
+        # empty rows + 72% single-NNZ rows).  Anything with avg ≥ 2 has
+        # enough work-per-row that the walker's warp-vector kernel matches
+        # or beats merge-based.  Set conservatively to avoid regressions on
+        # ordinary sparse matrices.
+        #
+        # Restricted to CSR-shaped (Dense outer over rows + unique-Compressed
+        # inner over cols) + identity transforms — the merge kernel doesn't
+        # carry input_fn / output_fn closures.  Hook returns false on
+        # backends without a specialized impl (CPU), and we fall back.
+        is_csr_shaped = lv1 isa Union{DenseLevel,BatchLevel} &&
+                        length(fmt.levels) == 2 &&
+                        fmt.levels[2] isa CompressedLevel &&
+                        is_unique(fmt.levels[2]) &&
+                        JLUST._lvl_dim(fmt, 1) == 1   # outer walks rows
+        merge_eligible = is_csr_shaped && use_identity && n_outer > Int32(0) &&
+                         (total_nnz / Int(n_outer)) < 2
+        if merge_eligible
+            iszero(T_beta) ? fill!(nonzeros(u_y), zero(T)) : (nonzeros(u_y) .*= T_beta)
+            rowptr = positions(u_A, 2)
+            colind = coordinates(u_A, 2)
+            ran = JLUST._csr_spmv_merge!(rowptr, colind, nonzeros(u_A),
+                                          nonzeros(u_x), nonzeros(u_y), off,
+                                          Int32(n_outer), Int32(total_nnz), T_alpha)
+            ran && return u_y
+            # Hook returned false → undo the pre-scale and fall through.
+            iszero(T_beta) || (nonzeros(u_y) ./= T_beta)
+        end
         sparse_bufs = _sparse_args(u_A)
         all_args    = (typeof(fmt), T,
                        sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
@@ -460,7 +497,7 @@ function JLUST.execute(::EmitterBackend, ::Op{:SpMV, F},
         # Compressed outer: 1 thread/NNZ + warp-segmented-sum + per-segment
         # atomic.  Both replace the format-specific CUDA hooks that used to
         # live in CUDAExt; both benefit any future format with the same shape.
-        _launch_spmv_kern(ka, fmt, all_args, Int(n_outer), length(nonzeros(u_A)), T_beta)
+        _launch_spmv_kern(ka, fmt, all_args, Int(n_outer), total_nnz, T_beta)
     end
 
     return u_y

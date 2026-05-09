@@ -103,3 +103,106 @@ end
 # Both retirements mean DCSR, custom user formats, sorted-row-list shapes, and
 # any future variant get the warp-shuffle treatment without per-format work —
 # the CSR/COO specializations are no longer load-bearing.
+
+# ─── Merge-based (NNZ-partitioned) CSR SpMV ──────────────────────────────────
+#
+# For graph-like / low-mean-degree CSR matrices, the walker's row-parallel
+# warp-vector kernel underperforms because most threads land on rows with 0–1
+# NNZ.  The merge-based kernel partitions the NNZ axis into fixed-size chunks
+# (NPC NNZ per warp); each warp:
+#
+#   1. Has each thread binary-search rowptr to find the row of its NNZ.
+#   2. Computes nzval[k] * x[col[k]].
+#   3. Segmented warp-reduce: same-row contributions sum within the warp.
+#   4. Each segment head atomic-adds to y[row].
+#
+# Matches cuSPARSE's CSR_ALG1 strategy at a high level (load-balance over
+# NNZ, not rows).  Same CSR storage; no format change visible to users.
+#
+# NPC=64 is empirically the best on L40S across the SuiteSparse curated set:
+# small enough to keep many warps in flight, large enough to amortize the
+# binary-search overhead.
+
+const _CSR_SPMV_MERGE_NPC = 64
+const _CSR_SPMV_MERGE_THREADS = 256
+
+function _csr_spmv_merge_kernel!(_pos1, _crd1, _nzval, _x_raw, _y, _origin_off,
+                                  _n_rows, _n_nnz, _alpha, ::Val{NPC}) where NPC
+    bid  = blockIdx().x
+    tid  = threadIdx().x
+    bs   = blockDim().x
+    warp_in_block = (tid - Int32(1)) ÷ Int32(32)
+    lane = (tid - Int32(1)) % Int32(32)
+    n_warps_per_block = bs ÷ Int32(32)
+    global_warp = (bid - Int32(1)) * n_warps_per_block + warp_in_block
+
+    nnz_lo = Int32(global_warp) * Int32(NPC)
+    nnz_hi = min(nnz_lo + Int32(NPC), _n_nnz)
+    if nnz_lo >= _n_nnz
+        return nothing
+    end
+
+    _x = Base.Experimental.Const(_x_raw)
+    T = eltype(_nzval)
+    MASK = UInt32(0xffffffff)
+
+    chunk_pos = nnz_lo
+    while chunk_pos < nnz_hi
+        my_nnz = chunk_pos + lane    # 0-based NNZ index
+        my_row = Int32(-1)
+        v = zero(T)
+        if my_nnz < nnz_hi
+            # Per-thread binary search: smallest k in [2..n_rows+1] s.t.
+            # rowptr[k] - origin_off > my_nnz.  Then row = k - 2 (0-based).
+            lo = Int32(2); hi = _n_rows + Int32(2)
+            while lo < hi
+                mid = (lo + hi) ÷ Int32(2)
+                vp = Int32(_pos1[mid]) - _origin_off
+                if vp <= my_nnz
+                    lo = mid + Int32(1)
+                else
+                    hi = mid
+                end
+            end
+            my_row = lo - Int32(2)
+            col = Int(_crd1[my_nnz + Int32(1)]) - Int(_origin_off) + Int(1)
+            v = _alpha * _nzval[my_nnz + Int32(1)] * _x[col]
+        end
+
+        # Segmented warp reduce by my_row.  shfl_down returns own value when
+        # source lane >= warpsize, so we explicitly bound (lane + δ < 32) to
+        # avoid summing into ourselves at the warp's right edge.
+        orig_row = my_row
+        for δ in (Int32(1), Int32(2), Int32(4), Int32(8), Int32(16))
+            peer_v   = CUDA.shfl_down_sync(MASK, v, δ)
+            peer_row = CUDA.shfl_down_sync(MASK, orig_row, δ)
+            if (lane + δ < Int32(32)) && peer_row == orig_row && orig_row >= Int32(0)
+                v += peer_v
+            end
+        end
+        prev_row = CUDA.shfl_up_sync(MASK, orig_row, UInt32(1))
+        is_head = (lane == Int32(0)) | (prev_row != orig_row)
+        if is_head & (orig_row >= Int32(0))
+            CUDA.@atomic _y[orig_row + Int32(1)] += v
+        end
+        chunk_pos += Int32(32)
+    end
+    return nothing
+end
+
+# Override of the JLUST hook — only fires for CuArray-backed buffers.
+# Returns true to signal that execution happened (skip the walker fallback).
+function JLUST._csr_spmv_merge!(rowptr::CuVector, colind::CuVector, nzval::CuVector{T},
+                                 x::CuVector{T}, y::CuVector{T},
+                                 origin_off::Int32, n_rows::Int32, n_nnz::Int32,
+                                 alpha::T) where T
+    n_nnz == Int32(0) && return true
+    npc = _CSR_SPMV_MERGE_NPC
+    threads = _CSR_SPMV_MERGE_THREADS
+    n_warps = cld(Int(n_nnz), npc)
+    n_warps_per_block = threads ÷ 32
+    n_blocks = cld(n_warps, n_warps_per_block)
+    CUDA.@cuda threads=threads blocks=n_blocks _csr_spmv_merge_kernel!(
+        rowptr, colind, nzval, x, y, origin_off, n_rows, n_nnz, alpha, Val(npc))
+    return true
+end
