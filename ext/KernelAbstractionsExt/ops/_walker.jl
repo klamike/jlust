@@ -150,18 +150,39 @@ function _walk_inner_lv(::RangeLevel, levels, lvl, p_var, pc, cc, leaf,
           "Use convert_format to CSR or DCSR first.")
 end
 
-# Custom AbstractLevelFormat: use the public JLUST.emit_spmv_lv hook.
-# The hook receives `_x_idx` via the `_inner_coord` form expected by user code.
-# We splice in a transformation step that aliases _x_idx and supplies _nnz_pos.
+# Custom AbstractLevelFormat: bind `_x_idx` from `level_step`, and:
+#   - if the level carries nzval (DiagonalLevel: val = nzval[i]) → standard
+#     leaf path, leaf reads `_nzval[_nnz_pos]` as usual
+#   - if the level has no nzval (ShiftedDiagLevel, RampLevel, etc.) → bind
+#     `_val` from level_step and emit the SpMV leaf inline; the standard leaf
+#     can't be used because `_nzval` isn't a kernel argument.  Restricted to
+#     leaf-position custom levels (no further inner recursion possible since
+#     we're emitting a complete leaf).
 function _walk_inner_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, leaf,
                         vs::Int=1)
-    nz_sym = JLUST.level_has_nzval(lv) ? :_nzval : :nothing
-    inner  = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
-    quote
-        _p1 = Int($p_var) - Int(_origin_off) + 1
-        (_x_idx, _) = JLUST.level_step($lv, _p1, $nz_sym)
-        _nnz_pos = $p_var
-        $inner
+    if JLUST.level_has_nzval(lv)
+        inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
+        quote
+            _p1 = Int($p_var) - Int(_origin_off) + 1
+            (_x_idx, _) = JLUST.level_step($lv, _p1, :_nzval)
+            _nnz_pos = $p_var
+            $inner
+        end
+    else
+        lvl == length(levels) || error(
+            "EmitterBackend: nzval-less custom level $(typeof(lv)) at level $lvl ",
+            "must be the innermost level (got $(length(levels)) total levels)")
+        # SpMV leaf inlined: `_acc += alpha·val·input_fn(x[col])` for the
+        # accumulator path, plus the same shape with @atomic on the COO/non-
+        # unique outer.  Detect which by checking whether `_acc` is in scope —
+        # we can't, so we emit the accumulator form (only Dense/Compressed-
+        # unique-outer formats are valid with a shifted-diag inner).
+        quote
+            _p1 = Int($p_var) - Int(_origin_off) + 1
+            (_x_idx, _val) = JLUST.level_step($lv, _p1, nothing)
+            _nnz_pos = $p_var
+            _acc += _val * _input_fn(_x[_x_idx])
+        end
     end
 end
 

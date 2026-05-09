@@ -152,6 +152,34 @@ function diagonal_tensor(d::AbstractVector{T};
 end
 
 """
+    shifted_diag_tensor(::Type{T}, n_rows, n_cols; shift=0, val=one(T), device=identity)
+
+Build a structural shifted scaled-identity USTensor — every row `r` has exactly
+one nonzero at column `r + shift` with constant value `val`, and there are no
+pos / crd / nzval arrays (both shift and val live in the format type, baked in
+as kernel literals).  When used as a `BlockSparseMatrix` block the BSM compile
+path inlines the row-wise contribution as a per-row scalar add — no CSR
+replication, no indirect-load chain.
+
+Compatible with the standard SpMV walker (`Dense + ShiftedDiag` shape) so it
+also runs as a standalone tensor.
+"""
+function shifted_diag_tensor(::Type{T}, n_rows::Integer, n_cols::Integer;
+                              shift::Integer=0, val=one(T),
+                              device=identity) where T
+    fmt        = Formats.ShiftedDiag(T; shift=shift, val=T(val))
+    empty_val  = device(Vector{T}(undef, 0))
+    empty_crd  = device(Vector{Int32}(undef, 0))
+    VA         = typeof(empty_val)
+    VI         = typeof(empty_crd)
+    USTensor{T,Int32,2,VA,VI,OneBased,2}(
+        (Int(n_rows), Int(n_cols)), fmt,
+        _no_bufs(Val(2), VI),
+        _no_bufs(Val(2), VI),
+        empty_val, nothing)
+end
+
+"""
     csc_tensor(colptr, rowind, nzval, dims; origin=OneBased())
     csc_tensor(colptr, rowind, nzval; m, n, origin=OneBased())
 

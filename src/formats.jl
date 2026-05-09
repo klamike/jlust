@@ -39,6 +39,29 @@ DeltaLevel(bits::Int) = DeltaLevel{bits}()
 # Bit-width accessor for runtime use (Composer / display).
 delta_bits(::DeltaLevel{B}) where {B} = B
 
+# Implicit shifted scaled-identity level: row r has exactly one nonzero at
+# column `r + Shift`, all with the constant value `Val`.  No nzval / pos / crd
+# arrays — both Shift and Val live in the type system, so kernels emitted
+# against this level read the value as a literal (zero memory traffic for the
+# block's structure).  Used as the "selector block" abstraction in
+# BlockSparseMatrix: a (Dense, ShiftedDiag) block is recognized at compile
+# time and inlined as a per-row `acc += Val * x[col]` term — no CSR replication.
+#
+# Both type parameters are bits-types so the level remains a singleton (zero
+# runtime fields), letting the @generated walker reconstruct it via `L()`.
+struct ShiftedDiagLevel{Shift, Val} <: AbstractLevelFormat
+    function ShiftedDiagLevel{Shift, Val}() where {Shift, Val}
+        Shift isa Integer || throw(InvalidTensorFormat(
+            "ShiftedDiagLevel Shift must be Integer, got $Shift::$(typeof(Shift))"))
+        isbits(Val) || throw(InvalidTensorFormat(
+            "ShiftedDiagLevel Val must be a bits-type literal, got $Val::$(typeof(Val))"))
+        new{Shift, Val}()
+    end
+end
+ShiftedDiagLevel(; shift::Integer=0, val=1.0) = ShiftedDiagLevel{Int(shift), val}()
+diag_shift(::ShiftedDiagLevel{S, V}) where {S, V} = S
+diag_val(::ShiftedDiagLevel{S, V}) where {S, V}   = V
+
 Base.hash(::DenseLevel{Sz}, h::UInt) where {Sz} = hash(Sz, hash(:DenseLevel, h))
 Base.hash(::BatchLevel{Sz}, h::UInt) where {Sz} = hash(Sz, hash(:BatchLevel, h))
 Base.hash(::SingletonLevel, h::UInt)            = hash(:SingletonLevel, h)
@@ -47,6 +70,8 @@ Base.hash(::CompressedLevel{U,O}, h::UInt) where {U,O} =
     hash(U, hash(O, hash(:CompressedLevel, h)))
 Base.hash(::DeltaLevel{B},        h::UInt) where {B}   =
     hash(B, hash(:DeltaLevel, h))
+Base.hash(::ShiftedDiagLevel{S, V}, h::UInt) where {S, V} =
+    hash(S, hash(V, hash(:ShiftedDiagLevel, h)))
 
 # ─── Level format predicates ──────────────────────────────────────────────────
 

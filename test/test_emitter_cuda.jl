@@ -321,4 +321,90 @@ end
     @test Array(BM * x) ≈ [9.0, 10.0]
 end
 
+# ─── ShiftedDiagLevel: structural shifted scaled-identity ────────────────────
+
+@testset "shifted_diag_tensor standalone SpMV" begin
+    n = 1024
+    # shift=0, val=2.5: y[r] = 2.5 * x[r]
+    u = shifted_diag_tensor(Float64, n, n; shift=0, val=2.5, device=CuArray)
+    x = CUDA.rand(Float64, n)
+    y = CUDA.zeros(Float64, n)
+    mul!(y, u, x)
+    @test Array(y) ≈ 2.5 .* Array(x)
+
+    # shift=3, val=-1.5: y[r] = -1.5 * x[r+3]
+    u2 = shifted_diag_tensor(Float64, n, n+3; shift=3, val=-1.5, device=CuArray)
+    x2 = CUDA.rand(Float64, n+3)
+    y2 = CUDA.zeros(Float64, n)
+    mul!(y2, u2, x2)
+    @test Array(y2) ≈ -1.5 .* Array(x2)[4:end]
+end
+
+@testset "BSM with explicit ShiftedDiag block" begin
+    # Two ways to encode the same matrix: CSR-encoded -I and ShiftedDiag(-I).
+    # Both should produce identical mul! results.
+    n = 16
+    rp = CuArray(Int32(1):Int32(n+1))
+    cv = CuArray(Int32(1):Int32(n))
+    nz_neg = CuArray(fill(-1.0, n))
+    A_csr_block  = csr_tensor(CuArray(Int32(1):Int32(n+1)), CuArray(Int32(1):Int32(n)),
+                                CuArray(fill(2.0, n)); m=n, n=n)
+    negI_csr     = csr_tensor(CuArray(Int32(1):Int32(n+1)), CuArray(Int32(1):Int32(n)),
+                                nz_neg; m=n, n=n)
+    negI_shifted = shifted_diag_tensor(Float64, n, n; shift=0, val=-1.0, device=CuArray)
+
+    BM_csr     = BlockSparseMatrix([A_csr_block negI_csr])
+    BM_shifted = BlockSparseMatrix([A_csr_block negI_shifted])
+
+    x = CUDA.rand(Float64, 2 * n)
+    y_csr = CUDA.zeros(Float64, n);     mul!(y_csr,     BM_csr,     x)
+    y_sh  = CUDA.zeros(Float64, n);     mul!(y_sh,      BM_shifted, x)
+    CUDA.synchronize()
+    @test Array(y_csr) ≈ Array(y_sh)
+end
+
+@testset "BSM with multiple ShiftedDiag blocks" begin
+    # Validate the patches-tuple unroll for N > 1 patches in one BSM.
+    n = 8
+    rp = CuArray(Int32(1):Int32(n+1)); cv = CuArray(Int32(1):Int32(n))
+    A_csr = csr_tensor(rp, cv, CuArray(fill(3.0, n)); m=n, n=n)
+    negI  = shifted_diag_tensor(Float64, n, n; shift=0, val=-1.0, device=CuArray)
+    posI  = shifted_diag_tensor(Float64, n, n; shift=0, val= 2.0, device=CuArray)
+
+    # Single block-row: [3I  -I  2I] (col widths n, n, n)
+    BM = BlockSparseMatrix([A_csr negI posI])
+    x  = CUDA.rand(Float64, 3 * n)
+    y  = CUDA.zeros(Float64, n); mul!(y, BM, x)
+    expected = 3.0 .* Array(x)[1:n] .- Array(x)[n+1:2n] .+ 2.0 .* Array(x)[2n+1:3n]
+    @test Array(y) ≈ expected
+end
+
+@testset "BBM-periodic with explicit ShiftedDiag in BSM diag" begin
+    # Mirror the DCOPF shape: BSM diag has a CSR block + a -I block; BBM bw=1
+    # with a (-R, R) selector off-diag.  Compare ShiftedDiag-block path against
+    # CSR-detected-selector path — both should be byte-identical (same kernel,
+    # same patches tuple, same captured graph layout).
+    n = 16
+    T_per = 4
+    rp = CuArray(Int32(1):Int32(n+1)); cv = CuArray(Int32(1):Int32(n))
+    A_csr = csr_tensor(rp, cv, CuArray(fill(3.0, n)); m=n, n=n)
+    negI_csr     = csr_tensor(rp, cv, CuArray(fill(-1.0, n)); m=n, n=n)
+    negI_shifted = shifted_diag_tensor(Float64, n, n; shift=0, val=-1.0, device=CuArray)
+    R_csr = csr_tensor(rp, cv, CuArray(fill(1.0, n)); m=n, n=n)
+    negR  = csr_tensor(rp, cv, CuArray(fill(-1.0, n)); m=n, n=n)
+
+    BSM_csr     = BlockSparseMatrix([A_csr negI_csr])
+    BSM_shifted = BlockSparseMatrix([A_csr negI_shifted])
+
+    BBM_csr = BlockBandedMatrix(BSM_csr,     negR, R_csr, T_per, n, n, 2 * n)
+    BBM_sh  = BlockBandedMatrix(BSM_shifted, negR, R_csr, T_per, n, n, 2 * n)
+
+    n_total = T_per * n + (T_per - 1) * n
+    x = CUDA.rand(Float64, T_per * 2 * n)
+    y_csr = CUDA.zeros(Float64, n_total); mul!(y_csr, BBM_csr, x)
+    y_sh  = CUDA.zeros(Float64, n_total); mul!(y_sh,  BBM_sh,  x)
+    CUDA.synchronize()
+    @test Array(y_csr) ≈ Array(y_sh)
+end
+
 end  # if gpu_available()

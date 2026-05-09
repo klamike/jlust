@@ -54,6 +54,35 @@ function _warp_reduce_sum_down end
 
 function _warp_seg_reduce_sum_down end
 
+# `_bbm_periodic_spmv_launch!(ka, …)` and `_bbm_periodic_selector_launch!(ka, …)`
+# — backend-agnostic launchers for the BlockBandedMatrix periodic SpMV path
+# (one diagonal block CSR replicated across T periods + one off-diagonal CSR
+# pair for T-1 transitions).  Implemented in KernelAbstractionsExt with KA
+# `@kernel` bodies so every KA-targetable backend (CUDA, ROCm, CPU, POCL,
+# oneAPI) runs the same structurally-aware kernel.  Used by BlockBandedMatrix
+# `mul!` in CUDAExt and (eventually) any other backend's BBM glue.
+
+function _bbm_periodic_spmv_launch! end
+function _bbm_periodic_selector_launch! end
+function _bsm_with_patches_spmv_launch! end
+
+# Block-level "selector patch": describes a (Dense, ShiftedDiag)-shaped block
+# embedded in a BlockSparseMatrix or BlockBandedMatrix.  For BSM rows in
+# `[row_start, row_end]`, the patch contributes
+#   acc_r += val * x[(r - row_start + 1) + col_offset (+ optional period_offset)]
+# A `Tuple{SelectorPatch...}` is part of the compiled BSM/BBM state so the
+# kernel can walk patches with a Julia-unrolled loop (no runtime length, no
+# array indirection).  Used to skip CSR replication for blocks that are
+# constant-scaled identities — the kernel reads `val` as a literal and avoids
+# pos / crd / nzval traffic for the patched rows entirely.
+
+struct SelectorPatch{T}
+    row_start  :: Int32   # 1-based
+    row_end    :: Int32   # 1-based, inclusive
+    col_offset :: Int32   # 0-based: col_1b = (r - row_start + 1) + col_offset
+    val        :: T
+end
+
 # ─── Handle abstraction ───────────────────────────────────────────────────────
 #
 # A `KernelHandle` represents a *prepared* op: descriptors built, workspace
@@ -169,6 +198,12 @@ default_backend(::USTensor, ::Type{<:AbstractUSTOp}) = EmitterBackend()
 level_has_nzval(::AbstractLevelFormat) = true
 level_arg_names(::AbstractLevelFormat, pc::Ref, cc::Ref) = Symbol[]
 level_args(::AbstractLevelFormat, u::AbstractUSTensor, lvl::Int) = AbstractArray[]
+
+# ShiftedDiagLevel: structural row-wise selector with no element storage.
+# col = row + Shift, val = Val (both type params, baked into the kernel by the
+# walker as compile-time literals).  Empty arg lists — no per-level buffers.
+@inline level_has_nzval(::ShiftedDiagLevel) = false
+@inline level_step(::ShiftedDiagLevel{S, V}, i::Int, ::Nothing) where {S, V} = (i + S, V)
 
 """
     level_step(lv, i::Int, nz) → (col::Int, val)

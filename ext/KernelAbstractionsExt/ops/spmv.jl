@@ -39,6 +39,7 @@ _level_arg_names(::SingletonLevel, pc::Ref, cc::Ref; outermost::Bool=false) =
 
 _level_has_nzval(lv::AbstractLevelFormat) = JLUST.level_has_nzval(lv)
 _level_has_nzval(::Union{DenseLevel,BatchLevel,CompressedLevel,SingletonLevel,DeltaLevel,RangeLevel}) = true
+_level_has_nzval(::ShiftedDiagLevel) = false
 
 _level_args(lv::AbstractLevelFormat, u::USTensor, lvl::Int; outermost::Bool=false) =
     JLUST.level_args(lv, u, lvl)

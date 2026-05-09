@@ -2,6 +2,7 @@ module Formats
 
 using ..JLUST: Dimension, LevelExpr, dims, TensorFormat, @tensor_format,
                DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
+               ShiftedDiagLevel,
                dim2lvl, lvl2dim, InvalidTensorFormat
 
 # ─── Scalar ───────────────────────────────────────────────────────────────────
@@ -40,6 +41,24 @@ const Scalar = TensorFormat((), (); name=:Scalar)
 @tensor_format SelectorCol (i, j) -> (j : dense, i : singleton)   # 1 nnz per col
 
 # ─── Diagonal formats ─────────────────────────────────────────────────────────
+
+# Implicit shifted scaled-identity matrix: row r → exactly one nnz at col
+# `r + shift` with constant value `val`.  No buffers stored — both shift and
+# val live in the format type.  Behaves like `val * I` shifted right by
+# `shift` columns.  When used as a BlockSparseMatrix block, the BSM compile
+# recognizes the structure and inlines the row-wise contribution as a single
+# `acc += val * x[col]` term per row — no CSR replication, no indirect loads
+# for pos / crd / nzval.  Standalone SpMV against this format also bypasses
+# nzval reads entirely.
+function ShiftedDiag(::Type{T}=Float64; shift::Integer=0, val=one(T)) where T
+    i, j = dims(:i, :j)
+    TensorFormat(
+        [i, j],
+        [i => DenseLevel(), j => ShiftedDiagLevel(; shift=shift, val=T(val))];
+        name   = Symbol("ShiftedDiag(shift=$(Int(shift)),val=$(T(val)))"),
+        family = :ShiftedDiag,
+    )
+end
 
 @tensor_format DIAI    (i, j) -> ((j - i) : compressed, i : range)
 @tensor_format DIAJ    (i, j) -> ((j - i) : compressed, j : range)

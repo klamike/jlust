@@ -38,9 +38,10 @@ import JLUST: BlockSparseMatrix, BlockBandedMatrix, BBMSpMVOp, AbstractKernelHan
 
 # ─── Compiled CSR view ───────────────────────────────────────────────────────
 
-mutable struct _CompiledBSM{T,Ti}
-    asm     :: USTensor                              # assembled CSR USTensor
-    map     :: Matrix{Union{Nothing, CuVector{Ti}}}  # (i,j) → indices into asm.nzval
+mutable struct _CompiledBSM{T,Ti,P<:Tuple}
+    asm     :: USTensor                              # assembled CSR USTensor (CSR blocks only)
+    map     :: Matrix{Union{Nothing, CuVector{Ti}}}  # (i,j) → indices into asm.nzval (CSR blocks)
+    patches :: P                                     # NTuple of SelectorPatch{T} — ShiftedDiag blocks
     graph   :: Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}  # (ptr_y, ptr_x) → captured graph
     # Hot-path fast cache: most repeated mul! calls reuse the same (y, x) buffers,
     # so a single field comparison skips the Dict lookup and tuple alloc.
@@ -51,38 +52,124 @@ end
 
 const _bsm_compiled_cache = IdDict{BlockSparseMatrix, _CompiledBSM}()
 
+# Per-block compile classification.  Returns one of:
+#   :null          — empty (skip)
+#   :csr           — CSR-formatted USTensor; assemble into the CSR
+#   :shifted_diag  — (Dense, ShiftedDiag) USTensor; extract as a SelectorPatch
+#   :unsupported   — fall through to per-block dispatch
+@inline function _block_compile_kind(b)
+    b === nothing && return :null
+    if b isa AbstractUSTensor
+        format(b) == Formats.CSR && return :csr
+        levels = format(b).levels
+        length(levels) == 2 && levels[1] isa DenseLevel && levels[2] isa ShiftedDiagLevel &&
+            return :shifted_diag
+    end
+    :unsupported
+end
+
 # Whether a BSM is supported by the compiled-CSR fast path: every non-null
-# block must be CSR.  Other formats fall through to the per-block emitter path.
+# block must be either CSR or (Dense, ShiftedDiag).  Other formats fall
+# through to the per-block emitter path.
 function _bsm_supports_compile(A::BlockSparseMatrix)
     nb_r, nb_c = size(A.blocks)
     for i in 1:nb_r, j in 1:nb_c
         b = A.blocks[i, j]; b === nothing && continue
-        format(b) == Formats.CSR || return false
+        k = _block_compile_kind(b)
+        (k === :csr || k === :shifted_diag) || return false
     end
     true
 end
 
+# Detect "constant-value selector" shape on a CSR block: exactly 1 nnz per
+# row at column = row (i.e. the leading n_rows×n_rows is a scaled identity).
+# Returns `(true, val)` if detected, else `(false, zero)`.  Used as back-
+# compat: a CSR-encoded selector block is treated as if it were
+# (Dense, ShiftedDiag) — same patch path, same kernel literal.
+function _selector_value(u::AbstractUSTensor)
+    fmt = format(u)
+    fmt == Formats.CSR || return (false, zero(eltype(u)))
+    m = Int(extents(u)[1])
+    pos_h = Vector{Int}(Array(positions(u, 2)))
+    length(pos_h) == m + 1 || return (false, zero(eltype(u)))
+    pos_h[end] - pos_h[1] == m || return (false, zero(eltype(u)))
+    for r in 1:m
+        pos_h[r+1] - pos_h[r] == 1 || return (false, zero(eltype(u)))
+    end
+    crd_h = Vector{Int}(Array(coordinates(u, 2)))
+    nz_h  = Array(nonzeros(u))
+    @inbounds for r in 1:m
+        crd_h[pos_h[r]] == r || return (false, zero(eltype(u)))
+    end
+    val = nz_h[1]
+    all(v -> v == val, nz_h) || return (false, zero(eltype(u)))
+    return (true, val)
+end
+
+# Build a SelectorPatch from a (Dense, ShiftedDiag)-formatted block at BSM
+# position (i, j).  The block's row range is `[row_off+1, row_off+row_sizes[i]]`
+# in the assembled coords; the col formula `(r - row_start + 1) + col_offset`
+# in the kernel must hit BSM column `col_off + (r_local + shift)` where
+# `r_local = r - row_start + 1` is 1-based within-block.  So col_offset =
+# col_off + shift.
+@inline function _shifted_diag_patch(A::BlockSparseMatrix{T}, i::Int, j::Int, b::AbstractUSTensor) where T
+    lv2     = format(b).levels[2]
+    rs      = Int32(A._row_off[i] + 1)
+    re      = Int32(A._row_off[i] + A.row_sizes[i])
+    co      = Int32(A._col_off[j] + diag_shift(lv2))
+    val     = T(diag_val(lv2))
+    SelectorPatch{T}(rs, re, co, val)
+end
+
 # Build the compiled CSR on the host, then move buffers to GPU.
-# Block (i,j) row r contributes pos[r+1]-pos[r] entries that land contiguously
-# in assembled.nzval at the slots reserved for block-row i row r, column-block j.
+# CSR blocks (i,j) row r contribute pos[r+1]-pos[r] entries that land
+# contiguously in assembled.nzval at the slots reserved for block-row i row r,
+# column-block j.  ShiftedDiag blocks are extracted as patches and skipped.
 function _compile_bsm(A::BlockSparseMatrix{T}) where T
     nb_r, nb_c = size(A.blocks)
     n_rows = sum(A.row_sizes)
     n_cols = sum(A.col_sizes)
 
-    # Pull pos / crd / nzval to host once per non-null block.  All blocks must
-    # be CSR — checked by `_bsm_supports_compile` at the call site.
+    # Classify blocks; collect patches for the ShiftedDiag ones AND for any
+    # CSR-encoded constant-value selector blocks (back-compat with old code
+    # that built `negI` via `sparse(I, n, n) * -1` rather than the explicit
+    # ShiftedDiag format).  Both shapes go through the same patch path so
+    # multi-selector BSMs work uniformly.
+    patches = SelectorPatch{T}[]
+    csr_blocks = Tuple{Int,Int}[]
+    for i in 1:nb_r, j in 1:nb_c
+        b = A.blocks[i, j]; b === nothing && continue
+        kind = _block_compile_kind(b)
+        if kind === :shifted_diag
+            push!(patches, _shifted_diag_patch(A, i, j, b))
+        elseif kind === :csr
+            is_sel, val = _selector_value(b)
+            if is_sel
+                push!(patches, SelectorPatch{T}(
+                    Int32(A._row_off[i] + 1),
+                    Int32(A._row_off[i] + A.row_sizes[i]),
+                    Int32(A._col_off[j]),   # detected pattern has within-block shift = 0
+                    T(val)))
+            else
+                push!(csr_blocks, (i, j))
+            end
+        else
+            error("_compile_bsm: block ($i,$j) has unsupported format $(format(b))")
+        end
+    end
+
+    # Pull pos / crd / nzval to host once per CSR block.
     block_pos = Dict{Tuple{Int,Int}, Vector{Int}}()
     block_crd = Dict{Tuple{Int,Int}, Vector{Int}}()
     block_nz  = Dict{Tuple{Int,Int}, Vector{T}}()
-    for i in 1:nb_r, j in 1:nb_c
-        b = A.blocks[i, j]; b === nothing && continue
+    for (i, j) in csr_blocks
+        b = A.blocks[i, j]
         block_pos[(i,j)] = Vector{Int}(Array(positions(b, 2)))
         block_crd[(i,j)] = Vector{Int}(Array(coordinates(b, 2)))
         block_nz[(i,j)]  = Vector{T}(Array(nonzeros(b)))
     end
 
-    # Per-row nnz count of the assembled.
+    # Per-row nnz count of the assembled (CSR contributions only).
     row_nnz = zeros(Int, n_rows)
     for ((i,j), pos) in block_pos
         for r in 1:A.row_sizes[i]
@@ -105,8 +192,7 @@ function _compile_bsm(A::BlockSparseMatrix{T}) where T
     end
 
     cursor = copy(rowptr)
-    for i in 1:nb_r, j in 1:nb_c
-        haskey(block_pos, (i,j)) || continue
+    for (i, j) in csr_blocks
         col_off = A._col_off[j]; row_off = A._row_off[i]
         pos = block_pos[(i,j)]; crd = block_crd[(i,j)]
         nz  = block_nz[(i,j)];  map_ij = block_map[(i,j)]
@@ -130,9 +216,11 @@ function _compile_bsm(A::BlockSparseMatrix{T}) where T
         map_gpu[i, j] = CuArray(v)
     end
 
-    _CompiledBSM{T,Int32}(asm_ust, map_gpu,
-                          Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
-                          UInt(0), UInt(0), nothing)
+    patches_tuple = (patches...,)
+    _CompiledBSM{T,Int32,typeof(patches_tuple)}(
+        asm_ust, map_gpu, patches_tuple,
+        Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
+        UInt(0), UInt(0), nothing)
 end
 
 @inline _ensure_compiled_bsm(A::BlockSparseMatrix) =
@@ -179,9 +267,25 @@ end
     return y
 end
 
-@inline _bsm_emit_spmv!(c::_CompiledBSM, x::CuVector, y::CuVector) =
-    JLUST.execute(JLUST.SpMVOp, c.asm, JLUST.ust(x), JLUST.ust(y);
-                  backend=JLUST.EmitterBackend())
+@inline function _bsm_emit_spmv!(c::_CompiledBSM, x::CuVector, y::CuVector)
+    if isempty(c.patches)
+        # No selector patches → standard SpMV through the assembled CSR.
+        # Walker's warp-vector kernel handles this with no extra overhead.
+        JLUST.execute(JLUST.SpMVOp, c.asm, JLUST.ust(x), JLUST.ust(y);
+                      backend=JLUST.EmitterBackend())
+    else
+        # Fused CSR + patch SpMV: the kernel walks the leaner CSR and adds
+        # each patch's per-row contribution as a literal `val * x[col]` term.
+        # Patches tuple is type-stable so the inner loop unrolls; saves CSR
+        # replication and 3-buffer indirect loads per patched row.
+        ka = CUDABackend()
+        JLUST._bsm_with_patches_spmv_launch!(ka,
+            positions(c.asm, 2), coordinates(c.asm, 2), nonzeros(c.asm),
+            y, x,
+            Int32(extents(c.asm)[1]), c.patches,
+            true, zero(eltype(y)))
+    end
+end
 
 function _bsm_emitter_mul!(y::CuVector, A::BlockSparseMatrix, x::CuVector,
                             backend::AbstractUSTBackend)
@@ -458,238 +562,25 @@ end
     JLUST.execute(JLUST.SpMVOp, c.asm, JLUST.ust(x), JLUST.ust(y);
                   backend=JLUST.EmitterBackend())
 
-# ─── BBM-periodic SpMV: structurally-aware kernel ────────────────────────────
+# ─── BBM-periodic SpMV: backend-agnostic kernels live in KAExt ──────────────
 #
-# For the common BBM shape (bw=1, BSM diag shared across periods, Tuple
-# off-diag shared across transitions), we can avoid materializing the T copies
-# of the BSM diag CSR.  The kernel walks the BBM's row layout — period by period
-# — and indexes into the SHARED block CSRs with a column offset computed from
-# the period number.
+# The two structurally-aware kernels (generic periodic + selector off-diag
+# fast path) used to be CUDA-only @cuda functions in this file.  They moved
+# to KernelAbstractionsExt as `@kernel` bodies so every KA-targetable backend
+# (CUDA, ROCm, CPU, POCL, oneAPI) runs the same code.  CUDA's read-only data
+# cache (LDG) is opted into via the `_supports_ldg(ka)` trait — backends
+# without it fall through to a regular global load, no kernel duplication.
 #
-# Bandwidth gain: the BSM diag CSR is read once across the kernel (cache-warm
-# for the second period's threads), instead of T copies of duplicate bytes.
-# For T=24 this is up to ~24× less DRAM traffic on the diag part.
-
-# Row layout (1-based): period t occupies rows
-#   [(t-1)*P+1 .. (t-1)*P+n_diag]  (diag rows of period t),  P = n_diag + n_off
-#   [(t-1)*P+n_diag+1 .. t*P]      (off rows for t→t+1, only if t < T_per).
-# Total rows: T_per*n_diag + (T_per-1)*n_off.
-
-function _bbm_periodic_spmv_kernel!(
-        d_pos, d_crd, d_nzval,
-        n_pos, n_crd, n_nzval,
-        p_pos, p_crd, p_nzval,
-        y, x_raw,
-        n_diag::Int32, n_off::Int32, n_cols::Int32,
-        n_total_rows::Int32,
-        ::Val{HAS_PATCH}, dp_row_start::Int32, dp_row_end::Int32,
-        dp_col_offset::Int32, dp_val,
-        ::Val{ZERO_BETA}, beta) where {HAS_PATCH, ZERO_BETA}
-    T   = eltype(y)
-    tid = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    tid > n_total_rows && return nothing
-
-    # Mark x as read-only so loads go through LDG (read-only data cache).  x is
-    # accessed at irregular column indices, so the texture-style cache helps
-    # more than the regular L1 — same warp threads frequently hit the same
-    # cache line for nearby cols, and the read-only cache has separate budget
-    # from the L1 lines holding nzval/crd.
-    x = Base.Experimental.Const(x_raw)
-
-    period_size  = n_diag + n_off
-    period_m1    = (tid - Int32(1)) ÷ period_size
-    rem          = (tid - Int32(1)) - period_m1 * period_size
-    col_off_t    = period_m1 * n_cols
-
-    acc = zero(T)
-
-    if rem < n_diag
-        r = rem + Int32(1)
-        @inbounds begin
-            lo = d_pos[r]
-            hi = d_pos[r + Int32(1)] - Int32(1)
-            for k in lo:hi
-                col  = d_crd[k] + col_off_t
-                acc += d_nzval[k] * x[col]
-            end
-            if HAS_PATCH && r >= dp_row_start && r <= dp_row_end
-                pcol = (r - dp_row_start + Int32(1)) + dp_col_offset + col_off_t
-                acc += dp_val * x[pcol]
-            end
-        end
-    else
-        r = rem - n_diag + Int32(1)
-        col_off_next = (period_m1 + Int32(1)) * n_cols
-        @inbounds begin
-            lo = n_pos[r]
-            hi = n_pos[r + Int32(1)] - Int32(1)
-            for k in lo:hi
-                col  = n_crd[k] + col_off_t
-                acc += n_nzval[k] * x[col]
-            end
-            lo = p_pos[r]
-            hi = p_pos[r + Int32(1)] - Int32(1)
-            for k in lo:hi
-                col  = p_crd[k] + col_off_next
-                acc += p_nzval[k] * x[col]
-            end
-        end
-    end
-
-    @inbounds y[tid] = ZERO_BETA ? acc : acc + beta * y[tid]
-    return nothing
-end
-
-# ─── BBM-periodic w/ selector off-diag: zero-indirection coupling ────────────
-#
-# When the off-diagonal (neg, pos) pair is a selector matrix — exactly one nnz
-# per row at col = row, with constant nzval — the kernel can drop pos/crd/nzval
-# reads entirely.  Each off-diag row in period t becomes simply:
-#
-#     y[off_row] = neg_val * x[r + col_off_t] + pos_val * x[r + col_off_next]
-#
-# For a typical multi-period ramp (R = sparse(1:n_gen, 1:n_gen, ones, n_gen,
-# n_var); off_diag = (-R, R)) this saves 8 indirect loads per off-diag row —
-# 6 μs at the §3 13659 case.  Detector also handles n_off ≤ n_cols (the
-# selector lives in the leading n_off columns of an n_cols-wide block).
-
-function _bbm_periodic_selector_kernel!(
-        d_pos, d_crd, d_nzval,
-        y, x_raw,
-        n_diag::Int32, n_off::Int32, n_cols::Int32,
-        n_total_rows::Int32,
-        neg_val, pos_val,
-        ::Val{HAS_PATCH}, dp_row_start::Int32, dp_row_end::Int32,
-        dp_col_offset::Int32, dp_val,
-        ::Val{ZERO_BETA}, beta) where {HAS_PATCH, ZERO_BETA}
-    T   = eltype(y)
-    tid = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    tid > n_total_rows && return nothing
-
-    x = Base.Experimental.Const(x_raw)
-
-    period_size  = n_diag + n_off
-    period_m1    = (tid - Int32(1)) ÷ period_size
-    rem          = (tid - Int32(1)) - period_m1 * period_size
-    col_off_t    = period_m1 * n_cols
-
-    if rem < n_diag
-        # Diag rows: identical to the generic periodic kernel.
-        r = rem + Int32(1)
-        acc = zero(T)
-        @inbounds begin
-            lo = d_pos[r]
-            hi = d_pos[r + Int32(1)] - Int32(1)
-            for k in lo:hi
-                col  = d_crd[k] + col_off_t
-                acc += d_nzval[k] * x[col]
-            end
-            if HAS_PATCH && r >= dp_row_start && r <= dp_row_end
-                pcol = (r - dp_row_start + Int32(1)) + dp_col_offset + col_off_t
-                acc += dp_val * x[pcol]
-            end
-            y[tid] = ZERO_BETA ? acc : acc + beta * y[tid]
-        end
-    else
-        # Off-diag selector path: 0 indirect loads, 2 x reads, 2 muls.
-        r = rem - n_diag + Int32(1)        # 1..n_off, lives in cols [1..n_off]
-        col_off_next = (period_m1 + Int32(1)) * n_cols
-        @inbounds begin
-            acc = T(neg_val) * x[r + col_off_t] + T(pos_val) * x[r + col_off_next]
-            y[tid] = ZERO_BETA ? acc : acc + beta * y[tid]
-        end
-    end
-    return nothing
-end
-
-# Detect "constant-value selector" shape:  the matrix has exactly 1 nnz per
-# row at column = row (i.e. the leading n_rows×n_rows block is a scaled
-# identity, with all-zero columns to the right).  Returns `(true, val)` if
-# detected, else `(false, zero)`.
-function _selector_value(u::AbstractUSTensor)
-    fmt = format(u)
-    fmt == Formats.CSR || return (false, zero(eltype(u)))
-    m = Int(extents(u)[1])
-    pos_h = Vector{Int}(Array(positions(u, 2)))
-    length(pos_h) == m + 1 || return (false, zero(eltype(u)))
-    pos_h[end] - pos_h[1] == m || return (false, zero(eltype(u)))
-    for r in 1:m
-        pos_h[r+1] - pos_h[r] == 1 || return (false, zero(eltype(u)))
-    end
-    crd_h = Vector{Int}(Array(coordinates(u, 2)))
-    nz_h  = Array(nonzeros(u))
-    @inbounds for r in 1:m
-        crd_h[pos_h[r]] == r || return (false, zero(eltype(u)))
-    end
-    val = nz_h[1]
-    all(v -> v == val, nz_h) || return (false, zero(eltype(u)))
-    return (true, val)
-end
-
-# Find a single BSM block (i, j) that's a constant-value selector and report it
-# as a "diagonal patch": rows in [row_start..row_end] of the BSM contribute one
-# inline term `val * x[col_off + (r - row_start)]` instead of going through the
-# CSR.  Returns `nothing` if no such block is found.  Supports a single patch
-# for now — first selector wins.  Multi-patch is a straightforward extension.
-function _bsm_find_diag_patch(A::BlockSparseMatrix{T}) where T
-    nb_r, nb_c = size(A.blocks)
-    for i in 1:nb_r, j in 1:nb_c
-        b = A.blocks[i, j]; b === nothing && continue
-        is_sel, val = _selector_value(b)
-        is_sel || continue
-        # row r of the block (1..A.row_sizes[i]) maps to BSM row r + row_off,
-        # and the selector's nnz lands at BSM col r + col_off.  So in kernel:
-        #   for BSM row R in [row_off+1, row_off+row_sizes[i]],
-        #   x col within the period = (R - (row_off+1)) + col_off + 1.
-        return (Int32(A._row_off[i] + 1),
-                Int32(A._row_off[i] + A.row_sizes[i]),
-                Int32(A._col_off[j]),
-                T(val))
-    end
-    return nothing
-end
-
-# Build a leaner CSR from the BSM compiled CSR by removing the nnz that fall
-# inside a diagonal patch's row range and at the patch's predicted column.
-# Returns (new_pos, new_crd, new_nzval) on host (Vectors).
-function _strip_diag_patch_csr(asm::USTensor, row_start::Int32, row_end::Int32,
-                                 col_offset::Int32, ::T) where T
-    pos_h = Vector{Int32}(Array(positions(asm, 2)))
-    crd_h = Vector{Int32}(Array(coordinates(asm, 2)))
-    nz_h  = Vector{T}(Array(nonzeros(asm)))
-    n_rows = length(pos_h) - 1
-    n_remove_total = Int(row_end - row_start + 1)
-
-    new_pos = Vector{Int32}(undef, n_rows + 1)
-    new_crd = Vector{Int32}(undef, length(crd_h) - n_remove_total)
-    new_nz  = Vector{T}(undef, length(nz_h) - n_remove_total)
-
-    new_pos[1] = 1
-    nz_cur = 0
-    @inbounds for r in 1:n_rows
-        lo = pos_h[r]; hi = pos_h[r + 1] - 1
-        in_patch = (Int32(r) >= row_start) & (Int32(r) <= row_end)
-        # Column we expect to remove if in patch: r within block + col_offset (1-based).
-        target_col = in_patch ? Int32(r - row_start + 1) + col_offset : Int32(0)
-        for k in lo:hi
-            if in_patch && crd_h[k] == target_col
-                continue   # skip the patch entry
-            end
-            nz_cur += 1
-            new_crd[nz_cur] = crd_h[k]
-            new_nz[nz_cur]  = nz_h[k]
-        end
-        new_pos[r + 1] = Int32(nz_cur + 1)
-    end
-    @assert nz_cur == length(new_crd)
-    return new_pos, new_crd, new_nz
-end
+# Launch entry points: `JLUST._bbm_periodic_spmv_launch!` /
+# `JLUST._bbm_periodic_selector_launch!` (declared in src/backends.jl,
+# implemented in ext/KernelAbstractionsExt/ops/block_periodic.jl).
 
 # Periodic compiled view — only created when the BBM matches the supported
 # shape (bw=1, BSM diag, single Tuple off-diag pair).  Holds direct refs to
-# the source block CSRs, no T-fold replication.
-mutable struct _CompiledBBMPeriodic{T,Ti}
-    bsm_compiled :: _CompiledBSM{T,Ti}      # diag's compiled CSR (reused, with selector blocks removed if any)
+# the source block CSRs (no T-fold replication) plus the BSM's already-extracted
+# selector patches (carried straight through from `bsm_compiled.patches`).
+mutable struct _CompiledBBMPeriodic{T,Ti,P<:Tuple}
+    bsm_compiled :: _CompiledBSM{T,Ti,P}     # diag's compiled CSR + extracted patches
     # Off-diag CSR storage (only populated when not in selector mode):
     n_pos        :: CuVector{Int32}          # off-diag neg CSR rowptr
     n_crd        :: CuVector{Int32}
@@ -701,17 +592,6 @@ mutable struct _CompiledBBMPeriodic{T,Ti}
     selector     :: Bool
     neg_val      :: T
     pos_val      :: T
-    # Optional in-diag selector patch.  When the BSM has a block at (i, j)
-    # whose CSR is a constant-value selector (1 nnz/row at col=row), we exclude
-    # it from the BSM compiled CSR and inline `acc += val * x[col_off + r_off
-    # + (r - row_start)]` in the kernel — saves one indirect-load chain per
-    # patched row.  `has_diag_patch=false` disables this path (CSR retains all
-    # entries).
-    has_diag_patch    :: Bool
-    diag_row_start    :: Int32     # 1-based; first BSM row in the patch
-    diag_row_end      :: Int32     # 1-based; last BSM row in the patch (inclusive)
-    diag_col_offset   :: Int32     # 0-based shift within the period
-    diag_val          :: T
     n_diag       :: Int32
     n_off        :: Int32
     n_cols       :: Int32
@@ -733,12 +613,15 @@ const _bbm_periodic_cache = IdDict{BlockBandedMatrix, _CompiledBBMPeriodic}()
 end
 
 # Pull the compiled BSM's CSR buffers + off-diag CSR buffers into a periodic
-# launcher.  No full BBM materialization.  If both off-diag matrices are
-# constant-value selectors, skip uploading their CSR buffers and let the
-# kernel use the closed-form selector access pattern instead.
+# launcher.  No full BBM materialization.  Selector blocks inside the BSM diag
+# are already extracted as `bsm_c.patches` by `_compile_bsm`; the periodic
+# kernel walks them alongside the per-period CSR walk.  If both off-diagonal
+# matrices are constant-value selectors, the kernel uses the closed-form
+# selector access pattern for off-diag rows and skips uploading their CSR.
 function _compile_bbm_periodic(M::BlockBandedMatrix{D,O}) where {D,O}
     bsm = M.diags::BlockSparseMatrix
     bsm_c = _ensure_compiled_bsm(bsm)
+    Pty   = typeof(bsm_c.patches)
 
     neg, pos = M.off_diags[1]
     Tel = eltype(M)
@@ -747,39 +630,16 @@ function _compile_bbm_periodic(M::BlockBandedMatrix{D,O}) where {D,O}
     n_cols = Int32(M.n_cols)
     n_total_rows = Int32(M.T * M.n_diag_rows + (M.T - 1) * M.n_off_rows[1])
 
-    # Detect a single in-diag selector patch (e.g., DCOPF's negI block).  If
-    # found, REPLACE bsm_c with a leaner compiled BSM whose CSR omits the patch
-    # entries.  The kernel re-adds them via the inline path.
-    patch = _bsm_find_diag_patch(bsm)
-    if patch !== nothing
-        rs, re, co, val = patch
-        new_pos, new_crd, new_nz = _strip_diag_patch_csr(bsm_c.asm, rs, re, co, val)
-        m, n = Int.(extents(bsm_c.asm))
-        cu = CUDA.CUSPARSE.CuSparseMatrixCSR{Tel,Int32}(
-            CuArray(new_pos), CuArray(new_crd), CuArray(new_nz), (m, n))
-        leaner_asm = JLUST.ust(cu)
-        # Wrap the leaner CSR in a fresh _CompiledBSM so the kernel reads the
-        # stripped pos/crd/nzval; this leaves the BSM's full compiled CSR (used
-        # by §2 BSM mul!) untouched.
-        bsm_c = _CompiledBSM{Tel,Int32}(leaner_asm, bsm_c.map,
-            Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
-            UInt(0), UInt(0), nothing)
-        has_patch = true; dp_rs = rs; dp_re = re; dp_co = co; dp_v = val
-    else
-        has_patch = false; dp_rs = Int32(0); dp_re = Int32(0); dp_co = Int32(0); dp_v = zero(Tel)
-    end
-
     n_is_sel, n_v = _selector_value(neg)
     p_is_sel, p_v = _selector_value(pos)
     if n_is_sel && p_is_sel
         empty_iv = CuVector{Int32}(undef, 0)
         empty_v  = CuVector{Tel}(undef, 0)
-        return _CompiledBBMPeriodic{Tel,Int32}(
+        return _CompiledBBMPeriodic{Tel,Int32,Pty}(
             bsm_c,
             empty_iv, empty_iv, empty_v,
             empty_iv, empty_iv, empty_v,
             true, Tel(n_v), Tel(p_v),
-            has_patch, dp_rs, dp_re, dp_co, dp_v,
             n_diag, n_off, n_cols, n_total_rows,
             Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
             UInt(0), UInt(0), nothing)
@@ -787,12 +647,11 @@ function _compile_bbm_periodic(M::BlockBandedMatrix{D,O}) where {D,O}
 
     n_pos, n_crd, n_nz = positions(neg, 2), coordinates(neg, 2), nonzeros(neg)
     p_pos, p_crd, p_nz = positions(pos, 2), coordinates(pos, 2), nonzeros(pos)
-    _CompiledBBMPeriodic{Tel,Int32}(
+    _CompiledBBMPeriodic{Tel,Int32,Pty}(
         bsm_c,
         CuVector{Int32}(n_pos), CuVector{Int32}(n_crd), CuVector{Tel}(n_nz),
         CuVector{Int32}(p_pos), CuVector{Int32}(p_crd), CuVector{Tel}(p_nz),
         false, zero(Tel), zero(Tel),
-        has_patch, dp_rs, dp_re, dp_co, dp_v,
         n_diag, n_off, n_cols, n_total_rows,
         Dict{Tuple{UInt,UInt}, CUDA.CuGraphExec}(),
         UInt(0), UInt(0), nothing)
@@ -807,27 +666,25 @@ end
     d_pos = positions(bsm_asm, 2)
     d_crd = coordinates(bsm_asm, 2)
     d_nz  = nonzeros(bsm_asm)
-    threads = 256
-    blocks  = cld(Int(c.n_total_rows), threads)
-    zero_beta = Val(iszero(beta))
-    has_patch = Val(c.has_diag_patch)
+    ka    = CUDABackend()
+    patches = c.bsm_compiled.patches   # NTuple{N, SelectorPatch{T}} from BSM compile
     if c.selector
-        CUDA.@cuda threads=threads blocks=blocks _bbm_periodic_selector_kernel!(
+        JLUST._bbm_periodic_selector_launch!(ka,
             d_pos, d_crd, d_nz,
             y, x,
             c.n_diag, c.n_off, c.n_cols, c.n_total_rows,
-            c.neg_val, c.pos_val,
-            has_patch, c.diag_row_start, c.diag_row_end, c.diag_col_offset, c.diag_val,
-            zero_beta, eltype(y)(beta))
+            eltype(y)(c.neg_val), eltype(y)(c.pos_val),
+            patches,
+            iszero(beta), eltype(y)(beta))
     else
-        CUDA.@cuda threads=threads blocks=blocks _bbm_periodic_spmv_kernel!(
+        JLUST._bbm_periodic_spmv_launch!(ka,
             d_pos, d_crd, d_nz,
             c.n_pos, c.n_crd, c.n_nzval,
             c.p_pos, c.p_crd, c.p_nzval,
             y, x,
             c.n_diag, c.n_off, c.n_cols, c.n_total_rows,
-            has_patch, c.diag_row_start, c.diag_row_end, c.diag_col_offset, c.diag_val,
-            zero_beta, eltype(y)(beta))
+            patches,
+            iszero(beta), eltype(y)(beta))
     end
     return y
 end
@@ -874,8 +731,10 @@ function LinearAlgebra.mul!(y::CuVector, A::BlockBandedMatrix, x::CuVector;
 end
 
 # Compile-time check: every block contributing to this BBM must be a CSR
-# USTensor (or BSM with all-CSR blocks).  Mixed / dense / unusual-format BBMs
-# fall through to the generic emitter dispatch.
+# USTensor (or BSM with all-CSR blocks).  Mixed / dense / unusual-format /
+# ShiftedDiag-block BBMs fall through to the generic emitter dispatch (or, for
+# the periodic special case, to the patch-aware periodic path which handles
+# ShiftedDiag blocks via the BSM compile's `patches` tuple).
 function _bbm_supports_compile(M::BlockBandedMatrix)
     _bbm_diag_supports(M.diags) || return false
     for k in 1:M.bw
@@ -884,8 +743,21 @@ function _bbm_supports_compile(M::BlockBandedMatrix)
     true
 end
 
+# CSR-only predicate.  `_compile_bbm` materialises the BBM into a single
+# assembled CSR via `_host_csr`, which only knows how to read CSR-formatted
+# blocks — so a BSM containing a ShiftedDiag block is NOT compilable for the
+# full BBM path (the periodic path handles it instead via patches).
+@inline _bsm_all_csr(A::BlockSparseMatrix) = begin
+    nb_r, nb_c = size(A.blocks)
+    for i in 1:nb_r, j in 1:nb_c
+        b = A.blocks[i, j]; b === nothing && continue
+        format(b) == Formats.CSR || return false
+    end
+    true
+end
+
 @inline _bbm_diag_supports(d::AbstractUSTensor)   = format(d) == Formats.CSR
-@inline _bbm_diag_supports(d::BlockSparseMatrix)  = _bsm_supports_compile(d)
+@inline _bbm_diag_supports(d::BlockSparseMatrix)  = _bsm_all_csr(d)
 @inline _bbm_diag_supports(d::AbstractVector)     = all(_bbm_diag_supports, d)
 @inline _bbm_diag_supports(::Any)                 = false   # incl. AbstractMatrix
 

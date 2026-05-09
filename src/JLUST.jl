@@ -24,6 +24,7 @@ export
     # Level formats
     AbstractLevelFormat,
     DenseLevel, BatchLevel, CompressedLevel, SingletonLevel, RangeLevel, DeltaLevel,
+    ShiftedDiagLevel, diag_shift, diag_val,
     is_ordered, is_unique,
 
     # Format DSL
@@ -62,7 +63,7 @@ export
 
     # Interop / constructors
     ust, csr_tensor, csc_tensor, coo_tensor, dcsr_tensor,
-    selector_tensor, diagonal_tensor,
+    selector_tensor, diagonal_tensor, shifted_diag_tensor,
 
     # Convert
     convert_format, convert_index_type, convert_value_type,
@@ -82,6 +83,9 @@ export
 
     # Custom level format constructor helper
     make_tensor,
+
+    # Block-level selector patch (compiled BSM / BBM-periodic descriptor)
+    SelectorPatch,
 
     # Block matrix
     BlockSparseMatrix,
