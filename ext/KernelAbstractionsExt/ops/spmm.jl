@@ -4,7 +4,30 @@
 # fiber for DCSR, NNZ for COO) and sequentially loops over n_col columns of B.
 # Builds via the unified level walker in _walker.jl.
 
-function _emit_spmm_body(levels::Tuple, ::Type{T}) where T
+function _emit_spmm_body(levels::Tuple, ::Type{T}; scatter::Bool=false) where T
+    # Walker (with `direction=:scatter`) binds `_y_idx`/`_x_idx` swapped for
+    # scatter, so the leaf+row body templates can refer to `_y_idx`
+    # consistently as "y row" and `_x_idx` as "x col" regardless of direction.
+    # Two directions differ only in:
+    #   • leaf: gather accumulates into `_acc`; scatter atomic-adds into C
+    #   • row body: gather inits/writes `_acc`; scatter just loops over _col
+    # Caller pre-scales C by beta whenever an atomic-leaf path is used.
+    direction = scatter ? :scatter : :gather
+    if scatter
+        leaf = :(KernelAbstractions.@atomic _C[_y_idx, _col] +=
+                     _alpha * _nzval[_nnz_pos] * _B[_x_idx, _col])
+        row_body = inner -> quote
+            for _col in 1:_n_col
+                $inner
+            end
+        end
+        return emit_kernel_body(levels;
+                                row_body_unique = row_body,
+                                row_body_atomic = row_body,
+                                leaf_unique     = leaf,
+                                leaf_atomic     = leaf,
+                                direction)
+    end
     leaf_unique = :(_acc += _nzval[_nnz_pos] * _B[_x_idx, _col])
     leaf_atomic = :(KernelAbstractions.@atomic _C[_y_idx, _col] +=
                         _alpha * _nzval[_nnz_pos] * _B[_x_idx, _col])
@@ -22,27 +45,30 @@ function _emit_spmm_body(levels::Tuple, ::Type{T}) where T
         end
     end
     emit_kernel_body(levels;
-                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic, direction)
 end
 
-_emit_spmm_body(fmt::TensorFormat, T) = _emit_spmm_body(fmt.levels, T)
+_emit_spmm_body(fmt::TensorFormat, T; kw...) = _emit_spmm_body(fmt.levels, T; kw...)
 
 # ─── SpMM kernel singletons (column-first / NNZ-first / tiled) ──────────────
 # All three emit through the unified `_ust_emit_kern`; only the standard arg
 # names and the body builder differ.  The 2D kernel (further down) uses a
 # different signature and stays separate.
 
-struct _SpMMColKern end
-struct _SpMMNNZFirstKern{NCOL,ZB} end
-struct _SpMMTiledKern end
+struct _SpMMColKern{SCAT} end
+_SpMMColKern() = _SpMMColKern{false}()
+struct _SpMMNNZFirstKern{NCOL,ZB,SCAT} end
+_SpMMNNZFirstKern{NCOL,ZB}() where {NCOL,ZB} = _SpMMNNZFirstKern{NCOL,ZB,false}()
+struct _SpMMTiledKern{SCAT} end
+_SpMMTiledKern() = _SpMMTiledKern{false}()
 
 _kern_standard_nms(::_SpMMColKern)        = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
 _kern_standard_nms(::_SpMMNNZFirstKern)   = (:_B, :_C, :_origin_off, :_n_outer, :_alpha, :_beta)
 _kern_standard_nms(::_SpMMTiledKern)      = (:_B, :_C, :_origin_off, :_n_outer, :_n_col, :_alpha, :_beta)
 
-_kern_emit_body(::_SpMMColKern,                levels, ::Type{T}) where T          = _emit_spmm_body(levels, T)
-_kern_emit_body(::_SpMMNNZFirstKern{NCOL,ZB},  levels, ::Type{T}) where {NCOL,ZB,T} = _emit_spmm_body_nnzfirst(levels, T, NCOL, ZB)
-_kern_emit_body(::_SpMMTiledKern,              levels, ::Type{T}) where T          = _emit_spmm_body_tiled(levels, T, _SPMM_TILE_K)
+_kern_emit_body(::_SpMMColKern{SCAT},               levels, ::Type{T}) where {SCAT, T}        = _emit_spmm_body(levels, T; scatter=SCAT)
+_kern_emit_body(::_SpMMNNZFirstKern{NCOL,ZB,SCAT},  levels, ::Type{T}) where {NCOL,ZB,SCAT,T}  = _emit_spmm_body_nnzfirst(levels, T, NCOL, ZB; scatter=SCAT)
+_kern_emit_body(::_SpMMTiledKern{SCAT},             levels, ::Type{T}) where {SCAT, T}        = _emit_spmm_body_tiled(levels, T, _SPMM_TILE_K; scatter=SCAT)
 
 # ─── NNZ-first (tiled) SpMM emitter ─────────────────────────────────────────
 #
@@ -88,7 +114,25 @@ function _spmm_2d_max_rows(ka)
     end
 end
 
-function _emit_spmm_body_nnzfirst(levels::Tuple, ::Type{T}, n_col::Int, zero_beta::Bool=false) where T
+function _emit_spmm_body_nnzfirst(levels::Tuple, ::Type{T}, n_col::Int, zero_beta::Bool=false;
+                                   scatter::Bool=false) where T
+    direction = scatter ? :scatter : :gather
+    if scatter
+        # Scatter form: per nz, emit n_col compile-time-unrolled atomic adds.
+        # No per-row accumulator (multiple threads write same C row), no row
+        # body (atomics happen at the leaf).  Caller pre-scales C by beta.
+        leaf_block = Expr(:block, [
+            :(KernelAbstractions.@atomic _C[_y_idx, $(c)] +=
+                  _alpha * _nzval[_nnz_pos] * _B[_x_idx, $(c)])
+            for c in 1:n_col]...)
+        passthrough = inner -> inner
+        return emit_kernel_body(levels;
+                                row_body_unique = passthrough,
+                                row_body_atomic = passthrough,
+                                leaf_unique     = leaf_block,
+                                leaf_atomic     = leaf_block,
+                                direction)
+    end
     # k accumulators (one per output column), accumulated in registers, written together.
     leaf_unique = Expr(:block, [
         :($(Symbol(:_acc_, c)) += _nzval[_nnz_pos] * _B[_x_idx, $(c)])
@@ -109,11 +153,11 @@ function _emit_spmm_body_nnzfirst(levels::Tuple, ::Type{T}, n_col::Int, zero_bet
     end
     row_body_atomic = inner -> inner
     emit_kernel_body(levels;
-                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic, direction)
 end
 
-_emit_spmm_body_nnzfirst(fmt::TensorFormat, T, n_col, zero_beta=false) =
-    _emit_spmm_body_nnzfirst(fmt.levels, T, n_col, zero_beta)
+_emit_spmm_body_nnzfirst(fmt::TensorFormat, T, n_col, zero_beta=false; kw...) =
+    _emit_spmm_body_nnzfirst(fmt.levels, T, n_col, zero_beta; kw...)
 
 _is_csr_like_for_guard(fmt::TensorFormat) =
     length(fmt.levels) == 2 &&
@@ -202,7 +246,29 @@ const _SPMM_TILE_K = 8   # columns per tile; governs register pressure
 # row/leaf shape differs from full-k NNZ-first only in: (a) tile_k accumulators
 # tracked via `_tile_start` runtime offset, (b) outer while-loop over tiles.
 # No second walker is needed — the leaf and row_body callbacks parameterize it.
-function _emit_spmm_body_tiled(levels::Tuple, ::Type{T}, tile_k::Int) where T
+function _emit_spmm_body_tiled(levels::Tuple, ::Type{T}, tile_k::Int; scatter::Bool=false) where T
+    direction = scatter ? :scatter : :gather
+    if scatter
+        # Scatter: tile loop still amortizes loading B[x_idx, tile_start+c-1]
+        # across TILE_K atomic-adds per nz; no per-row accumulator/writeback.
+        leaf_atom = Expr(:block, [
+            :(KernelAbstractions.@atomic _C[_y_idx, _tile_start + $(c - 1)] +=
+                  _alpha * _nzval[_nnz_pos] * _B[_x_idx, _tile_start + $(c - 1)])
+            for c in 1:tile_k]...)
+        row_body = inner -> quote
+            _tile_start = Int32(1)
+            while _tile_start <= _n_col
+                $inner
+                _tile_start += Int32($tile_k)
+            end
+        end
+        return emit_kernel_body(levels;
+                                row_body_unique = row_body,
+                                row_body_atomic = row_body,
+                                leaf_unique     = leaf_atom,
+                                leaf_atomic     = leaf_atom,
+                                direction)
+    end
     acc_inits   = Expr(:block, [:($(Symbol(:_acc_, c)) = $(zero(T))) for c in 1:tile_k]...)
     acc_writes  = Expr(:block, [
         :(_C[_y_idx, _tile_start + $(c-1)] =
@@ -232,11 +298,11 @@ function _emit_spmm_body_tiled(levels::Tuple, ::Type{T}, tile_k::Int) where T
         end
     end
     emit_kernel_body(levels;
-                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic)
+                     row_body_unique, row_body_atomic, leaf_unique, leaf_atomic, direction)
 end
 
-_emit_spmm_body_tiled(fmt::TensorFormat, T, tile_k) =
-    _emit_spmm_body_tiled(fmt.levels, T, tile_k)
+_emit_spmm_body_tiled(fmt::TensorFormat, T, tile_k; kw...) =
+    _emit_spmm_body_tiled(fmt.levels, T, tile_k; kw...)
 
 # ─── SpMM kernel strategies ───────────────────────────────────────────────────
 #
@@ -254,24 +320,32 @@ struct _SpMMNNZFirst end
 struct _SpMMTiled    end
 struct _SpMM2D       end
 
+# Returns (strategy, scatter::Bool).  Scatter is propagated to the kernel
+# singleton's SCAT type parameter, which selects the scatter form of the same
+# emit body.  All three walker-driven strategies (ColFirst, NNZFirst, Tiled)
+# support scatter via the walker's direction parameter.  2D bypasses the
+# walker (hardcoded CSR), so it doesn't apply under scatter — selector falls
+# back to NNZFirst (or Tiled for k > inline threshold).
 function _spmm_strategy(fmt::TensorFormat, n_outer::Int, n_col::Int,
                          nnz::Int, ka, skip_empty_rows::Bool)
+    scatter = _spmv_is_scatter(fmt)
     lv1 = fmt.levels[1]
     is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
                   length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
-    is_coo_like && return _SpMMColFirst()
+    is_coo_like && return (_SpMMColFirst(), false)   # COO can't be scatter
 
     if n_col <= _SPMM_NCOL_INLINE_THRESHOLD
         # 2D wins when CSR-shaped AND (skip-empty mask requested ∨ 1D underfills SMs ∨ NNZ-dense).
-        if _is_csr_like_for_guard(fmt) && (skip_empty_rows ||
-                                           n_outer <= _spmm_2d_max_rows(ka) ||
-                                           nnz > _SPMM_2D_AVG_NNZ * n_outer)
-            return _SpMM2D()
+        # Scatter excludes 2D (CSR-only path).
+        if !scatter && _is_csr_like_for_guard(fmt) && (skip_empty_rows ||
+                                                       n_outer <= _spmm_2d_max_rows(ka) ||
+                                                       nnz > _SPMM_2D_AVG_NNZ * n_outer)
+            return (_SpMM2D(), false)
         end
-        return _SpMMNNZFirst()
+        return (_SpMMNNZFirst(), scatter)
     end
-    n_col % _SPMM_TILE_K == 0 && return _SpMMTiled()
-    _SpMMColFirst()
+    n_col % _SPMM_TILE_K == 0 && return (_SpMMTiled(), scatter)
+    (_SpMMColFirst(), scatter)
 end
 
 # Common runtime args bundle: (fmt_type, T, sparse_bufs..., B, C, off, n_outer, ...).
@@ -279,8 +353,10 @@ end
     (_sparse_args(u_A)..., nonzeros(u_B), nonzeros(u_C), off, n_outer)
 
 function _run_spmm!(::_SpMM2D, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
-                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}, ::Val{SCAT}) where {Z, SE, SCAT}
     # 2D kernel uses a hardcoded CSR signature, so it bypasses _ust_emit_kern.
+    # Selector excludes 2D under scatter; assert in case.
+    SCAT && error("EmitterBackend: 2D SpMM strategy is gather-only.")
     T = eltype(u_A)
     args = (T, Val(n_col), Val(Z), Val(SE),
             _spmm_common(u_A, u_B, u_C, off, n_outer)..., T_alpha, T_beta)
@@ -288,26 +364,31 @@ function _run_spmm!(::_SpMM2D, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::In
 end
 
 function _run_spmm!(::_SpMMNNZFirst, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
-                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}, ::Val{SCAT}) where {Z, SE, SCAT}
     T = eltype(u_A)
-    args = (_SpMMNNZFirstKern{n_col, Z}(), typeof(format(u_A)), T,
-            _spmm_common(u_A, u_B, u_C, off, n_outer)..., T_alpha, T_beta)
+    # Scatter passes _beta=0 because the caller pre-scaled C; gather forwards
+    # T_beta as-is.
+    bw = SCAT ? zero(T) : T_beta
+    args = (_SpMMNNZFirstKern{n_col, Z, SCAT}(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., T_alpha, bw)
     _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
 end
 
 function _run_spmm!(::_SpMMTiled, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
-                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}, ::Val{SCAT}) where {Z, SE, SCAT}
     T = eltype(u_A)
-    args = (_SpMMTiledKern(), typeof(format(u_A)), T,
-            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, T_beta)
+    bw = SCAT ? zero(T) : T_beta
+    args = (_SpMMTiledKern{SCAT}(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, bw)
     _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
 end
 
 function _run_spmm!(::_SpMMColFirst, ka, u_A, u_B, u_C, off, n_outer::Int32, n_col::Int,
-                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}) where {Z, SE}
+                    T_alpha, T_beta, ::Val{Z}, ::Val{SE}, ::Val{SCAT}) where {Z, SE, SCAT}
     T = eltype(u_A)
-    args = (_SpMMColKern(), typeof(format(u_A)), T,
-            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, T_beta)
+    bw = SCAT ? zero(T) : T_beta
+    args = (_SpMMColKern{SCAT}(), typeof(format(u_A)), T,
+            _spmm_common(u_A, u_B, u_C, off, n_outer)..., Int32(n_col), T_alpha, bw)
     _launch_kern(ka, _ust_emit_kern, args, Int(n_outer))
 end
 
@@ -326,16 +407,18 @@ function JLUST.execute(::EmitterBackend, ::Op{:SpMM, F},
     n_outer = Int32(_spmv_ndrange(u_A))
     n_col   = Int(extents(u_B)[2])
 
-    # COO-like atomic-leaf path needs C pre-scaled by beta.
+    # Atomic-leaf paths need C pre-scaled by beta: COO-like outer (non-unique
+    # Compressed + Singleton) and scatter (CSC and lookalikes).
     lv1 = fmt.levels[1]
-    if lv1 isa CompressedLevel && !is_unique(lv1) &&
-       length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
+    is_coo_like = lv1 isa CompressedLevel && !is_unique(lv1) &&
+                  length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
+    if is_coo_like || _spmv_is_scatter(fmt)
         iszero(T_beta) ? fill!(nonzeros(u_C), zero(T)) : (nonzeros(u_C) .*= T_beta)
     end
 
-    strat = _spmm_strategy(fmt, Int(n_outer), n_col, length(nonzeros(u_A)), ka, skip_empty_rows)
+    strat, scatter = _spmm_strategy(fmt, Int(n_outer), n_col, length(nonzeros(u_A)), ka, skip_empty_rows)
     _run_spmm!(strat, ka, u_A, u_B, u_C, off, n_outer, n_col,
-               T_alpha, T_beta, Val(iszero(T_beta)), Val(skip_empty_rows))
+               T_alpha, T_beta, Val(iszero(T_beta)), Val(skip_empty_rows), Val(scatter))
     return u_C
 end
 

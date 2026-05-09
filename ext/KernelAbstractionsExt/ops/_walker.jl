@@ -35,14 +35,42 @@
 # Custom AbstractLevelFormat: the walker delegates to JLUST.emit_spmv_lv at
 # inner positions when the level lacks a dedicated method.  Outermost custom
 # levels are an error and must be paired with a DenseLevel outer.
+#
+# ── Direction (gather vs scatter) ─────────────────────────────────────────────
+#
+# `direction === :gather` (default): outer level walks the y-output dim, inner
+# levels walk the x-input dim.  Walker binds `_y_idx = _row_id` (outer) and
+# `_x_idx = crd[k]` (inner crd).  Used by CSR / DCSR / COO — the SpMV gather
+# pattern `y[i] = Σ A[i,j] x[j]`.
+#
+# `direction === :scatter`: outer level walks the x-input dim, inner levels
+# walk the y-output dim (the role flip CSC requires).  Walker swaps the
+# bindings: `_x_idx = _row_id` (outer = input col), `_y_idx = crd[k]` (inner
+# crd = output row).  Op-side leaf templates can still write `_y[_y_idx] += A
+# * _x[_x_idx]` and have it mean the right thing — semantics live in the
+# walker, not in every per-strategy emit body.
+#
+# Direction is a compile-time `Symbol` argument; the conditional bind is
+# selected at codegen time, so the emitted Expr for direction=:gather is
+# identical to pre-direction code (zero runtime cost in the gather path).
+#
+# Custom levels (AbstractLevelFormat) work in either direction: `level_step`
+# is direction-agnostic ("the coord this level walks") so the walker binds
+# the returned coord to `_y_idx` or `_x_idx` based on the format's level→dim
+# mapping.  A user can build a CSC-like custom format `(j:dense, i:MyLevel)`
+# and the walker routes it through scatter automatically.
 
 const KI = KernelAbstractions.KernelIntrinsics
 
 # ── Inner-level walker ────────────────────────────────────────────────────────
 
-function _walk_inner(levels, lvl, p_var, pc, cc, leaf, vs::Int=1)
+# Pick which symbol the inner crd binds to based on direction.
+@inline _inner_idx_sym(direction::Symbol) =
+    direction === :scatter ? :_y_idx : :_x_idx
+
+function _walk_inner(levels, lvl, p_var, pc, cc, leaf, vs::Int=1; direction::Symbol=:gather)
     lvl > length(levels) && return leaf
-    _walk_inner_lv(levels[lvl], levels, lvl, p_var, pc, cc, leaf, vs)
+    _walk_inner_lv(levels[lvl], levels, lvl, p_var, pc, cc, leaf, vs; direction)
 end
 
 # Inner Dense / Batch — dense loop.  When the level type carries a static size
@@ -52,9 +80,9 @@ end
 # `_sz<lvl>` kernel argument is referenced — the kernel signature must bind it.
 function _walk_inner_lv(lv::Union{DenseLevel{Sz},BatchLevel{Sz}},
                         levels, lvl, p_var::Symbol, pc, cc, leaf,
-                        vs::Int=1) where {Sz}
+                        vs::Int=1; direction::Symbol=:gather) where {Sz}
     lvar  = Symbol(:_i, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs; direction)
     if Sz === nothing
         sz = Symbol(:_sz, lvl)
         quote
@@ -81,17 +109,18 @@ end
 # Int upcasts compiled to 64-bit GPU arithmetic and was a 20%+ perf hit in the
 # inner loop versus equivalent hand-rolled Int32 kernels.
 function _walk_inner_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
-                        vs::Int=1)
+                        vs::Int=1; direction::Symbol=:gather)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar = Symbol(:_i, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs; direction)
+    idx_sym = _inner_idx_sym(direction)
     if vs == 1
         quote
             _lo = $ps[$p_var]      - _origin_off
             _hi = $ps[$p_var + 1]  - _origin_off
             for $lvar in (_lo + Int32(1)):_hi
-                _x_idx   = $cs[$lvar] - _origin_off + Int32(1)
+                $idx_sym = $cs[$lvar] - _origin_off + Int32(1)
                 _nnz_pos = $lvar
                 $inner
             end
@@ -102,7 +131,7 @@ function _walk_inner_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, l
             _hi = $ps[$p_var + 1]  - _origin_off
             $lvar = _lo + _vec_lane + Int32(1)
             while $lvar <= _hi
-                _x_idx   = $cs[$lvar] - _origin_off + Int32(1)
+                $idx_sym = $cs[$lvar] - _origin_off + Int32(1)
                 _nnz_pos = $lvar
                 $inner
                 $lvar += Int32($vs)
@@ -112,31 +141,33 @@ function _walk_inner_lv(::CompressedLevel, levels, lvl, p_var::Symbol, pc, cc, l
 end
 
 function _walk_inner_lv(::SingletonLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
-                        vs::Int=1)
+                        vs::Int=1; direction::Symbol=:gather)
     ci = cc[] += 1
     cs = Symbol(:_crd, ci)
-    inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
+    inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs; direction)
+    idx_sym = _inner_idx_sym(direction)
     quote
-        _x_idx   = $cs[$p_var] - _origin_off + Int32(1)
+        $idx_sym = $cs[$p_var] - _origin_off + Int32(1)
         _nnz_pos = $p_var
         $inner
     end
 end
 
 function _walk_inner_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
-                        vs::Int=1)
+                        vs::Int=1; direction::Symbol=:gather)
     pi = pc[] += 1; ci = cc[] += 1
     ps = Symbol(:_pos, pi); cs = Symbol(:_crd, ci)
     lvar  = Symbol(:_i, lvl)
     corig = Symbol(:_corig, lvl)
-    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs)
+    inner = _walk_inner(levels, lvl + 1, lvar, pc, cc, leaf, vs; direction)
+    idx_sym = _inner_idx_sym(direction)
     quote
         _lo = Int($ps[$p_var])     - Int(_origin_off)
         _hi = Int($ps[$p_var + 1]) - Int(_origin_off)
         $corig = 0
         for $lvar in (_lo + 1):_hi
             $corig  += Int($cs[$lvar])
-            _x_idx   = $corig - Int(_origin_off) + 1
+            $idx_sym = $corig - Int(_origin_off) + 1
             _nnz_pos = $lvar
             $inner
             $corig += 1
@@ -145,12 +176,13 @@ function _walk_inner_lv(::DeltaLevel, levels, lvl, p_var::Symbol, pc, cc, leaf,
 end
 
 function _walk_inner_lv(::RangeLevel, levels, lvl, p_var, pc, cc, leaf,
-                        vs::Int=1)
+                        vs::Int=1; direction::Symbol=:gather)
     error("EmitterBackend: RangeLevel (DIA-style) inner kernels not supported. " *
           "Use convert_format to CSR or DCSR first.")
 end
 
-# Custom AbstractLevelFormat: bind `_x_idx` from `level_step`, and:
+# Custom AbstractLevelFormat: bind the coord returned by `level_step` to the
+# direction-appropriate symbol (`_x_idx` for gather, `_y_idx` for scatter):
 #   - if the level carries nzval (DiagonalLevel: val = nzval[i]) → standard
 #     leaf path, leaf reads `_nzval[_nnz_pos]` as usual
 #   - if the level has no nzval (ShiftedDiagLevel, RampLevel, etc.) → bind
@@ -158,13 +190,19 @@ end
 #     can't be used because `_nzval` isn't a kernel argument.  Restricted to
 #     leaf-position custom levels (no further inner recursion possible since
 #     we're emitting a complete leaf).
+#
+# `level_step` is direction-agnostic (returns "the coord this level walks"),
+# so a user CSC-like custom format `(j:dense, i:MyLevel)` works under scatter
+# without any change in the user's level code — the walker binds `_y_idx` from
+# the returned coord and the inlined leaf becomes an atomic-add.
 function _walk_inner_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc, cc, leaf,
-                        vs::Int=1)
+                        vs::Int=1; direction::Symbol=:gather)
+    idx_sym = _inner_idx_sym(direction)
     if JLUST.level_has_nzval(lv)
-        inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs)
+        inner = _walk_inner(levels, lvl + 1, p_var, pc, cc, leaf, vs; direction)
         quote
             _p1 = Int($p_var) - Int(_origin_off) + 1
-            (_x_idx, _) = JLUST.level_step($lv, _p1, :_nzval)
+            ($idx_sym, _) = JLUST.level_step($lv, _p1, :_nzval)
             _nnz_pos = $p_var
             $inner
         end
@@ -172,16 +210,23 @@ function _walk_inner_lv(lv::AbstractLevelFormat, levels, lvl, p_var::Symbol, pc,
         lvl == length(levels) || error(
             "EmitterBackend: nzval-less custom level $(typeof(lv)) at level $lvl ",
             "must be the innermost level (got $(length(levels)) total levels)")
-        # SpMV leaf inlined: `_acc += alpha·val·input_fn(x[col])` for the
-        # accumulator path, plus the same shape with @atomic on the COO/non-
-        # unique outer.  Detect which by checking whether `_acc` is in scope —
-        # we can't, so we emit the accumulator form (only Dense/Compressed-
-        # unique-outer formats are valid with a shifted-diag inner).
-        quote
-            _p1 = Int($p_var) - Int(_origin_off) + 1
-            (_x_idx, _val) = JLUST.level_step($lv, _p1, nothing)
-            _nnz_pos = $p_var
-            _acc += _val * _input_fn(_x[_x_idx])
+        # SpMV leaf inlined: gather accumulates into `_acc`; scatter atomic-adds
+        # into y at the inner-supplied coord (bound to `_y_idx` by direction).
+        # Caller pre-scales y by beta in scatter mode.
+        if direction === :scatter
+            quote
+                _p1 = Int($p_var) - Int(_origin_off) + 1
+                ($idx_sym, _val) = JLUST.level_step($lv, _p1, nothing)
+                _nnz_pos = $p_var
+                KernelAbstractions.@atomic _y[_y_idx] += _alpha * _val * _input_fn(_x[_x_idx])
+            end
+        else
+            quote
+                _p1 = Int($p_var) - Int(_origin_off) + 1
+                ($idx_sym, _val) = JLUST.level_step($lv, _p1, nothing)
+                _nnz_pos = $p_var
+                _acc += _val * _input_fn(_x[_x_idx])
+            end
         end
     end
 end
@@ -196,11 +241,13 @@ end
 function emit_kernel_body(levels::Tuple;
                           row_body_unique, row_body_atomic,
                           leaf_unique,     leaf_atomic,
-                          vs::Int=1, seg::Bool=false)
+                          vs::Int=1, seg::Bool=false,
+                          direction::Symbol=:gather)
     pc = Ref(0); cc = Ref(0)
     isempty(levels) && error("emit_kernel_body: no levels")
     _emit_outer(levels[1], levels, pc, cc,
-                row_body_unique, row_body_atomic, leaf_unique, leaf_atomic, vs, seg)
+                row_body_unique, row_body_atomic, leaf_unique, leaf_atomic,
+                vs, seg; direction)
 end
 
 emit_kernel_body(fmt::TensorFormat; kw...) = emit_kernel_body(fmt.levels; kw...)
@@ -215,9 +262,14 @@ emit_kernel_body(fmt::TensorFormat; kw...) = emit_kernel_body(fmt.levels; kw...)
 # folds them away in the scalar path.
 function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
                      row_body_unique, _row_body_atomic, leaf_unique, _leaf_atomic,
-                     vs::Int=1, _seg::Bool=false)
-    inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, vs)
+                     vs::Int=1, _seg::Bool=false; direction::Symbol=:gather)
+    inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, vs; direction)
     body  = row_body_unique(inner)
+    # Outer Dense walks the y-dim (row) under gather, the x-dim (col) under
+    # scatter — bind to `_y_idx` or `_x_idx` accordingly.  Op-side leaf can
+    # always read `_y[_y_idx]` and `_x[_x_idx]` and have it mean the right
+    # thing because the walker resolves direction at codegen time.
+    out_idx_sym = direction === :scatter ? :_x_idx : :_y_idx
     if vs == 1
         quote
             _tid       = KI.get_global_id().x
@@ -225,7 +277,7 @@ function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
             _vec_lane  = Int32(0)
             _group_mask = UInt32(0)
             if _row_id <= _n_outer
-                _y_idx = _row_id
+                $out_idx_sym = _row_id
                 $body
             end
         end
@@ -240,7 +292,7 @@ function _emit_outer(::Union{DenseLevel,BatchLevel}, levels, pc, cc,
             _group_bits    = (UInt32(1) << UInt32($vs)) - UInt32(1)
             _group_mask    = _group_bits << (UInt32(_group_in_warp) * UInt32($vs))
             if _row_id <= _n_outer
-                _y_idx = _row_id
+                $out_idx_sym = _row_id
                 $body
             end
         end
@@ -256,11 +308,12 @@ end
 # uniformity but ignore it here.
 function _emit_outer(lv::CompressedLevel, levels, pc, cc,
                      row_body_unique, row_body_atomic, leaf_unique, leaf_atomic,
-                     vs::Int=1, seg::Bool=false)
+                     vs::Int=1, seg::Bool=false; direction::Symbol=:gather)
     ci = cc[] += 1
     cs = Symbol(:_crd, ci)
+    out_idx_sym = direction === :scatter ? :_x_idx : :_y_idx
     if is_unique(lv)
-        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, 1)
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_unique, 1; direction)
         body  = row_body_unique(inner)
         quote
             _tid       = KI.get_global_id().x
@@ -268,7 +321,7 @@ function _emit_outer(lv::CompressedLevel, levels, pc, cc,
             _vec_lane  = Int32(0)
             _group_mask = UInt32(0)
             if _row_id <= _n_outer
-                _y_idx = Int($cs[_row_id]) - Int(_origin_off) + 1
+                $out_idx_sym = Int($cs[_row_id]) - Int(_origin_off) + 1
                 $body
             end
         end
@@ -279,7 +332,12 @@ function _emit_outer(lv::CompressedLevel, levels, pc, cc,
         # head check.  The walker writes the partial inner result into _my_val
         # via the `leaf_atomic` body (rewritten by `_emit_spmv_body` to
         # `_my_val += α·nzval·input_fn(x)` when seg=true).
-        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1)
+        # Seg path is gather-only (folds row-sums); scatter via non-unique
+        # Compressed outer would need a different reduction.
+        direction === :gather ||
+            error("EmitterBackend: segmented-reduce path is gather-only.  " *
+                  "Scatter via non-unique Compressed outer is not yet supported.")
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1; direction)
         body  = row_body_atomic(inner)   # `inner -> inner` for seg
         quote
             _tid        = KI.get_global_id().x
@@ -301,7 +359,7 @@ function _emit_outer(lv::CompressedLevel, levels, pc, cc,
         end
     else
         # Non-unique fallback: thread = NNZ; leaf is the atomic-add y-write.
-        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1)
+        inner = _walk_inner(levels, 2, :_row_id, pc, cc, leaf_atomic, 1; direction)
         body  = row_body_atomic(inner)
         quote
             _tid       = KI.get_global_id().x
@@ -309,7 +367,7 @@ function _emit_outer(lv::CompressedLevel, levels, pc, cc,
             _vec_lane  = Int32(0)
             _group_mask = UInt32(0)
             if _row_id <= _n_outer
-                _y_idx = Int($cs[_row_id]) - Int(_origin_off) + 1
+                $out_idx_sym = Int($cs[_row_id]) - Int(_origin_off) + 1
                 $body
             end
         end

@@ -79,15 +79,26 @@ function _sparse_args(u::USTensor)
 end
 
 # Compute thread count (ndrange) for SpMV based on outermost format level.
-# DenseLevel: one thread per dense row. CompressedLevel: one thread per outer fiber.
+# DenseLevel: one thread per dense fiber along whichever dim level 1 walks
+# (rows for CSR, cols for CSC).  CompressedLevel: one thread per outer fiber.
 # For non-unique Compressed (COO-like): one thread per NNZ (length of crd, not pos).
 function _spmv_ndrange(u_A::USTensor)
-    lv1 = format(u_A).levels[1]
+    fmt = format(u_A)
+    lv1 = fmt.levels[1]
     if lv1 isa Union{DenseLevel,BatchLevel}
-        extents(u_A)[1]
+        extents(u_A)[JLUST._lvl_dim(fmt, 1)]
     else
         length(coordinates(u_A, 1))   # fibers for unique, NNZ for non-unique
     end
+end
+
+# Scatter-mode detection: outermost Dense/Batch level walks the *input* dim
+# (col for CSC), while inner levels supply the *output* row coord.  Detected
+# purely from the format's level→dim mapping so any future format with the
+# same shape gets it for free.
+@inline function _spmv_is_scatter(fmt::TensorFormat)
+    lv1 = fmt.levels[1]
+    (lv1 isa Union{DenseLevel,BatchLevel}) && JLUST._lvl_dim(fmt, 1) == 2
 end
 
 # ─── SpMV body emitter ────────────────────────────────────────────────────────
@@ -112,8 +123,29 @@ function _emit_spmv_body(levels::Tuple, ::Type{T};
                           zero_beta::Bool=false,
                           const_x::Bool=false,
                           seg::Bool=false,
+                          scatter::Bool=false,
                           input_fn_sym::Symbol=:_input_fn,
                           output_fn_sym::Symbol=:_output_fn) where T
+    if scatter
+        # Scatter: walker (with `direction=:scatter`) binds `_y_idx` from inner
+        # crd (= y row) and `_x_idx` from outer thread idx (= x col), so the
+        # leaf can read like the gather form — one atomic-add into y at the
+        # inner-supplied row, no per-row accumulator.  Caller pre-scales y by
+        # beta before launch; kernel ignores _beta.
+        leaf_scatter = :(KernelAbstractions.@atomic _y[_y_idx] +=
+                             _alpha * _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx]))
+        passthrough  = inner -> inner
+        inner_body = emit_kernel_body(levels;
+                                      row_body_unique = passthrough,
+                                      row_body_atomic = passthrough,
+                                      leaf_unique     = leaf_scatter,
+                                      leaf_atomic     = leaf_scatter,
+                                      vs=1, seg=false, direction=:scatter)
+        return const_x ? quote
+            _x = Base.Experimental.Const(_x)
+            $inner_body
+        end : inner_body
+    end
     leaf_unique = :(_acc += _nzval[_nnz_pos] * $input_fn_sym(_x[_x_idx]))
     # Atomic-mode leaf: when `seg=true` the outer wraps with an all-warp
     # segmented reduce + single per-segment-head atomic, so the leaf just
@@ -237,12 +269,12 @@ end
 #                   Backends with `_supports_warp_vector(ka) === true` opt in
 #                   for formats with variable-length inner iteration.
 
-struct _SpMVKern{LDG, VS, ZB, SEG} end
-_SpMVKern() = _SpMVKern{false, 1, false, false}()
+struct _SpMVKern{LDG, VS, ZB, SEG, SCAT} end
+_SpMVKern() = _SpMVKern{false, 1, false, false, false}()
 _kern_standard_nms(::_SpMVKern) =
     (:_x, :_y, :_origin_off, :_n_outer, :_input_fn, :_output_fn, :_alpha, :_beta)
-_kern_emit_body(::_SpMVKern{LDG, VS, ZB, SEG}, levels, ::Type{T}) where {LDG, VS, ZB, SEG, T} =
-    _emit_spmv_body(levels, T; const_x=LDG, vs=VS, zero_beta=ZB, seg=SEG)
+_kern_emit_body(::_SpMVKern{LDG, VS, ZB, SEG, SCAT}, levels, ::Type{T}) where {LDG, VS, ZB, SEG, SCAT, T} =
+    _emit_spmv_body(levels, T; const_x=LDG, vs=VS, zero_beta=ZB, seg=SEG, scatter=SCAT)
 
 # `_supports_ldg(ka)` and `_supports_warp_vector(ka)` are declared in JLUST
 # core (src/backends.jl) so each backend extension overrides for its concrete
@@ -299,28 +331,32 @@ end
     lv1 isa CompressedLevel && !is_unique(lv1)
 end
 
-# Lift the runtime VS / ZB / SEG to compile-time `Val`s so the walker @generated
-# body specializes per (LDG, VS, ZB, SEG) combination — different stride literal,
-# warp-reduce depth, y-write pattern, and atomic vs segmented-reduce leaf.
+# Lift the runtime VS / ZB / SEG / SCAT to compile-time `Val`s so the walker
+# @generated body specializes per combination — different stride literal,
+# warp-reduce depth, y-write pattern, atomic vs segmented-reduce leaf, gather
+# vs scatter index binding.  Scatter forces VS=1 (no warp-coop across atomic
+# scatter writes) and SEG=false (segmented-reduce is gather-only).
 @inline function _launch_spmv_kern(ka, fmt::TensorFormat, all_args, ndrange::Int,
                                      total_nnz::Int, beta)
-    ldg = _supports_ldg(ka)
-    vs  = _spmv_vs(ka, fmt, ndrange, total_nnz)
-    seg = _spmv_seg(ka, fmt)
-    _launch_spmv_kern_dispatch(ka, all_args, ndrange, Val(ldg), vs, Val(iszero(beta)), Val(seg))
+    ldg     = _supports_ldg(ka)
+    scatter = _spmv_is_scatter(fmt)
+    vs      = scatter ? 1 : _spmv_vs(ka, fmt, ndrange, total_nnz)
+    seg     = scatter ? false : _spmv_seg(ka, fmt)
+    _launch_spmv_kern_dispatch(ka, all_args, ndrange, Val(ldg), vs,
+                               Val(iszero(beta)), Val(seg), Val(scatter))
 end
 
 @inline function _launch_spmv_kern_dispatch(ka, all_args, ndrange::Int,
                                               ::Val{LDG}, vs::Int, ::Val{ZB},
-                                              ::Val{SEG}) where {LDG, ZB, SEG}
+                                              ::Val{SEG}, ::Val{SCAT}) where {LDG, ZB, SEG, SCAT}
     # Vector mode requires VS threads per row, so the launch ndrange grows.
     n_threads = vs == 1 ? ndrange : ndrange * vs
-    if     vs == 1  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 1 , ZB, SEG}(), all_args...), n_threads)
-    elseif vs == 2  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 2 , ZB, SEG}(), all_args...), n_threads)
-    elseif vs == 4  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 4 , ZB, SEG}(), all_args...), n_threads)
-    elseif vs == 8  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 8 , ZB, SEG}(), all_args...), n_threads)
-    elseif vs == 16 ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 16, ZB, SEG}(), all_args...), n_threads)
-    elseif vs == 32 ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 32, ZB, SEG}(), all_args...), n_threads)
+    if     vs == 1  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 1 , ZB, SEG, SCAT}(), all_args...), n_threads)
+    elseif vs == 2  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 2 , ZB, SEG, SCAT}(), all_args...), n_threads)
+    elseif vs == 4  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 4 , ZB, SEG, SCAT}(), all_args...), n_threads)
+    elseif vs == 8  ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 8 , ZB, SEG, SCAT}(), all_args...), n_threads)
+    elseif vs == 16 ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 16, ZB, SEG, SCAT}(), all_args...), n_threads)
+    elseif vs == 32 ; _launch_kern(ka, _ust_emit_kern, (_SpMVKern{LDG, 32, ZB, SEG, SCAT}(), all_args...), n_threads)
     else error("_launch_spmv_kern: vs=$vs not in {1,2,4,8,16,32}")
     end
 end
@@ -344,9 +380,26 @@ function JLUST.execute(::EmitterBackend, ::Op{:SpMV, F},
     # through code that assumes coordinates(A,1)=rows, coordinates(A,2)=cols.
     is_coo_like  = lv1 isa CompressedLevel && !is_unique(lv1) &&
                    length(fmt.levels) >= 2 && fmt.levels[2] isa SingletonLevel
+    is_scatter   = _spmv_is_scatter(fmt)
     use_identity = IF === typeof(identity) && OF === typeof(identity)
 
-    if is_coo_like
+    if is_scatter
+        # Scatter mode (CSC and lookalikes): outer Dense walks input cols;
+        # inner level supplies y rows.  Pre-scale y by beta; the kernel atomic-
+        # adds into y from each (col, row) pair.  output_fn doesn't compose
+        # with atomic-add (would need a two-pass implementation), so we reject
+        # non-identity output_fn rather than silently producing wrong results.
+        OF === typeof(identity) ||
+            error("EmitterBackend: output_fn is unsupported for scatter-mode " *
+                  "(CSC / col-outer) SpMV.  Convert A to CSR first.")
+        iszero(T_beta) ? fill!(nonzeros(u_y), zero(T)) : (nonzeros(u_y) .*= T_beta)
+        n_outer     = Int32(_spmv_ndrange(u_A))
+        sparse_bufs = _sparse_args(u_A)
+        all_args    = (typeof(fmt), T,
+                       sparse_bufs..., nonzeros(u_x), nonzeros(u_y), off, n_outer,
+                       input_fn, output_fn, T_alpha, zero(T))
+        _launch_spmv_kern(ka, fmt, all_args, Int(n_outer), length(nonzeros(u_A)), zero(T))
+    elseif is_coo_like
         # COO-like: pre-scale y by beta; the atomic / segmented-reduce paths
         # accumulate additively into this baseline.
         iszero(T_beta) ? fill!(nonzeros(u_y), zero(T)) : (nonzeros(u_y) .*= T_beta)
